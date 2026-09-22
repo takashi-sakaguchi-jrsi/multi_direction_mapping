@@ -1,0 +1,130 @@
+{
+  "camera": {
+    "lens_calibration_file": null,
+    "fov_degrees": 181.0,
+    "fx": 341.87536947032544,
+    "fy": 341.87536947032544,
+    "cx": 960.0,
+    "cy": 540.0,
+    "center_offset_x": 0,
+    "center_offset_y": 0,
+    "image_width": 1920,
+    "image_height": 1080
+  },
+  "pipe": {
+    "diameter_mm": 250.0
+  },
+  "colormap": {
+    "pixels_per_mm": 2.5464790894703255
+  },
+  "estimation": {
+    "use_vanishing_point_constraints": false,
+    "use_ocr_z_constraints": true,
+    "feature_matching": {
+      "use_cylindrical_matching": false
+    },
+    "motion": {
+      "use_vanishing_point_yaw": false,
+      "use_vanishing_point_pitch": false,
+      "estimate_dx": true,
+      "estimate_dz": true,
+      "estimate_droll": true,
+      "estimate_dyaw": true,
+      "estimate_dpitch": true
+    }
+  },
+  "two_direction": {
+    "enabled": true,
+    "modes": ["A"],
+    "output_dir": "data/output/two_direction",
+    "cache_projection_maps": false,
+    "z_source": "known",
+    "known_z_metadata_path": "data/input/videos/phi250_fisheye_side_metadata.json",
+    "match_source_pixels_per_mm": true,
+    "capture": {
+      "usable_outer_radius_ratio": 0.8,
+      "derived_usable_half_fov_deg": 71.97,
+      "nominal_sector_half_deg": 60.0,
+      "required_margin_deg": 5.0,
+      "image_height_px": 1080,
+      "image_width_px": 1920
+    },
+    "run_A": {
+      "video_path": "data/input/videos/phi250_fisheye_side_U.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 0.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "U"
+    },
+    "run_B": {
+      "video_path": "data/input/videos/phi250_fisheye_side_R.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 120.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "R"
+    },
+    "center_prior": {
+      "scale": 1.0,
+      "sigma_x_mm": 1.0,
+      "sigma_y_mm": 2.0,
+      "sigma_roll_deg": 3.0,
+      "sigma_yaw_deg": 5.0,
+      "sigma_pitch_deg": 8.0
+    },
+    "hard_bounds": {
+      "max_x_dev_mm": 5.0,
+      "max_y_dev_mm": 10.0,
+      "max_roll_dev_deg": 15.0,
+      "max_yaw_dev_deg": 20.0,
+      "max_pitch_dev_deg": 25.0
+    },
+    "registration": {
+      "z_search_margin_mm": 50.0,
+      "theta_search_margin_deg": 15.0,
+      "ransac_iterations": 500,
+      "ransac_inlier_threshold_mm": 5.0,
+      "min_inliers": 8,
+      "lambda_ocr": 1.0,
+      "lambda_smooth": 1.0,
+      "max_correction_mm": 50.0
+    },
+    "seam_warp": {
+      "enabled": true,
+      "apply_edge_theta": false,
+      "half_band_deg": 8.0,
+      "control_spacing_mm": 30.0,
+      "max_dz_mm": 10.0,
+      "max_dtheta_deg": 4.0,
+      "min_matches": 6,
+      "ncc_window_mm": 40.0,
+      "ncc_step_mm": 15.0
+    },
+    "best_view": {
+      "scoring": "overwrite",
+      "distance_tie_tolerance_mm": 1.0
+    },
+    "feature_matching_sideview": {
+      "use_radius_filter": false,
+      "max_pixel_displacement_sideview": 250.0,
+      "ratio_test_threshold": 0.75,
+      "min_match_count": 10,
+      "center_rect_half_ratio": 0.4,
+      "reject_reverse_travel": true,
+      "reverse_flow_tolerance_px": 1.0,
+      "outlier_iqr_multiplier": 1.5,
+      "outlier_min_points": 4
+    },
+    "projection": {
+      "allow_signed_relative_z": true,
+      "distance_metric": "coordinate",
+      "sample_stride": 2
+    },
+    "legacy_vp": {
+      "enabled": false
+    }
+  }
+}
