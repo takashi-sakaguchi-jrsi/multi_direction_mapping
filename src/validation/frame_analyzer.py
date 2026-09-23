@@ -19,6 +19,33 @@ from src.validation.records import FrameAnalysisRecord
 from src.validation.sideview_feature_matcher import SideviewFeatureMatcher
 
 
+def resolve_frame_window(td, n_total: Optional[int] = None) -> Tuple[int, Optional[int]]:
+    """[start, end) 。end が None なら末尾まで。max_frames は start からの枚数上限。"""
+    start = int(getattr(td, "start_frame", 0) or 0)
+    if start < 0:
+        raise ValueError(f"start_frame は 0 以上: {start}")
+    end = getattr(td, "end_frame", None)
+    end = int(end) if end is not None else None
+    max_frames = getattr(td, "max_frames", None)
+    if max_frames is not None:
+        cap = start + int(max_frames)
+        end = cap if end is None else min(end, cap)
+    if end is not None and end <= start:
+        raise ValueError(f"空のフレーム範囲: start={start}, end={end}")
+    if n_total is not None:
+        n_total = int(n_total)
+        start = min(start, n_total)
+        if end is None:
+            end = n_total
+        else:
+            end = min(end, n_total)
+        if start >= n_total or (end is not None and end <= start):
+            raise ValueError(
+                f"フレーム範囲が動画長を外れます: start={start}, end={end}, n={n_total}"
+            )
+    return start, end
+
+
 class FrameAnalyzer:
     def __init__(self, config, estimator: CameraEstimator, mode: str = "A"):
         self.config = config
@@ -54,17 +81,25 @@ class FrameAnalyzer:
         run_id = run_cfg.run_id or reference["run_id"]
 
         loaded = frames
+        td = self.config.two_direction
         if loaded is None:
-            loaded = self._load_frames(
+            start, end = resolve_frame_window(td)
+            loaded, video_fps = self._load_frames(
                 run_cfg.video_path,
-                max_frames=getattr(self.config.two_direction, "max_frames", None),
+                start_frame=start,
+                end_frame=end,
             )
+            if video_fps and video_fps > 0:
+                fps = float(video_fps)
         else:
-            max_frames = getattr(self.config.two_direction, "max_frames", None)
-            if max_frames is not None:
-                loaded = loaded[: int(max_frames)]
+            start, end = resolve_frame_window(td, n_total=len(loaded))
+            loaded = loaded[start:end]
+        if fps <= 0:
+            fps = 30.0
         if known_z_mm is not None:
             known_z_mm = np.asarray(known_z_mm, dtype=float).reshape(-1)
+            start_z, end_z = resolve_frame_window(td, n_total=known_z_mm.size)
+            known_z_mm = known_z_mm[start_z:end_z]
             if known_z_mm.size < len(loaded):
                 raise ValueError(
                     f"known_z_mm の長さ ({known_z_mm.size}) がフレーム数 "
@@ -105,7 +140,7 @@ class FrameAnalyzer:
 
         prev = loaded[0]
         records.append(self._make_record(
-            run_id, 0, 0.0, position, orientation, reference,
+            run_id, 0, start, start / fps, position, orientation, reference,
             ocr_dist, success, z_positions, np.zeros(6), np.zeros(6),
             0, {}, 0.0, {}, "INIT",
         ))
@@ -119,6 +154,7 @@ class FrameAnalyzer:
             residual_stats = {}
             prior_norm = 0.0
             bound_hit = {}
+            orig = start + i
             try:
                 pts1, pts2 = self.matcher.detect_and_match(
                     prev, curr,
@@ -185,9 +221,8 @@ class FrameAnalyzer:
                 status = "FAILED"
                 residual_stats = {"error": str(exc)}
 
-            z_ocr = float(ocr_dist[i]) if success[i] else None
             records.append(self._make_record(
-                run_id, i, i / fps, position.copy(), orientation.copy(), reference,
+                run_id, i, orig, orig / fps, position.copy(), orientation.copy(), reference,
                 ocr_dist, success, z_positions, motion_raw, motion_final,
                 match_count, residual_stats, prior_norm, bound_hit, status,
             ))
@@ -201,36 +236,55 @@ class FrameAnalyzer:
             "run_reference": reference,
             "frames": loaded,
             "z_source": "known" if known_z_mm is not None else "ocr",
+            "start_frame": start,
+            "end_frame": start + len(loaded),
+            "fps": fps,
         }
         return records, extra
 
     @staticmethod
-    def _load_frames(video_path: str, max_frames: Optional[int] = None) -> List[np.ndarray]:
+    def _load_frames(
+        video_path: str,
+        start_frame: int = 0,
+        end_frame: Optional[int] = None,
+    ) -> Tuple[List[np.ndarray], float]:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise FileNotFoundError(f"動画が見つかりません: {video_path}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        start = int(start_frame or 0)
+        idx = 0
+        while idx < start:
+            ok = cap.grab()
+            if not ok:
+                cap.release()
+                raise ValueError(
+                    f"start_frame={start} が動画長を超えています: {video_path}"
+                )
+            idx += 1
         frames = []
-        limit = int(max_frames) if max_frames is not None else None
-        while True:
-            if limit is not None and len(frames) >= limit:
-                break
+        while end_frame is None or idx < int(end_frame):
             ok, frame = cap.read()
             if not ok:
                 break
             frames.append(frame)
+            idx += 1
         cap.release()
         if not frames:
-            raise ValueError(f"フレームが空です: {video_path}")
-        return frames
+            raise ValueError(
+                f"指定範囲のフレームが空です: {video_path} "
+                f"[{start_frame}, {end_frame})"
+            )
+        return frames, fps
 
     def _make_record(
-        self, run_id, frame_num, timestamp, position, orientation, reference,
+        self, run_id, local_i, frame_num, timestamp, position, orientation, reference,
         ocr_dist, success, z_positions, motion_raw, motion_final,
         match_count, residual_stats, prior_norm, bound_hit, status,
     ) -> FrameAnalysisRecord:
         z_ocr = None
-        if frame_num < len(success) and success[frame_num]:
-            z_ocr = float(ocr_dist[frame_num])
+        if local_i < len(success) and success[local_i]:
+            z_ocr = float(ocr_dist[local_i])
         ref_vec = np.array([
             reference["x_ref_mm"], reference["y_ref_mm"],
             reference["roll_ref_rad"], reference["yaw_ref_rad"], reference["pitch_ref_rad"],

@@ -1173,8 +1173,12 @@ class TwoDirectionConfig:
     z_source: str = "ocr"
     """距離の入力元。ocr=Tesseract、known=生成 metadata の z を OCR 代用（第1段階）"""
     known_z_metadata_path: Optional[str] = None
+    start_frame: int = 0
+    """処理開始フレーム（0始まり、含む）"""
+    end_frame: Optional[int] = None
+    """処理終了フレーム（含まない。[start_frame, end_frame)。None なら末尾まで）"""
     max_frames: Optional[int] = None
-    """先頭から使うフレーム数。None なら全フレーム。第1段階の短縮実行用"""
+    """start_frame から使う最大枚数。end_frame より狭いときに効く"""
     match_source_pixels_per_mm: bool = False
     """True なら元展開図の pix/mm を生成カラーマップに使う（再現確認用）"""
     capture: CaptureConfig = field(default_factory=CaptureConfig)
@@ -1744,6 +1748,14 @@ class Config:
         """
         validator = ConfigValidator(self)
         validator.validate_all()
+
+    def validate_two_direction_config(self) -> None:
+        """2方向合成設定のバリデーションを実行
+
+        Raises:
+            ConfigValidationError: バリデーションエラー
+        """
+        ConfigValidator(self).validate_two_direction_config()
     
     def to_dict(self) -> Dict[str, Any]:
         """設定を辞書に変換する
@@ -2166,6 +2178,15 @@ class ConfigValidator:
         if cfg.max_frames is not None and int(cfg.max_frames) <= 0:
             raise ConfigValidationError(
                 f"two_direction.max_frames は正の整数である必要があります: {cfg.max_frames}"
+            )
+        if int(cfg.start_frame) < 0:
+            raise ConfigValidationError(
+                f"two_direction.start_frame は 0 以上である必要があります: {cfg.start_frame}"
+            )
+        if cfg.end_frame is not None and int(cfg.end_frame) <= int(cfg.start_frame):
+            raise ConfigValidationError(
+                f"two_direction.end_frame は start_frame より大きい必要があります: "
+                f"start={cfg.start_frame}, end={cfg.end_frame}"
             )
         if cfg.legacy_vp.enabled:
             self.logger.warning(

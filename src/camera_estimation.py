@@ -3349,22 +3349,20 @@ class CameraEstimator:
         yaw2: float,
         pitch2: float,
     ) -> np.ndarray:
-        """U Mode A: フレーム dy は dz のみ、dx は dyaw のみで説明する。
+        """U Mode A: フレーム残差を (dz, dyaw) の同一予測で説明する。
 
         逆投影は world_to_pixel と同一の R_c2w 視線を使う。
-        垂直成分は進行（画像 y ≡ 世界 −Z）に一致するので変換しない。
-        水平成分（ねじれ）は yaw が受ける。pitch は進行面チルトのため固定。
+        yaw=0 付近のヤコビアンは dy→dz、dx→dyaw だが、残差を
+        「dz は旧 yaw / dyaw は旧 z」に足し分けると、yaw が外れたとき
+        z 移動の横漏れがすべて dyaw に載り雪崩になる。
+        pitch は進行面チルトのため固定（pitch2 は呼び出し側で pitch_0）。
         """
         pos_z = np.array([x0, y0, z0 + dz], dtype=float)
-        pos_0 = np.array([x0, y0, z0], dtype=float)
-        pred_z = self.transformer.world_to_pixel(
-            world_prev, pos_z, roll_0, yaw_0, pitch_0
+        pred = self.transformer.world_to_pixel(
+            world_prev, pos_z, roll_0, yaw2, pitch2
         )
-        pred_ang = self.transformer.world_to_pixel(
-            world_prev, pos_0, roll_0, yaw2, pitch2
-        )
-        res_v = curr_points[:, 1] - pred_z[:, 1]
-        res_u = curr_points[:, 0] - pred_ang[:, 0]
+        res_v = curr_points[:, 1] - pred[:, 1]
+        res_u = curr_points[:, 0] - pred[:, 0]
         return np.concatenate([res_v, res_u])
 
     def _estimate_motion_with_reference(

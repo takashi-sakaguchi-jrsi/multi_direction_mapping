@@ -23,7 +23,7 @@ from src.calibration import load_calibration
 from src.config import Config, load_config
 from src.coordinate_transform import CoordinateTransformer, FisheyeCamera
 from src.validation.best_view_accumulator import BestViewAccumulator
-from src.validation.frame_analyzer import FrameAnalyzer
+from src.validation.frame_analyzer import FrameAnalyzer, resolve_frame_window
 from src.validation.geometry import (
     build_run_reference,
     derive_usable_half_fov_deg,
@@ -128,6 +128,12 @@ def run_two_direction_validation(
         f"usable half FOV={derived_fov:.2f} deg "
         f"(config={td.capture.derived_usable_half_fov_deg}), "
         f"pixels_per_mm={config.colormap.pixels_per_mm:.6f}"
+    )
+    win_start, win_end = resolve_frame_window(td)
+    logger.info(
+        f"frame window [{win_start}, {win_end if win_end is not None else 'end'}) "
+        f"(start_frame={td.start_frame}, end_frame={td.end_frame}, "
+        f"max_frames={td.max_frames})"
     )
 
     output_dir = Path(td.output_dir)
@@ -375,10 +381,22 @@ def parse_args():
         help="z_values_mm を含む生成 metadata.json（--z-source known と併用）",
     )
     p.add_argument(
+        "--start-frame",
+        type=int,
+        default=None,
+        help="処理開始フレーム（0始まり、含む）",
+    )
+    p.add_argument(
+        "--end-frame",
+        type=int,
+        default=None,
+        help="処理終了フレーム（含まない。[start, end)）",
+    )
+    p.add_argument(
         "--max-frames",
         type=int,
         default=None,
-        help="先頭から使うフレーム数（第1段階の短縮実行）",
+        help="start-frame から使う最大枚数。end-frame より狭いときに効く",
     )
     p.add_argument(
         "--ppm",
@@ -423,6 +441,10 @@ def main() -> int:
         config.two_direction.z_source = "known"
     if args.z_source:
         config.two_direction.z_source = args.z_source
+    if args.start_frame is not None:
+        config.two_direction.start_frame = int(args.start_frame)
+    if args.end_frame is not None:
+        config.two_direction.end_frame = int(args.end_frame)
     if args.max_frames is not None:
         config.two_direction.max_frames = int(args.max_frames)
     if args.match_source_ppm:

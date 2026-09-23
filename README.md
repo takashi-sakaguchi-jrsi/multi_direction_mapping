@@ -1,5 +1,7 @@
 # 2方向動画合成カラーマップ検証
 
+仕様書 `doc/2方向動画合成カラーマップ生成_検証仕様書_v0_4_rev3.docx` に対する実装の採用事項・改修経緯は `doc/2方向動画合成カラーマップ生成_実装ノート.md`。
+
 ## 実行
 
 ```bash
@@ -17,7 +19,7 @@ CLI は `src/main_twopass.py` と同じ4層設定です（dataclass 初期値 < 
 再現テストの正本は `original_colormap/phi250tenkaizu.png`（管路直径 250mm）。
 
 ```bash
-python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 0 --reconstruct
+python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
 ```
 
 プロジェクトルートで実行してください。`python src/...` でも動くようにしてあります。

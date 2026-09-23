@@ -20,10 +20,9 @@ CameraCarDemo 相当の円筒サンプリングで、カメラモデルだけ等
 正本展開図は `original_colormap/phi250tenkaizu.png`（φ250mm、半径 125mm）。
 
 ```bash
-python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 0 --z-step-mm 10 --reconstruct
+python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
 ```
 
-全長は使わず、開始距離から 100～300 フレーム程度だけ出します。`--z-start-mm` を変えると特徴の違う区間で確認できます。
+`--jitter` はフレームごとの dz / dpitch / dyaw に、十数フレーム周期の緩やかな中程度振動と 2〜3 フレームの小さい振動を合成します。OCR 列 `ocr_z_mm` は真の累積 z に 10mm 遅れモデルを掛けたものです。
 
-出力例: `phi250_fisheye_side_U.mp4`, `phi250_fisheye_side_R.mp4` と `*_metadata.json`。
-距離 overlay は焼き込みません。`--reconstruct` は既知の z / roll / pitch で、生成した距離区間付近の展開図へ戻す確認用です。OCR や特徴点姿勢推定は使いません。
+距離 overlay は焼き込みません。`--reconstruct` は既知の z / 姿勢で、生成した距離区間付近の展開図へ戻す確認用です。OCR や特徴点姿勢推定は使いません。

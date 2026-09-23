@@ -7,12 +7,13 @@ from src.camera_estimation import CameraEstimator
 from src.validation.geometry import build_run_reference, mode_a_estimate_yaw_pitch
 
 
-def _known_correspondences(transformer, physical_roll_deg=0.0, n=20):
+def _known_correspondences(transformer, physical_roll_deg=0.0, n=20, yaw_off_deg=0.0):
     """光軸付近の円筒点を2姿勢へ投影して対応点を作る"""
     from src.validation.geometry import optical_axis_world
     radius = transformer.pipe_radius
     ref = build_run_reference(physical_roll_deg)
     ori0 = np.array([ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]])
+    ori0[1] = ori0[1] + np.radians(float(yaw_off_deg))
     axis = optical_axis_world(*ori0)
     nxy = np.linalg.norm(axis[:2]) + 1e-12
     base = np.array([axis[0] / nxy * radius, axis[1] / nxy * radius, 0.0])
@@ -80,6 +81,32 @@ def test_mode_a_u_maps_frame_dy_to_dz(transformer, config):
     assert abs(motion["dy"]) < 1e-6
     assert abs(motion["droll"]) < 1e-6
     assert abs(motion["dpitch"]) < 1e-9
+    assert motion["dz"] > 1.0
+    assert abs(np.degrees(motion["dyaw"])) < 0.5
+
+
+def test_mode_a_u_yaw_does_not_avalanche_from_offset(transformer, config):
+    """純 z 移動を yaw≠0 から見ても、分割残差のように dyaw を積み増さない。"""
+    estimator = CameraEstimator(config.estimation, transformer)
+    yaw_off = 8.0
+    p0, p1, ref = _known_correspondences(transformer, 0.0, yaw_off_deg=yaw_off)
+    if len(p0) < 4:
+        pytest.skip("投影点が不足")
+    state = {
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([
+            ref["roll_ref_rad"],
+            ref["yaw_ref_rad"] + np.radians(yaw_off),
+            ref["pitch_ref_rad"],
+        ]),
+    }
+    motion = estimator.estimate_motion_flexible(
+        p0, p1, state, _cam_params(transformer),
+        run_reference=ref,
+        center_prior=config.two_direction.center_prior,
+        estimation_mode="A",
+        hard_bounds=config.two_direction.hard_bounds,
+    )
     assert motion["dz"] > 1.0
     assert abs(np.degrees(motion["dyaw"])) < 0.5
 

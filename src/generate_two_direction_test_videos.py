@@ -42,8 +42,14 @@ from src.validation.ocr_simulation import (
     OCR_STEP_MM,
     ocr_metadata_fields,
 )
+from src.validation.pose_jitter import (
+    PoseJitterConfig,
+    build_motion_series,
+    motion_metadata_fields,
+)
 from src.validation.geometry import (
     SUFFIX_TO_PHYSICAL_ROLL_DEG,
+    build_run_reference,
     physical_roll_to_internal_deg,
     run_id_from_physical_roll,
 )
@@ -80,6 +86,8 @@ def generate_two_direction_videos(
     shading: bool,
     reconstruct: bool,
     save_png: bool,
+    jitter: bool = False,
+    jitter_seed: int = 0,
 ) -> Dict:
     renderer = FisheyeSideviewRenderer(
         colormap=colormap,
@@ -94,21 +102,41 @@ def generate_two_direction_videos(
             f"目視確認には {N_FRAMES_HINT_MIN}～{N_FRAMES_HINT_MAX} フレーム程度を推奨"
             f"（指定: {n_frames}）"
         )
-    zs = z_values_for_segment(
-        renderer,
-        z_start_mm=z_start_mm,
-        n_frames=n_frames,
-        z_step_mm=z_step_mm,
-        z_margin_mm=z_margin_mm,
-    )
+    jitter_cfg = PoseJitterConfig(seed=int(jitter_seed))
+    program_rpy_by_run = {}
+    if jitter:
+        series = build_motion_series(
+            n_frames=n_frames,
+            z_start_mm=z_start_mm,
+            z_step_mm=z_step_mm,
+            z_max_mm=float(renderer.z_extent_mm) - float(z_margin_mm),
+            config=jitter_cfg,
+        )
+        zs = series["z_mm"]
+        ocr_fields = motion_metadata_fields(series, z_step_mm=float(z_step_mm), config=jitter_cfg)
+        logger.info(
+            f"振動走行 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, "
+            f"dz_mean={ocr_fields['dz_mean_mm']:.3f} mm"
+        )
+    else:
+        series = None
+        zs = z_values_for_segment(
+            renderer,
+            z_start_mm=z_start_mm,
+            n_frames=n_frames,
+            z_step_mm=z_step_mm,
+            z_margin_mm=z_margin_mm,
+        )
+        ocr_fields = ocr_metadata_fields(zs, z_step_mm=float(z_step_mm), ocr_step_mm=OCR_STEP_MM)
     if len(zs) < n_frames:
         logger.warning(
             f"展開図終端のため {n_frames} フレームから {len(zs)} に短縮 "
             f"(z_start={zs[0]:.1f} mm, z_end={zs[-1]:.1f} mm, extent={renderer.z_extent_mm:.1f} mm)"
         )
-    logger.info(
-        f"生成区間 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, step={z_step_mm} mm"
-    )
+    if not jitter:
+        logger.info(
+            f"生成区間 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, step={z_step_mm} mm"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir
     result: Dict = {
@@ -128,7 +156,7 @@ def generate_two_direction_videos(
         "physical_pitch_deg": float(pitch_deg),
         "z_start_mm": float(zs[0]),
         "z_end_mm": float(zs[-1]),
-        **ocr_metadata_fields(zs, z_step_mm=float(z_step_mm), ocr_step_mm=OCR_STEP_MM),
+        **ocr_fields,
         "fps": float(fps),
         "distance_overlay": False,
         "phase1": False,
@@ -137,7 +165,23 @@ def generate_two_direction_videos(
     all_frames: Dict[str, List[np.ndarray]] = {}
     for run in runs:
         roll = SUFFIX_TO_PHYSICAL_ROLL_DEG[run]
-        frames, _ = renderer.render_sequence(zs, roll_deg=roll, pitch_deg=pitch_deg)
+        rpy_list = None
+        if jitter:
+            ref = build_run_reference(roll, physical_pitch_deg=pitch_deg)
+            yaw_off = series["yaw_offset_deg"]
+            pitch_off = series["pitch_offset_deg"]
+            rpy_list = [
+                (
+                    float(ref["roll_ref_rad"]),
+                    float(np.radians(ref["yaw_ref_deg"] + yaw_off[i])),
+                    float(np.radians(ref["pitch_ref_deg"] + pitch_off[i])),
+                )
+                for i in range(len(zs))
+            ]
+            program_rpy_by_run[run] = rpy_list
+        frames, _ = renderer.render_sequence(
+            zs, roll_deg=roll, pitch_deg=pitch_deg, program_rpy_rad=rpy_list
+        )
         all_frames[run] = frames
         video_path = videos_dir / f"{name}_{run}.mp4"
         write_mp4(video_path, frames, fps)
@@ -163,10 +207,13 @@ def generate_two_direction_videos(
         orientations = []
         for run in runs:
             roll = SUFFIX_TO_PHYSICAL_ROLL_DEG[run]
-            for frame, z in zip(all_frames[run], zs):
+            for i, (frame, z) in enumerate(zip(all_frames[run], zs)):
                 frames_all.append(frame)
                 positions.append((0.0, 0.0, float(z)))
-                orientations.append((float(roll), float(pitch_deg)))
+                if jitter:
+                    orientations.append(program_rpy_by_run[run][i])
+                else:
+                    orientations.append((float(roll), float(pitch_deg)))
         canvas, filled = renderer.reconstruct_from_hits(frames_all, positions, orientations)
         preview = crop_colormap_z_window(canvas, renderer, float(zs[0]), float(zs[-1]))
         source_preview = crop_colormap_z_window(
@@ -251,6 +298,12 @@ def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
     )
     p.add_argument("--shading", action="store_true", help="Demo 相当の距離減衰を入れる")
     p.add_argument(
+        "--jitter",
+        action="store_true",
+        help="dz/dpitch/dyaw に十数フレーム＋2〜3フレームの合成振動を入れる",
+    )
+    p.add_argument("--jitter-seed", type=int, default=0)
+    p.add_argument(
         "--reconstruct",
         action="store_true",
         help="既知姿勢で展開図へ戻す（Phase1省略の往復確認）",
@@ -284,6 +337,8 @@ def main(argv: Sequence[str] = None) -> int:
             shading=args.shading,
             reconstruct=args.reconstruct,
             save_png=args.save_png,
+            jitter=bool(args.jitter),
+            jitter_seed=int(args.jitter_seed),
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error(str(exc))

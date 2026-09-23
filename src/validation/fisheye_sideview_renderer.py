@@ -1,7 +1,8 @@
 """CameraCarDemo 円筒レンダラの魚眼（等距離射影）差し替え。
 
 ピンホールの tan(FOV/2) をやめ、r = fθ でレイを出す。
-姿勢は Demo と同じカメラカー定義（roll, pitch）。距離 overlay は持たない。
+姿勢は Demo のカメラカー定義（roll, pitch）、またはプログラム Euler（roll, yaw, pitch）。
+距離 overlay は持たない。
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import cv2
 import numpy as np
 
 from src.camera_utils import compute_fisheye_focal_length
+from src.validation.geometry import pose_R_c2w
 
 
 DEFAULT_FOV_DEG = 181.0
@@ -155,8 +157,11 @@ class FisheyeSideviewRenderer:
 
     def _rotate_rays(self, roll_deg: float, pitch_deg: float) -> np.ndarray:
         rotation = self.demo_rotation(roll_deg, pitch_deg)
+        return self._apply_rotation(rotation)
+
+    def _apply_rotation(self, rotation: np.ndarray) -> np.ndarray:
         flat = self._view_rays.reshape(-1, 3).T
-        rotated = rotation @ flat
+        rotated = np.asarray(rotation, dtype=np.float64) @ flat
         return rotated.T.reshape(self.output_height, self.output_width, 3)
 
     def _intersect(
@@ -164,9 +169,10 @@ class FisheyeSideviewRenderer:
         cam_position: Sequence[float],
         roll_deg: float,
         pitch_deg: float,
+        rotation: Optional[np.ndarray] = None,
     ) -> Dict[str, np.ndarray]:
         x0, y0, z0 = [float(v) for v in cam_position]
-        rays = self._rotate_rays(roll_deg, pitch_deg)
+        rays = self._apply_rotation(rotation) if rotation is not None else self._rotate_rays(roll_deg, pitch_deg)
         dx, dy, dz = rays[..., 0], rays[..., 1], rays[..., 2]
         a = dx * dx + dy * dy
         b = 2.0 * (x0 * dx + y0 * dy)
@@ -266,11 +272,19 @@ class FisheyeSideviewRenderer:
         cam_orientation: Sequence[float],
         fov_deg: Optional[float] = None,
         return_hits: bool = False,
+        program_rpy_rad: Optional[Sequence[float]] = None,
     ):
         if fov_deg is not None and abs(float(fov_deg) - self.fov_deg) > 1e-6:
             raise ValueError("FOV は初期化時の値のみ対応しています。レンダラを作り直してください。")
-        roll, pitch = float(cam_orientation[0]), float(cam_orientation[1])
-        hits = self._intersect(cam_position, roll, pitch)
+        rotation = None
+        if program_rpy_rad is not None:
+            roll, yaw, pitch = [float(v) for v in program_rpy_rad]
+            # Demo は R @ v_cam。プログラムは v_cam @ R_c2w = R_c2w.T @ v_cam
+            rotation = pose_R_c2w(roll, yaw, pitch).T
+            hits = self._intersect(cam_position, 0.0, 0.0, rotation=rotation)
+        else:
+            roll, pitch = float(cam_orientation[0]), float(cam_orientation[1])
+            hits = self._intersect(cam_position, roll, pitch)
         frame = self._sample_texture(hits)
         if return_hits:
             return frame, hits
@@ -282,12 +296,16 @@ class FisheyeSideviewRenderer:
         roll_deg: float,
         pitch_deg: float = DEFAULT_PITCH_DEG,
         cam_xy: Tuple[float, float] = (0.0, 0.0),
+        program_rpy_rad: Optional[Sequence[Sequence[float]]] = None,
     ) -> Tuple[List[np.ndarray], List[float]]:
         frames: List[np.ndarray] = []
         zs: List[float] = []
-        for z in z_values:
+        for i, z in enumerate(z_values):
             pos = (float(cam_xy[0]), float(cam_xy[1]), float(z))
-            frames.append(self.render_view(pos, (roll_deg, pitch_deg)))
+            rpy = None
+            if program_rpy_rad is not None:
+                rpy = program_rpy_rad[i]
+            frames.append(self.render_view(pos, (roll_deg, pitch_deg), program_rpy_rad=rpy))
             zs.append(float(z))
         return frames, zs
 
@@ -302,7 +320,11 @@ class FisheyeSideviewRenderer:
         filled = np.zeros((self.eq_h, self.eq_w), dtype=bool)
         dmin = np.full((self.eq_h, self.eq_w), np.inf, dtype=np.float32)
         for frame, pos, ori in zip(frames, positions, orientations):
-            _, hits = self.render_view(pos, ori, return_hits=True)
+            ori = tuple(float(v) for v in ori)
+            if len(ori) >= 3:
+                _, hits = self.render_view(pos, ori[:2], return_hits=True, program_rpy_rad=ori[:3])
+            else:
+                _, hits = self.render_view(pos, ori, return_hits=True)
             valid = hits["valid"]
             if not np.any(valid):
                 continue

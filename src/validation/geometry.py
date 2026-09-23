@@ -230,7 +230,8 @@ def expected_edge_etas(
 def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
     """Mode A で推定する角度 (estimate_yaw, estimate_pitch)。
 
-    U: フレーム dy→dz、dx→dyaw。pitch=90°・roll=0・x=y=0 固定。yaw は 0° 求心。
+    U: フレーム残差は (dz, dyaw) を同一予測。yaw=0 付近では dy→dz・dx→dyaw。
+       pitch=90°・roll=0・x=y=0 固定。yaw は 0° 求心。
        pitch は進行面のチルトなので横残差から推定しない（z 復元を壊す）。
     R/L: 画像x=pitch, 画像y=z。roll=r0, yaw=y0, x=y=0 固定。pitch は p0 求心。
     """
