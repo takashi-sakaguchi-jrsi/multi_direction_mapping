@@ -109,3 +109,84 @@ def test_ur_shift_meets_at_seam_and_free_edge_stays():
     (free_x, _free_y), _ = __import__("cv2").phaseCorrelate(orig, warped)
     # L 側（相手なし）は u=0 なのでほとんど動かない
     assert abs(free_x) < 2.0
+
+
+def test_periodic_band_includes_eta_wrap():
+    from src.validation.seam_warp import _periodic_band_index, _wrap_row_delta, _seam_row
+    h = 200
+    row = float(_seam_row(h, 180.0, 0.0, 2.0 * np.pi))
+    assert row < 2.0
+    idx, _rel, _c = _periodic_band_index(h, row, 8.0)
+    assert 0 in set(idx.tolist())
+    assert (h - 1) in set(idx.tolist())
+    dy = _wrap_row_delta(np.array([1.0 - (h - 2)]), h)
+    np.testing.assert_allclose(dy, [3.0], atol=0.1)
+
+
+def test_rl_wrap_seam_finds_matches():
+    """R の 180° は行先頭、L は行末。周期帯でないと R/L がほぼマッチしない。"""
+    h, w = 160, 220
+    ppm = 1.0
+    base = _pattern(h, w, seed=3)
+    rgb_r = base.copy()
+    rgb_l = np.roll(np.roll(base, 6, axis=1), -1, axis=0)
+    filled = np.ones((h, w), dtype=bool)
+    cfg = SeamWarpConfig(
+        enabled=True,
+        half_band_deg=12.0,
+        control_spacing_mm=20.0,
+        max_dz_mm=20.0,
+        max_dtheta_deg=8.0,
+        min_matches=4,
+        ncc_window_mm=28.0,
+        ncc_step_mm=10.0,
+    )
+    result = warp_strips_to_seams(
+        [
+            {"rgb": rgb_r, "filled": filled, "z_min": 0.0, "z_max": float(w), "run_id": "R"},
+            {"rgb": rgb_l, "filled": filled, "z_min": 0.0, "z_max": float(w), "run_id": "L"},
+        ],
+        pixels_per_mm=ppm,
+        config=cfg,
+    )
+    rl = [m for m in result.mismatches if m.pair == ("R", "L")]
+    assert rl and rl[0].n_used >= 4
+    assert result.success
+    h, w = 120, 80
+    ppm = 1.0
+    filled = np.ones((h, w), dtype=bool)
+    strips = []
+    for i, rid in enumerate(("U", "R", "L")):
+        strips.append({
+            "rgb": _pattern(h, w, seed=i + 1),
+            "filled": filled,
+            "z_min": 0.0,
+            "z_max": float(w),
+            "run_id": rid,
+        })
+    cfg = SeamWarpConfig(enabled=True, min_matches=4)
+    result = warp_strips_to_seams(strips, pixels_per_mm=ppm, config=cfg)
+    pairs = {m.pair for m in result.mismatches}
+    assert pairs == {("U", "R"), ("U", "L"), ("R", "L")}
+
+
+def test_remap_keeps_theta_wrap_filled():
+    """θ シフトしても η=0 ラップ（180°）を黒帯にしない。"""
+    from src.validation.seam_warp import SeamMismatch, _remap_run
+
+    h, w = 48, 40
+    rgb = np.full((h, w, 3), 180, dtype=np.uint8)
+    filled = np.ones((h, w), dtype=bool)
+    mth = np.full(2, np.radians(40.0))
+    mm = SeamMismatch(
+        ("R", "L"), np.array([0.0, float(w)]), np.zeros(2), mth, 12, 12, "ok"
+    )
+    out = _remap_run(
+        {"rgb": rgb, "filled": filled, "z_min": 0.0, "z_max": float(w), "run_id": "L"},
+        "L", [mm], ppm=1.0, theta_min=0.0, theta_max=2.0 * np.pi, cfg=None,
+    )
+    assert float(np.mean(out["filled"][0])) > 0.9
+    assert float(np.mean(out["filled"][-1])) > 0.9
+    assert int(out["rgb"][0].max()) > 0
+    assert int(out["rgb"][-1].max()) > 0
+

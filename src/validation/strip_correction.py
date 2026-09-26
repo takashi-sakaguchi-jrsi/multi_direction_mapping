@@ -166,6 +166,111 @@ def _ocr_reference_frames(
     return zs, zt
 
 
+def remap_with_periodic_theta(
+    rgb: np.ndarray,
+    filled: np.ndarray,
+    map_x: np.ndarray,
+    map_y: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """x（z）は定数境界、y（θ）は周期。
+
+    ``cv2.remap`` は軸ごとの borderMode を持てない。``map_y % h`` だけだと
+    ``(h-1, h)`` が画面外扱いになり、旧切断（η=0／180°）が黒線になる。
+    幅が 32767 を超える展開図は列方向に分割して補間する。
+    """
+    h, w = rgb.shape[:2]
+    map_x = np.asarray(map_x, dtype=np.float32)
+    map_y = np.asarray(map_y, dtype=np.float32)
+    y_min = float(np.min(map_y)) if map_y.size else 0.0
+    y_max = float(np.max(map_y)) if map_y.size else 0.0
+    pad_lo = max(2, int(np.ceil(0.0 - y_min)) + 1) if y_min < 0.0 else 2
+    pad_hi = max(2, int(np.ceil(y_max - (h - 1))) + 1) if y_max > (h - 1) else 2
+    pad = int(max(pad_lo, pad_hi, 2))
+    if h < 32766 and w < 32767:
+        rgb_p = np.concatenate([rgb[-pad:], rgb, rgb[:pad]], axis=0)
+        filled_u8 = filled.astype(np.uint8) * 255
+        filled_p = np.concatenate([filled_u8[-pad:], filled_u8, filled_u8[:pad]], axis=0)
+        map_y_p = map_y + float(pad)
+        rgb_o = cv2.remap(
+            rgb_p, map_x, map_y_p, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT
+        )
+        filled_o = cv2.remap(
+            filled_p, map_x, map_y_p, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
+        ) > 0
+        rgb_o[~filled_o] = 0
+        return rgb_o, filled_o
+
+    out_h, out_w = int(map_y.shape[0]), int(map_x.shape[1])
+    if rgb.ndim == 3:
+        rgb_o = np.zeros((out_h, out_w, rgb.shape[2]), dtype=rgb.dtype)
+    else:
+        rgb_o = np.zeros((out_h, out_w), dtype=rgb.dtype)
+    filled_o = np.zeros((out_h, out_w), dtype=bool)
+    chunk = 2048
+    for x0c in range(0, out_w, chunk):
+        x1c = min(out_w, x0c + chunk)
+        mx = map_x[:, x0c:x1c]
+        my = map_y[:, x0c:x1c]
+        y0 = np.floor(my).astype(np.int32)
+        wy = (my - y0.astype(np.float32))[..., None]
+        y0m = np.mod(y0, h)
+        y1m = np.mod(y0 + 1, h)
+        x = np.clip(mx, 0.0, float(w - 1))
+        xx0 = np.floor(x).astype(np.int32)
+        xx1 = np.minimum(xx0 + 1, w - 1)
+        wx = (x - xx0.astype(np.float32))[..., None]
+        inside = (mx >= 0.0) & (mx <= (w - 1))
+        c00 = rgb[y0m, xx0].astype(np.float32)
+        c01 = rgb[y0m, xx1].astype(np.float32)
+        c10 = rgb[y1m, xx0].astype(np.float32)
+        c11 = rgb[y1m, xx1].astype(np.float32)
+        blended = (
+            c00 * (1.0 - wy) * (1.0 - wx)
+            + c01 * (1.0 - wy) * wx
+            + c10 * wy * (1.0 - wx)
+            + c11 * wy * wx
+        )
+        rgb_o[:, x0c:x1c][inside] = np.clip(blended[inside], 0, 255).astype(np.uint8)
+        f00 = filled[y0m, xx0]
+        f01 = filled[y0m, xx1]
+        f10 = filled[y1m, xx0]
+        f11 = filled[y1m, xx1]
+        filled_o[:, x0c:x1c] = f00 & f01 & f10 & f11 & inside
+        del c00, c01, c10, c11, blended
+    rgb_o[~filled_o] = 0
+    return rgb_o, filled_o
+
+
+def _remap_z_columns(
+    rgb: np.ndarray,
+    filled: np.ndarray,
+    map_x_1d: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """z 方向だけリマップ。2D の map を作らない（全長展開で数 GB になる）。"""
+    h, w = rgb.shape[:2]
+    map_x_1d = np.asarray(map_x_1d, dtype=np.float32).reshape(-1)
+    new_w = int(map_x_1d.size)
+    rgb_o = np.zeros((h, new_w, 3), dtype=np.uint8)
+    filled_o = np.zeros((h, new_w), dtype=bool)
+    chunk = 512
+    for x0 in range(0, new_w, chunk):
+        x1 = min(new_w, x0 + chunk)
+        mx = map_x_1d[x0:x1]
+        i0 = np.floor(mx).astype(np.int32)
+        i1 = np.minimum(i0 + 1, w - 1)
+        i0 = np.clip(i0, 0, w - 1)
+        a = (mx - i0.astype(np.float32)).astype(np.float32)
+        inside = (mx >= 0.0) & (mx <= float(w - 1))
+        c0 = rgb[:, i0].astype(np.float32)
+        c1 = rgb[:, i1].astype(np.float32)
+        out = c0 * (1.0 - a)[None, :, None] + c1 * a[None, :, None]
+        rgb_o[:, x0:x1] = np.clip(out, 0, 255).astype(np.uint8)
+        filled_o[:, x0:x1] = filled[:, i0] & filled[:, i1] & inside[None, :]
+        del c0, c1, out
+    rgb_o[~filled_o] = 0
+    return rgb_o, filled_o
+
+
 def warp_z_to_ocr(
     rgb: np.ndarray,
     filled: np.ndarray,
@@ -193,7 +298,7 @@ def warp_z_to_ocr(
     src_z_max = float(z_min) + w / ppm
     if z_est.size < 2:
         return (
-            {"rgb": rgb.copy(), "filled": filled.copy()},
+            {"rgb": rgb, "filled": filled},
             src_z_min,
             src_z_max,
             None,
@@ -203,7 +308,7 @@ def warp_z_to_ocr(
     zs, zt = _ocr_reference_frames(z_est, z_ocr, control_spacing_mm)
     if zs.size < 2:
         return (
-            {"rgb": rgb.copy(), "filled": filled.copy()},
+            {"rgb": rgb, "filled": filled},
             src_z_min,
             src_z_max,
             None,
@@ -226,16 +331,8 @@ def warp_z_to_ocr(
     extra = mm_dst > za_max
     mm_src[extra] = z_max + (mm_dst[extra] - za_max)
     mm_src = np.where(np.isnan(mm_src), 0.0, mm_src)
-    map_x = ((mm_src - src_z_min) * ppm).astype(np.float32)
-    map_x = np.clip(map_x, 0, w - 1)
-    map_x = np.repeat(map_x.reshape(1, -1), h, axis=0)
-    map_y = np.repeat(np.arange(h, dtype=np.float32).reshape(-1, 1), new_w, axis=1)
-    rgb_o = cv2.remap(rgb, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-    filled_u8 = filled.astype(np.uint8) * 255
-    filled_o = cv2.remap(
-        filled_u8, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
-    ) > 0
-    rgb_o[~filled_o] = 0
+    map_x_1d = np.clip(((mm_src - src_z_min) * ppm).astype(np.float32), 0, w - 1)
+    rgb_o, filled_o = _remap_z_columns(rgb, filled, map_x_1d)
     return (
         {"rgb": rgb_o, "filled": filled_o},
         z_dst_min,
@@ -356,16 +453,11 @@ def warp_theta_to_edge_center(
     z_cols = z_min + np.arange(w, dtype=float) / ppm
     dtheta = _eval_pchip_hold(zs, ds, z_cols)
     span = theta_max - theta_min
-    d_rows = dtheta / span * (h - 1)
+    d_rows = dtheta / span * h
     map_x = np.repeat(np.arange(w, dtype=np.float32).reshape(1, -1), h, axis=0)
     rows = np.arange(h, dtype=np.float32).reshape(-1, 1)
-    map_y = (rows - d_rows.reshape(1, -1)) % h
-    rgb_o = cv2.remap(rgb, map_x, map_y.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-    filled_u8 = filled.astype(np.uint8) * 255
-    filled_o = cv2.remap(
-        filled_u8, map_x, map_y.astype(np.float32), cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
-    ) > 0
-    rgb_o[~filled_o] = 0
+    map_y = rows - d_rows.reshape(1, -1)
+    rgb_o, filled_o = remap_with_periodic_theta(rgb, filled, map_x, map_y)
     return (
         {"rgb": rgb_o, "filled": filled_o},
         dtheta,

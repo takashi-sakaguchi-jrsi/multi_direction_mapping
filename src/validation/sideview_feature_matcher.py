@@ -100,14 +100,23 @@ class SideviewFeatureMatcher:
         self,
         pts1: np.ndarray,
         pts2: np.ndarray,
+        forward_dy_sign: int = -1,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """逆走除外のあと、ベクトル長と方向角の IQR 外れ値を落とす。"""
+        """逆走除外のあと、ベクトル長と方向角の IQR 外れ値を落とす。
+
+        forward_dy_sign: +z 前進で画像 y が増えるなら +1、減るなら -1。
+        現行 U/R/L の Demo 一致姿勢では -1（画像 y 減少＝前進）。
+        """
         if len(pts1) == 0:
             return pts1, pts2
         d = pts2 - pts1
         keep = np.linalg.norm(d, axis=1) < self.max_displacement
         if self.reject_reverse_travel:
-            keep = keep & (d[:, 1] <= self.reverse_flow_tolerance_px)
+            tol = self.reverse_flow_tolerance_px
+            if int(np.sign(forward_dy_sign) or -1) >= 0:
+                keep = keep & (d[:, 1] >= -tol)
+            else:
+                keep = keep & (d[:, 1] <= tol)
         pts1, pts2 = pts1[keep], pts2[keep]
         if len(pts1) < self.outlier_min_points:
             return pts1, pts2
@@ -147,18 +156,37 @@ class SideviewFeatureMatcher:
         valid_mask: Optional[np.ndarray] = None,
         center: Optional[Tuple[float, float]] = None,
         max_radius_px: Optional[float] = None,
+        forward_dy_sign: int = -1,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if prev_frame.ndim == 3 else prev_frame
-        curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY) if curr_frame.ndim == 3 else curr_frame
-        mask1 = self.build_roi_mask(prev_gray.shape, roi_rect, valid_mask, center, max_radius_px)
-        mask2 = self.build_roi_mask(curr_gray.shape, roi_rect, valid_mask, center, max_radius_px)
+        h, w = prev_frame.shape[:2]
+        if roi_rect is None:
+            roi_rect = self.center_rect((h, w), center)
+        x0, y0, x1, y1 = [int(v) for v in roi_rect]
+        x0 = max(0, min(w, x0))
+        x1 = max(0, min(w, x1))
+        y0 = max(0, min(h, y0))
+        y1 = max(0, min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            return None, None
+        _ = valid_mask, max_radius_px
 
-        kp1, des1 = self.orb.detectAndCompute(prev_gray, mask1)
-        kp2, des2 = self.orb.detectAndCompute(curr_gray, mask2)
+        prev_crop = prev_frame[y0:y1, x0:x1]
+        curr_crop = curr_frame[y0:y1, x0:x1]
+        prev_gray = cv2.cvtColor(prev_crop, cv2.COLOR_BGR2GRAY) if prev_crop.ndim == 3 else prev_crop
+        curr_gray = cv2.cvtColor(curr_crop, cv2.COLOR_BGR2GRAY) if curr_crop.ndim == 3 else curr_crop
+
+        kp1, des1 = self.orb.detectAndCompute(prev_gray, None)
+        kp2, des2 = self.orb.detectAndCompute(curr_gray, None)
         if kp1 is None or kp2 is None or des1 is None or des2 is None:
             return None, None
         if len(kp1) < 4 or len(kp2) < 4:
             return None, None
+
+        origin = (float(x0), float(y0))
+        for kp in kp1:
+            kp.pt = (kp.pt[0] + origin[0], kp.pt[1] + origin[1])
+        for kp in kp2:
+            kp.pt = (kp.pt[0] + origin[0], kp.pt[1] + origin[1])
 
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         matches = bf.knnMatch(des1, des2, k=2)
@@ -174,7 +202,9 @@ class SideviewFeatureMatcher:
 
         pts1 = np.float32([kp1[m.queryIdx].pt for m in good])
         pts2 = np.float32([kp2[m.trainIdx].pt for m in good])
-        pts1, pts2 = self.filter_motion_vectors(pts1, pts2)
+        pts1, pts2 = self.filter_motion_vectors(
+            pts1, pts2, forward_dy_sign=forward_dy_sign
+        )
         if len(pts1) < 3:
             return None, None
         return pts1, pts2

@@ -20,7 +20,11 @@ from src.validation.geometry import (
     camera_car_deg_to_eta,
     eta_to_camera_car_deg,
 )
-from src.validation.strip_correction import _eval_pchip_hold, _flatten_end_slopes
+from src.validation.strip_correction import (
+    _eval_pchip_hold,
+    _flatten_end_slopes,
+    remap_with_periodic_theta,
+)
 
 
 SEAM_PAIRS: Tuple[Tuple[str, str], ...] = (("U", "R"), ("U", "L"), ("R", "L"))
@@ -38,6 +42,8 @@ def normalize_run_id(run_id: str) -> str:
         return "U"
     if key == "B":
         return "R"
+    if key == "C":
+        return "L"
     return key
 
 
@@ -156,9 +162,17 @@ def warp_strips_to_seams(
 
 
 def _copy_strip(s: dict) -> dict:
+    rgb = s["rgb"]
+    filled = s["filled"]
+    if int(getattr(rgb, "size", 0)) >= 8_000_000:
+        rgb_out = rgb
+        filled_out = filled
+    else:
+        rgb_out = np.ascontiguousarray(rgb.copy())
+        filled_out = np.ascontiguousarray(filled.copy())
     return {
-        "rgb": np.ascontiguousarray(s["rgb"].copy()),
-        "filled": np.ascontiguousarray(s["filled"].copy()),
+        "rgb": rgb_out,
+        "filled": filled_out,
         "z_min": float(s["z_min"]),
         "z_max": float(s.get("z_max", s["z_min"])),
         "run_id": s["run_id"],
@@ -172,6 +186,22 @@ def _cfg_val(cfg, name: str, default):
 
 
 def _paste_common(strips: Sequence[dict], ppm: float) -> Dict[str, dict]:
+    shapes = [tuple(s["rgb"].shape[:2]) for s in strips]
+    z_mins = [float(s["z_min"]) for s in strips]
+    if (
+        shapes
+        and all(sh == shapes[0] for sh in shapes)
+        and all(abs(z - z_mins[0]) <= 1e-3 for z in z_mins)
+    ):
+        return {
+            s["run_id"]: {
+                "rgb": s["rgb"],
+                "filled": s["filled"],
+                "z_min": float(s["z_min"]),
+                "z_max": float(s.get("z_max", s["z_min"] + s["rgb"].shape[1] / ppm)),
+            }
+            for s in strips
+        }
     z_lo = min(float(s["z_min"]) for s in strips)
     z_hi = max(
         float(s.get("z_max", s["z_min"] + s["rgb"].shape[1] / ppm))
@@ -220,8 +250,8 @@ def _match_seam_pair(
     pair = pair_key(a_id, b_id)
     assert pair is not None
     car = OVERLAP_CENTER_CAMERA_CAR_DEG[pair]
-    gray_a = _to_gray(sa["rgb"])
-    gray_b = _to_gray(sb["rgb"])
+    gray_a = sa["rgb"]
+    gray_b = sb["rgb"]
     h, w = gray_a.shape[:2]
     row = _seam_row(h, car, theta_min, theta_max)
     half_deg = float(_cfg_val(cfg, "half_band_deg", 8.0))
@@ -239,7 +269,8 @@ def _match_seam_pair(
         pa, pb = orb_pts
         zs.extend((0.5 * (pa[:, 0] + pb[:, 0]) / ppm + z0).tolist())
         mz.extend(((pa[:, 0] - pb[:, 0]) / ppm).tolist())
-        mth.extend(((pa[:, 1] - pb[:, 1]) / max(h - 1, 1) * span).tolist())
+        dy = _wrap_row_delta(pa[:, 1] - pb[:, 1], h)
+        mth.extend((dy / max(h - 1, 1) * span).tolist())
 
     ncc = _ncc_band_matches(
         gray_a, gray_b, sa["filled"], sb["filled"],
@@ -347,10 +378,40 @@ def _iqr_keep(vals: np.ndarray, mult: float = 1.5, min_pts: int = 4) -> np.ndarr
     return (vals >= lo) & (vals <= hi)
 
 
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    if img.ndim == 2:
-        return img
-    return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+def _to_gray(
+    img: np.ndarray,
+    y0: int = 0,
+    y1: Optional[int] = None,
+    x0: int = 0,
+    x1: Optional[int] = None,
+) -> np.ndarray:
+    """切り出し帯だけを灰度化する。全画面 (h, w) の変換はしない。"""
+    if y1 is None:
+        y1 = int(img.shape[0])
+    if x1 is None:
+        x1 = int(img.shape[1])
+    band = img[y0:y1, x0:x1]
+    if band.ndim == 2:
+        return band
+    if not band.flags["C_CONTIGUOUS"]:
+        band = np.ascontiguousarray(band)
+    return cv2.cvtColor(band, cv2.COLOR_RGB2GRAY)
+
+
+def _wrap_row_delta(dy: np.ndarray, h: int) -> np.ndarray:
+    """θ 周期の行差。η=0 ラップをまたぐ 180° 接合用。"""
+    hh = max(int(h), 1)
+    return np.mod(np.asarray(dy, dtype=float) + 0.5 * hh, hh) - 0.5 * hh
+
+
+def _periodic_band_index(h: int, row: float, half_rows: float, extra: int = 0):
+    """接合帯を θ 周期で切り出す行インデックス。180°（η=0）でも L 側下端を含む。"""
+    h = max(int(h), 1)
+    half = max(int(np.ceil(half_rows)), 4) + max(int(extra), 0)
+    center = int(np.round(row)) % h
+    rel = np.arange(-half, half + 1, dtype=int)
+    idx = np.mod(center + rel, h)
+    return idx, rel, center
 
 
 def _band_slices(h: int, row: float, half_rows: float) -> Tuple[int, int]:
@@ -367,30 +428,52 @@ def _orb_band_matches(
     gray_a, gray_b, filled_a, filled_b, row: float, half_rows: float
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     h, w = gray_a.shape[:2]
-    y0, y1 = _band_slices(h, row, half_rows)
-    mask_a = np.zeros((h, w), dtype=np.uint8)
-    mask_b = np.zeros((h, w), dtype=np.uint8)
-    mask_a[y0:y1] = filled_a[y0:y1].astype(np.uint8) * 255
-    mask_b[y0:y1] = filled_b[y0:y1].astype(np.uint8) * 255
+    idx, rel, center = _periodic_band_index(h, row, half_rows)
+    band_a = np.take(gray_a, idx, axis=0)
+    band_b = np.take(gray_b, idx, axis=0)
+    mask_full_a = filled_a[idx]
+    mask_full_b = filled_b[idx]
+    y_base = float(center + rel[0])
     orb = cv2.ORB_create(nfeatures=800)
-    kp1, des1 = orb.detectAndCompute(gray_a, mask_a)
-    kp2, des2 = orb.detectAndCompute(gray_b, mask_b)
-    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
-        return None
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    knn = matcher.knnMatch(des1, des2, k=2)
-    good = []
-    for pair in knn:
-        if len(pair) < 2:
-            continue
-        m, n = pair
-        if m.distance < 0.75 * n.distance:
-            good.append(m)
-    if len(good) < 3:
+    pts_a: List[np.ndarray] = []
+    pts_b: List[np.ndarray] = []
+    chunk = 2048
+    overlap = 256
+    x0 = 0
+    while x0 < w:
+        x1 = min(w, x0 + chunk)
+        ga = _to_gray(band_a, 0, band_a.shape[0], x0, x1)
+        gb = _to_gray(band_b, 0, band_b.shape[0], x0, x1)
+        mask_a = mask_full_a[:, x0:x1].astype(np.uint8) * 255
+        mask_b = mask_full_b[:, x0:x1].astype(np.uint8) * 255
+        kp1, des1 = orb.detectAndCompute(ga, mask_a)
+        kp2, des2 = orb.detectAndCompute(gb, mask_b)
+        if des1 is not None and des2 is not None and len(kp1) >= 4 and len(kp2) >= 4:
+            knn = matcher.knnMatch(des1, des2, k=2)
+            good = []
+            for pair in knn:
+                if len(pair) < 2:
+                    continue
+                m, n = pair
+                if m.distance < 0.75 * n.distance:
+                    good.append(m)
+            if len(good) >= 3:
+                pa = np.float32([kp1[m.queryIdx].pt for m in good])
+                pb = np.float32([kp2[m.trainIdx].pt for m in good])
+                pa[:, 0] += x0
+                pb[:, 0] += x0
+                pa[:, 1] = np.mod(y_base + pa[:, 1], h)
+                pb[:, 1] = np.mod(y_base + pb[:, 1], h)
+                pts_a.append(pa)
+                pts_b.append(pb)
+        nxt = x0 + chunk - overlap
+        if nxt <= x0:
+            break
+        x0 = nxt
+    if not pts_a:
         return None
-    pa = np.float32([kp1[m.queryIdx].pt for m in good])
-    pb = np.float32([kp2[m.trainIdx].pt for m in good])
-    return pa, pb
+    return np.vstack(pts_a), np.vstack(pts_b)
 
 
 def _ncc_band_matches(
@@ -398,7 +481,6 @@ def _ncc_band_matches(
     row: float, half_rows: float, ppm: float, z0: float, span: float, h: int, cfg,
 ) -> Tuple[List[float], List[float], List[float]]:
     hh, w = gray_a.shape[:2]
-    y0, y1 = _band_slices(hh, row, half_rows)
     win = max(12, int(round(float(_cfg_val(cfg, "ncc_window_mm", 40.0)) * ppm)))
     step = max(4, int(round(float(_cfg_val(cfg, "ncc_step_mm", 15.0)) * ppm)))
     max_dz = float(_cfg_val(cfg, "max_dz_mm", 10.0))
@@ -406,34 +488,36 @@ def _ncc_band_matches(
     sx = max(2, int(np.ceil(max_dz * ppm)))
     sy = max(1, int(np.ceil(max_dth / max(span, 1e-12) * max(h - 1, 1))))
     zs, mz, mth = [], [], []
-    band_h = y1 - y0
-    if band_h < 4 or w < win + 2 * sx:
+    idx_t, rel_t, _center = _periodic_band_index(hh, row, half_rows)
+    idx_s, rel_s, _c2 = _periodic_band_index(hh, row, half_rows, extra=sy)
+    off = int(rel_t[0] - rel_s[0])
+    templ_h = int(idx_t.size)
+    if templ_h < 4 or w < win + 2 * sx or off < 0:
         return zs, mz, mth
+    band_a = np.take(gray_a, idx_t, axis=0)
+    band_b = np.take(gray_b, idx_s, axis=0)
+    fill_a = filled_a[idx_t]
+    fill_b = filled_b[idx_s]
     for x in range(sx, w - win - sx, step):
-        ta = gray_a[y0:y1, x : x + win].astype(np.float32)
-        ma = filled_a[y0:y1, x : x + win]
+        ta = _to_gray(band_a, 0, templ_h, x, x + win).astype(np.float32)
+        ma = fill_a[:, x : x + win]
         if float(np.mean(ma)) < 0.6 or float(ta.std()) < 4.0:
             continue
         xs0 = x - sx
         xs1 = x + win + sx
-        ys0 = max(0, y0 - sy)
-        ys1 = min(hh, y1 + sy)
-        search = gray_b[ys0:ys1, xs0:xs1].astype(np.float32)
-        mb = filled_b[ys0:ys1, xs0:xs1]
+        search = _to_gray(band_b, 0, band_b.shape[0], xs0, xs1).astype(np.float32)
+        mb = fill_b[:, xs0:xs1]
         if float(np.mean(mb)) < 0.5:
             continue
-        templ = ta
-        if search.shape[0] < templ.shape[0] or search.shape[1] < templ.shape[1]:
+        if search.shape[0] < ta.shape[0] or search.shape[1] < ta.shape[1]:
             continue
-        res = cv2.matchTemplate(search, templ, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(search, ta, cv2.TM_CCOEFF_NORMED)
         _, peak, _, loc = cv2.minMaxLoc(res)
         if peak < 0.35:
             continue
         px, py = loc
-        b_x = xs0 + px
-        b_y = ys0 + py
-        dx = float(b_x - x)
-        dy = float(b_y - y0)
+        dx = float((xs0 + px) - x)
+        dy = float(py - off)
         zs.append(z0 + (x + 0.5 * win) / ppm)
         mz.append(-dx / ppm)
         mth.append(-dy / max(h - 1, 1) * span)
@@ -507,19 +591,26 @@ def _remap_run(
     z_cols = z_min + xs / ppm
     u_lo_z, u_lo_th, u_hi_z, u_hi_th = boundary_displacement(run_id, z_cols, mismatches)
     span = float(theta_max - theta_min)
-    eta = theta_min + ys / max(h - 1, 1) * span
+    eta = theta_min + ys / max(h, 1) * span
     car = eta_to_camera_car_deg(eta)
-    wt = sector_blend_weight(car, run_id).reshape(-1, 1)
-    uz = (1.0 - wt) * u_lo_z.reshape(1, -1) + wt * u_hi_z.reshape(1, -1)
-    uth = (1.0 - wt) * u_lo_th.reshape(1, -1) + wt * u_hi_th.reshape(1, -1)
-    map_x = (xs.reshape(1, -1) - uz * ppm).astype(np.float32)
-    map_y = (ys.reshape(-1, 1) - uth / max(span, 1e-12) * (h - 1)).astype(np.float32)
-    rgb_o = cv2.remap(rgb, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-    filled_u8 = filled.astype(np.uint8) * 255
-    filled_o = cv2.remap(
-        filled_u8, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
-    ) > 0
-    rgb_o[~filled_o] = 0
+    wt = np.asarray(sector_blend_weight(car, run_id), dtype=float).reshape(-1, 1)
+    th_scale = h / max(span, 1e-12)
+    if rgb.ndim == 3:
+        rgb_o = np.zeros((h, w, rgb.shape[2]), dtype=rgb.dtype)
+    else:
+        rgb_o = np.zeros((h, w), dtype=rgb.dtype)
+    filled_o = np.zeros((h, w), dtype=bool)
+    chunk = 512
+    for x0 in range(0, w, chunk):
+        x1 = min(w, x0 + chunk)
+        uz = (1.0 - wt) * u_lo_z[x0:x1].reshape(1, -1) + wt * u_hi_z[x0:x1].reshape(1, -1)
+        uth = (1.0 - wt) * u_lo_th[x0:x1].reshape(1, -1) + wt * u_hi_th[x0:x1].reshape(1, -1)
+        map_x = (xs[x0:x1].reshape(1, -1) - uz * ppm).astype(np.float32)
+        map_y = (ys.reshape(-1, 1) - uth * th_scale).astype(np.float32)
+        chunk_rgb, chunk_filled = remap_with_periodic_theta(rgb, filled, map_x, map_y)
+        rgb_o[:, x0:x1] = chunk_rgb
+        filled_o[:, x0:x1] = chunk_filled
+        del uz, uth, map_x, map_y, chunk_rgb, chunk_filled
     return {
         "rgb": rgb_o,
         "filled": filled_o,

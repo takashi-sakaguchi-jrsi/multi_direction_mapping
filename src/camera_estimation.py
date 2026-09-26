@@ -3349,13 +3349,11 @@ class CameraEstimator:
         yaw2: float,
         pitch2: float,
     ) -> np.ndarray:
-        """U Mode A: フレーム残差を (dz, dyaw) の同一予測で説明する。
+        """U Mode A: フレーム残差を (dz, dpitch) の同一予測で説明する。
 
+        初期 (-90,90,90) は (0,0,90) と同一姿勢。pitch が周方向（車体 roll）。
+        yaw は光軸まわり捩れで roll と同じ軸のため固定（pitch への相殺漏れを防ぐ）。
         逆投影は world_to_pixel と同一の R_c2w 視線を使う。
-        yaw=0 付近のヤコビアンは dy→dz、dx→dyaw だが、残差を
-        「dz は旧 yaw / dyaw は旧 z」に足し分けると、yaw が外れたとき
-        z 移動の横漏れがすべて dyaw に載り雪崩になる。
-        pitch は進行面チルトのため固定（pitch2 は呼び出し側で pitch_0）。
         """
         pos_z = np.array([x0, y0, z0 + dz], dtype=float)
         pred = self.transformer.world_to_pixel(
@@ -6141,38 +6139,14 @@ def compute_distance_constraints_only(
     )
 
     loaded: List[np.ndarray] = []
-    if frames is not None:
-        loaded = list(frames)
-    elif video_path is not None:
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise ValueError(f"動画を開けません: {video_path}")
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if end_frame is None:
-            end_frame = total
-        idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if idx >= start_frame and idx < end_frame:
-                loaded.append(frame)
-            if idx >= end_frame:
-                break
-            idx += 1
-        cap.release()
-    elif known_z_mm is None:
-        raise ValueError("video_path または frames が必要です")
-
-    n_frames = len(loaded)
+    ocr_from_video = False
     if known_z_mm is not None:
         known = np.asarray(known_z_mm, dtype=float).reshape(-1)
-        if n_frames == 0:
-            n_frames = int(known.size)
-        if known.size != n_frames:
+        if frames is not None and len(frames) > 0 and known.size != len(frames):
             raise ValueError(
-                f"known_z_mm の長さ ({known.size}) がフレーム数 ({n_frames}) と一致しません"
+                f"known_z_mm の長さ ({known.size}) がフレーム数 ({len(frames)}) と一致しません"
             )
+        n_frames = int(known.size)
         ocr_dist = known.copy()
         success = np.isfinite(ocr_dist)
         logger.info(
@@ -6180,7 +6154,9 @@ def compute_distance_constraints_only(
         )
         if progress_callback:
             progress_callback(n_frames, n_frames)
-    else:
+    elif frames is not None:
+        loaded = frames
+        n_frames = len(loaded)
         ocr_dist = np.full(n_frames, np.nan, dtype=float)
         success = np.zeros(n_frames, dtype=bool)
         for i, frame in enumerate(loaded):
@@ -6196,6 +6172,47 @@ def compute_distance_constraints_only(
                 logger.debug(f"OCR-only frame {i} failed: {exc}")
             if progress_callback:
                 progress_callback(i + 1, n_frames)
+    elif video_path is not None:
+        ocr_from_video = True
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"動画を開けません: {video_path}")
+        ocr_vals: List[float] = []
+        ok_flags: List[bool] = []
+        try:
+            idx = 0
+            start = int(start_frame or 0)
+            while idx < start:
+                if not cap.grab():
+                    break
+                idx += 1
+            while end_frame is None or idx < int(end_frame):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                dist = np.nan
+                succeeded = False
+                try:
+                    dist, _ = extract_distance_from_frame(
+                        frame, ocr_roi_ratio, _ocr_config
+                    )
+                    succeeded = True
+                except OCRTextNotFoundError:
+                    pass
+                except Exception as exc:
+                    logger.debug(f"OCR-only frame {idx} failed: {exc}")
+                ocr_vals.append(dist)
+                ok_flags.append(succeeded)
+                idx += 1
+                if progress_callback:
+                    progress_callback(len(ocr_vals), len(ocr_vals))
+        finally:
+            cap.release()
+        n_frames = len(ocr_vals)
+        ocr_dist = np.asarray(ocr_vals, dtype=float)
+        success = np.asarray(ok_flags, dtype=bool)
+    else:
+        raise ValueError("video_path または frames が必要です")
 
     z_positions = None
     if n_frames == 0:

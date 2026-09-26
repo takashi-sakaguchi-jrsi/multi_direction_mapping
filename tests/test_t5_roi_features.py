@@ -48,6 +48,16 @@ def test_downward_vector_is_rejected_as_reverse():
     np.testing.assert_allclose(a[0], [20.0, 20.0])
 
 
+def test_downward_vector_is_kept_when_forward_dy_is_positive():
+    cfg = Config.from_defaults()
+    matcher = SideviewFeatureMatcher(cfg)
+    pts1 = np.array([[10.0, 10.0], [20.0, 20.0]], dtype=np.float32)
+    pts2 = np.array([[10.0, 18.0], [20.0, 12.0]], dtype=np.float32)
+    a, b = matcher.filter_motion_vectors(pts1, pts2, forward_dy_sign=1)
+    assert len(a) == 1
+    np.testing.assert_allclose(a[0], [10.0, 10.0])
+
+
 def test_upward_vector_is_kept():
     cfg = Config.from_defaults()
     matcher = SideviewFeatureMatcher(cfg)

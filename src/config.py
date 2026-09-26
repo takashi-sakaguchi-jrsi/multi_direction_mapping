@@ -1111,8 +1111,8 @@ class SeamWarpConfig:
     """True なら OCR 後に従来のエッジ中心 θ 一様シフトも行う。捩れは表せない。"""
     half_band_deg: float = 8.0
     control_spacing_mm: float = 30.0
-    max_dz_mm: float = 10.0
-    max_dtheta_deg: float = 4.0
+    max_dz_mm: float = 40.0
+    max_dtheta_deg: float = 6.0
     min_matches: int = 6
     ncc_window_mm: float = 40.0
     ncc_step_mm: float = 15.0
@@ -1164,10 +1164,10 @@ class LegacyVpConfig:
 
 @dataclass
 class TwoDirectionConfig:
-    """2方向合成PoC設定（main_twopass と同じ4層マージに載せる）"""
+    """2または3方向合成PoC設定（main_twopass と同じ4層マージに載せる）"""
     enabled: bool = True
     modes: List[str] = field(default_factory=lambda: ["A", "C"])
-    """A: Uはフレームdy→dz・dx→dyaw（pitch=90°固定、yawは0°求心）。R/Lは dz+pitch（yaw=y0固定、pitchはp0求心）。xy/roll固定。C: 6DoF+prior。"""
+    """A: U/R/L とも dz+pitch（xy/roll/yaw 固定。U は pitch=車体 roll。捩れは推定しない）。C: 6DoF+prior。"""
     output_dir: str = "data/output/two_direction"
     cache_projection_maps: bool = False
     z_source: str = "ocr"
@@ -1188,6 +1188,10 @@ class TwoDirectionConfig:
     run_B: RunConfig = field(default_factory=lambda: RunConfig(
         run_id="R", physical_roll_deg=120.0
     ))
+    run_C: RunConfig = field(default_factory=lambda: RunConfig(
+        run_id="L", physical_roll_deg=240.0
+    ))
+    """第3走行（L）。video_path が空なら 2 方向のままスキップする。"""
     center_prior: CenterPriorConfig = field(default_factory=CenterPriorConfig)
     hard_bounds: HardBoundsConfig = field(default_factory=HardBoundsConfig)
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
@@ -1198,6 +1202,24 @@ class TwoDirectionConfig:
     )
     projection: ProjectionConfig = field(default_factory=ProjectionConfig)
     legacy_vp: LegacyVpConfig = field(default_factory=LegacyVpConfig)
+
+    def run_slots(self) -> List[Tuple[str, "RunConfig"]]:
+        """設定スロット A/B/C。C は常に存在するが空パスなら未使用。"""
+        return [("A", self.run_A), ("B", self.run_B), ("C", self.run_C)]
+
+    def active_run_slots(
+        self, frames_by_tag: Optional[Dict[str, Any]] = None
+    ) -> List[Tuple[str, "RunConfig"]]:
+        """解析する run。A/B は常に含み、C は frames か video_path があるときだけ。"""
+        frames_by_tag = frames_by_tag or {}
+        out: List[Tuple[str, RunConfig]] = []
+        for tag, run_cfg in self.run_slots():
+            if frames_by_tag.get(tag) is not None:
+                out.append((tag, run_cfg))
+                continue
+            if tag in ("A", "B") or bool(getattr(run_cfg, "video_path", "")):
+                out.append((tag, run_cfg))
+        return out
 
 
 def _dataclass_from_dict(dc_cls, data: Optional[Dict[str, Any]]):
@@ -1213,7 +1235,7 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
     if not data:
         return TwoDirectionConfig()
     top = {k: v for k, v in data.items() if k not in {
-        "capture", "run_A", "run_B", "center_prior", "hard_bounds",
+        "capture", "run_A", "run_B", "run_C", "center_prior", "hard_bounds",
         "registration", "seam_warp", "best_view", "feature_matching_sideview",
         "projection", "legacy_vp",
     }}
@@ -1221,6 +1243,9 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
     cfg.capture = _dataclass_from_dict(CaptureConfig, data.get("capture"))
     cfg.run_A = _dataclass_from_dict(RunConfig, data.get("run_A"))
     cfg.run_B = _dataclass_from_dict(RunConfig, data.get("run_B"))
+    cfg.run_C = _dataclass_from_dict(RunConfig, data.get("run_C") or {
+        "run_id": "L", "physical_roll_deg": 240.0,
+    })
     cfg.center_prior = _dataclass_from_dict(CenterPriorConfig, data.get("center_prior"))
     cfg.hard_bounds = _dataclass_from_dict(HardBoundsConfig, data.get("hard_bounds"))
     cfg.registration = _dataclass_from_dict(RegistrationConfig, data.get("registration"))
@@ -2161,7 +2186,9 @@ class ConfigValidator:
                 raise ConfigValidationError(
                     f"two_direction.modes は A/C のみ許可: {cfg.modes}"
                 )
-        for run in (cfg.run_A, cfg.run_B):
+        for tag, run in cfg.run_slots():
+            if tag == "C" and not run.video_path:
+                continue
             if run.physical_roll_deg not in (0.0, 120.0, 240.0, -120.0):
                 raise ConfigValidationError(
                     f"physical_roll_deg は 0/120/240/-120 のいずれか: "

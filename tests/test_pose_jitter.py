@@ -52,7 +52,7 @@ def test_ocr_follows_accumulated_true_z():
 def test_program_pose_matches_demo_optical_axis():
     """U/R のプログラム姿勢は Demo 回転の光軸と一致する。"""
     for roll_car, rpy_deg in (
-        (0.0, (0.0, 0.0, 90.0)),
+        (0.0, (-90.0, 90.0, 90.0)),
         (120.0, (-90.0, 90.0, -30.0)),
     ):
         R_demo = FisheyeSideviewRenderer.demo_rotation(roll_car, 90.0)

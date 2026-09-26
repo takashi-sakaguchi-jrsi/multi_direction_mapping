@@ -132,7 +132,7 @@ def resolve_known_z_mm(config) -> Optional[np.ndarray]:
     path = td.known_z_metadata_path
     if path:
         return load_known_z_mm(path)
-    for run in (td.run_A, td.run_B):
+    for _tag, run in td.active_run_slots():
         if run.video_path:
             inferred = infer_known_z_metadata_path(run.video_path)
             if inferred is not None:

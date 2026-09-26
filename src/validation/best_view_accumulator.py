@@ -11,17 +11,17 @@ import numpy as np
 @dataclass
 class AccumulatorBuffers:
     color: np.ndarray
-    d_wall: np.ndarray
     filled: np.ndarray
-    source_run: np.ndarray
-    source_frame: np.ndarray
-    source_u: np.ndarray
-    source_v: np.ndarray
-    source_gamma: np.ndarray
+    source_run: Optional[np.ndarray]
     z_min: float
     theta_min: float
     pixels_per_mm: float
     theta_bins: int
+    d_wall: Optional[np.ndarray] = None
+    source_frame: Optional[np.ndarray] = None
+    source_u: Optional[np.ndarray] = None
+    source_v: Optional[np.ndarray] = None
+    source_gamma: Optional[np.ndarray] = None
 
 
 class BestViewAccumulator:
@@ -48,13 +48,8 @@ class BestViewAccumulator:
         shape = (theta_bins, z_bins)
         self.buf = AccumulatorBuffers(
             color=np.zeros(shape + (3,), dtype=np.uint8),
-            d_wall=np.full(shape, np.inf, dtype=np.float32),
             filled=np.zeros(shape, dtype=bool),
-            source_run=np.full(shape, -1, dtype=np.int16),
-            source_frame=np.full(shape, -1, dtype=np.int32),
-            source_u=np.full(shape, np.nan, dtype=np.float32),
-            source_v=np.full(shape, np.nan, dtype=np.float32),
-            source_gamma=np.full(shape, np.nan, dtype=np.float32),
+            source_run=None,
             z_min=float(z_min),
             theta_min=float(theta_min),
             pixels_per_mm=float(ppm),
@@ -64,6 +59,59 @@ class BestViewAccumulator:
         self.theta_max = float(theta_max)
         self.z_max = float(z_max)
         self._run_ids: Dict[str, int] = {}
+        self._grow_block = 2048
+
+    def _grow_to(self, min_cols: int) -> None:
+        """右端へゼロ列を足して幅を伸ばす。1px ずつではなく 2048 列単位。"""
+        min_cols = int(min_cols)
+        canvas_w = int(self.buf.color.shape[1])
+        if canvas_w >= min_cols:
+            return
+        extra = min_cols - canvas_w
+        grow_cols = ((extra + self._grow_block - 1) // self._grow_block) * self._grow_block
+        h = int(self.buf.color.shape[0])
+        self.buf.color = np.concatenate(
+            [self.buf.color, np.zeros((h, grow_cols, 3), dtype=self.buf.color.dtype)],
+            axis=1,
+        )
+        self.buf.filled = np.concatenate(
+            [self.buf.filled, np.zeros((h, grow_cols), dtype=self.buf.filled.dtype)],
+            axis=1,
+        )
+        if self.buf.source_run is not None:
+            self.buf.source_run = np.concatenate(
+                [self.buf.source_run, np.zeros((h, grow_cols), dtype=self.buf.source_run.dtype)],
+                axis=1,
+            )
+        for name, fill in (
+            ("d_wall", np.inf),
+            ("source_frame", -1),
+            ("source_u", np.nan),
+            ("source_v", np.nan),
+            ("source_gamma", np.nan),
+        ):
+            arr = getattr(self.buf, name)
+            if arr is None:
+                continue
+            pad = np.full((h, grow_cols), fill, dtype=arr.dtype)
+            setattr(self.buf, name, np.concatenate([arr, pad], axis=1))
+        self.z_max = float(self.buf.z_min) + (
+            self.buf.color.shape[1] / max(float(self.buf.pixels_per_mm), 1e-9)
+        )
+
+    def _ensure_point_bufs(self) -> None:
+        """点投影用の大きな配列は初回だけ確保する。"""
+        shape = self.buf.filled.shape
+        if self.buf.d_wall is None:
+            self.buf.d_wall = np.full(shape, np.inf, dtype=np.float32)
+        if self.buf.source_frame is None:
+            self.buf.source_frame = np.full(shape, -1, dtype=np.int32)
+        if self.buf.source_u is None:
+            self.buf.source_u = np.full(shape, np.nan, dtype=np.float32)
+        if self.buf.source_v is None:
+            self.buf.source_v = np.full(shape, np.nan, dtype=np.float32)
+        if self.buf.source_gamma is None:
+            self.buf.source_gamma = np.full(shape, np.nan, dtype=np.float32)
 
     def _run_code(self, run_id: str) -> int:
         if run_id not in self._run_ids:
@@ -104,8 +152,8 @@ class BestViewAccumulator:
             dst0 = 0
         canvas_w = self.buf.color.shape[1]
         if dst1 > canvas_w:
-            src1 -= dst1 - canvas_w
-            dst1 = canvas_w
+            self._grow_to(dst1)
+            canvas_w = self.buf.color.shape[1]
         if src0 >= src1 or dst0 >= dst1:
             return
         patch = colors[:, src0:src1]
@@ -114,9 +162,11 @@ class BestViewAccumulator:
             return
         self.buf.color[:, dst0:dst1][m] = patch[m]
         self.buf.filled[:, dst0:dst1][m] = True
-        code = self._run_code(run_id)
-        self.buf.source_run[:, dst0:dst1][m] = code
-        self.buf.source_frame[:, dst0:dst1][m] = int(frame_num)
+        if self.buf.source_run is not None:
+            code = self._run_code(run_id)
+            self.buf.source_run[:, dst0:dst1][m] = code
+        if self.buf.source_frame is not None:
+            self.buf.source_frame[:, dst0:dst1][m] = int(frame_num)
 
     def add_projection(self, proj: Dict[str, np.ndarray], run_id: str) -> None:
         """座標上書き。2D 帯があれば add_strip、なければ点列を後勝ちで書く。"""
@@ -143,6 +193,7 @@ class BestViewAccumulator:
         it, iz, in_rng = self._index(z, theta)
         if not np.any(in_rng):
             return
+        self._ensure_point_bufs()
         it, iz = it[in_rng], iz[in_rng]
         colors = colors[in_rng]
         u, v, gamma = u[in_rng], v[in_rng], gamma[in_rng]
@@ -151,7 +202,8 @@ class BestViewAccumulator:
         # 後から来た点で上書き（同一呼び出し内は配列末尾が残るよう逆順代入）
         self.buf.color[it, iz] = colors
         self.buf.filled[it, iz] = True
-        self.buf.source_run[it, iz] = run_code
+        if self.buf.source_run is not None:
+            self.buf.source_run[it, iz] = run_code
         self.buf.source_frame[it, iz] = frame_num
         self.buf.source_u[it, iz] = u
         self.buf.source_v[it, iz] = v
@@ -162,6 +214,8 @@ class BestViewAccumulator:
         return float(1.0 - np.mean(self.buf.filled))
 
     def run_adoption_ratio(self) -> Dict[str, float]:
+        if self.buf.source_run is None:
+            return {}
         filled = self.buf.filled
         n = max(int(np.sum(filled)), 1)
         out = {}
@@ -171,11 +225,15 @@ class BestViewAccumulator:
         return out
 
     def colormap_rgb(self) -> np.ndarray:
+        if self.buf.color.size >= 8_000_000:
+            self.buf.color[~self.buf.filled] = 0
+            return self.buf.color
         img = self.buf.color.copy()
         img[~self.buf.filled] = 0
         return img
 
     def provenance(self) -> Dict[str, np.ndarray]:
+        self._ensure_point_bufs()
         dw = self.buf.d_wall.copy()
         dw[~self.buf.filled] = np.nan
         return {

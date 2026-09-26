@@ -20,9 +20,10 @@ from src.validation.known_z import (
 )
 from tests.synthetic_pipe import make_sequence
 
-VIDEO_U = Path("data/input/videos/phi250_fisheye_side_U.mp4")
-VIDEO_R = Path("data/input/videos/phi250_fisheye_side_R.mp4")
-META = Path("data/input/videos/phi250_fisheye_side_metadata.json")
+VIDEO_U = Path("data/input/videos/phi250_line_swing_U.mp4")
+VIDEO_R = Path("data/input/videos/phi250_line_swing_R.mp4")
+VIDEO_L = Path("data/input/videos/phi250_line_swing_L.mp4")
+META = Path("data/input/videos/phi250_line_swing_metadata.json")
 
 
 def test_known_z_skips_tesseract_and_fills_ocr_dist(transformer, config):
@@ -157,12 +158,14 @@ def test_synthetic_pipeline_with_known_z(config, transformer, mapper):
         ocr.assert_not_called()
 
     assert result["z_source"] == "known"
-    assert result["modes"]["A"]["run_A"]["n_frames"] == 4
+    assert result["modes"]["A"]["run_U"]["n_frames"] == 4
     assert result["report_path"]
 
 
-@pytest.mark.skipif(not VIDEO_U.is_file() or not VIDEO_R.is_file() or not META.is_file(),
-                    reason="phi250 仮想動画または metadata が無い")
+@pytest.mark.skipif(
+    not VIDEO_U.is_file() or not VIDEO_R.is_file() or not VIDEO_L.is_file() or not META.is_file(),
+    reason="phi250 line-swing 仮想動画または metadata が無い",
+)
 def test_generated_videos_first_stage_known_z(tmp_path):
     cfg = Config.from_json("data/config/two_direction_config.json")
     cfg.two_direction.z_source = "known"
@@ -183,13 +186,17 @@ def test_generated_videos_first_stage_known_z(tmp_path):
     meta = json.loads(META.read_text(encoding="utf-8"))
     ocr_series = ocr_z_from_metadata(meta)
     assert result["z_source"] == "known"
-    assert result["modes"]["A"]["run_A"]["n_frames"] == 6
-    assert result["modes"]["A"]["run_A"]["z_ocr_first"] == pytest.approx(float(ocr_series[0]))
-    assert result["modes"]["A"]["run_A"]["z_ocr_last"] == pytest.approx(float(ocr_series[5]))
+    assert result["modes"]["A"]["run_U"]["n_frames"] == 6
+    assert result["modes"]["A"]["run_U"]["z_ocr_first"] == pytest.approx(float(ocr_series[0]))
+    assert result["modes"]["A"]["run_U"]["z_ocr_last"] == pytest.approx(float(ocr_series[5]))
     out = Path(cfg.two_direction.output_dir) / "mode_A"
-    assert (out / "partial_A.png").is_file()
-    assert (out / "partial_B.png").is_file()
+    assert (out / "partial_U.png").is_file()
+    assert (out / "partial_R.png").is_file()
     assert (out / "final.png").is_file()
+    if cfg.two_direction.run_C.video_path:
+        assert result["n_runs"] == 3
+        assert (out / "partial_L.png").is_file()
+        assert "run_L" in result["modes"]["A"]
 
 
 def test_two_direction_config_disables_production_calib():
@@ -209,6 +216,20 @@ def test_two_direction_config_disables_production_calib():
     assert transformer.camera.f == pytest.approx(341.87536947032544)
     assert transformer.camera.cx == pytest.approx(960.0)
     assert transformer.camera.cy == pytest.approx(540.0)
+
+
+def test_two_direction_config_loads_three_runs():
+    cfg = load_config("data/config/two_direction_config.json")
+    assert cfg.two_direction.run_C.run_id == "L"
+    assert cfg.two_direction.run_C.physical_roll_deg == pytest.approx(240.0)
+    assert "phi250_line_swing_L.mp4" in cfg.two_direction.run_C.video_path
+    tags = [t for t, _ in cfg.two_direction.active_run_slots()]
+    assert tags == ["A", "B", "C"]
+
+
+def test_default_config_skips_empty_run_c(config):
+    tags = [t for t, _ in config.two_direction.active_run_slots()]
+    assert tags == ["A", "B"]
 
 
 def test_apply_generation_metadata_clears_calib(config):

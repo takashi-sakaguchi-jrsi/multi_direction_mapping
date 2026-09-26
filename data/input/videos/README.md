@@ -11,7 +11,8 @@ data/input/videos/
 
 例: `vu250_side_U.mp4`, `vu250_side_R.mp4`
 
-PoC は3本のうち2本を `data/config/two_direction_config.json` の `run_A` / `run_B` で指定します。
+PoC は 2 本または 3 本を `data/config/two_direction_config.json` の `run_A` / `run_B` / `run_C` で指定します。
+`run_C`（L）の `video_path` が空なら 2 方向のまま動作します。
 `video_path` の suffix `_U` / `_R` / `_L` からも方向を補完できますが、config の `physical_roll_deg` が優先です。
 
 ## 展開図からの生成（Phase1省略）
@@ -20,7 +21,7 @@ CameraCarDemo 相当の円筒サンプリングで、カメラモデルだけ等
 正本展開図は `original_colormap/phi250tenkaizu.png`（φ250mm、半径 125mm）。
 
 ```bash
-python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
+python src/generate_two_direction_test_videos.py --fov 181 --runs U,R,L --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
 ```
 
 `--jitter` はフレームごとの dz / dpitch / dyaw に、十数フレーム周期の緩やかな中程度振動と 2〜3 フレームの小さい振動を合成します。OCR 列 `ocr_z_mm` は真の累積 z に 10mm 遅れモデルを掛けたものです。

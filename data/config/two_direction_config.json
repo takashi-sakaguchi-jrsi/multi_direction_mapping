@@ -30,16 +30,18 @@
       "estimate_dz": true,
       "estimate_droll": true,
       "estimate_dyaw": true,
-      "estimate_dpitch": true
+      "estimate_dpitch": true,
+      "max_dtheta": 2.0,
+      "max_dphi": 2.0
     }
   },
   "two_direction": {
     "enabled": true,
     "modes": ["A"],
-    "output_dir": "data/output/two_direction",
+    "output_dir": "data/output/three_direction",
     "cache_projection_maps": false,
     "z_source": "known",
-    "known_z_metadata_path": "data/input/videos/phi250_line_swing_metadata.json",
+    "known_z_metadata_path": "data/input/videos/phi250_baseline_metadata.json",
     "match_source_pixels_per_mm": true,
     "capture": {
       "usable_outer_radius_ratio": 0.8,
@@ -50,7 +52,7 @@
       "image_width_px": 1920
     },
     "run_A": {
-      "video_path": "data/input/videos/phi250_line_swing_U.mp4",
+      "video_path": "data/input/videos/phi250_baseline_U.mp4",
       "physical_pitch_deg": 90.0,
       "physical_roll_deg": 0.0,
       "yaw_ref_deg": 0.0,
@@ -59,13 +61,22 @@
       "run_id": "U"
     },
     "run_B": {
-      "video_path": "data/input/videos/phi250_line_swing_R.mp4",
+      "video_path": "data/input/videos/phi250_baseline_R.mp4",
       "physical_pitch_deg": 90.0,
       "physical_roll_deg": 120.0,
       "yaw_ref_deg": 0.0,
       "x_ref_mm": 0.0,
       "y_ref_mm": 0.0,
       "run_id": "R"
+    },
+    "run_C": {
+      "video_path": "data/input/videos/phi250_baseline_L.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 240.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "L"
     },
     "center_prior": {
       "scale": 1.0,
@@ -97,8 +108,8 @@
       "apply_edge_theta": false,
       "half_band_deg": 8.0,
       "control_spacing_mm": 30.0,
-      "max_dz_mm": 10.0,
-      "max_dtheta_deg": 4.0,
+      "max_dz_mm": 40.0,
+      "max_dtheta_deg": 6.0,
       "min_matches": 6,
       "ncc_window_mm": 40.0,
       "ncc_step_mm": 15.0

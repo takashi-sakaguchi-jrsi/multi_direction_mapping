@@ -58,3 +58,27 @@ def test_analyze_run_slices_known_z_and_keeps_original_frame_num(transformer, co
     assert recs[0].z_ocr == pytest.approx(30.0)
     assert recs[-1].z_ocr == pytest.approx(50.0)
     np.testing.assert_allclose(extra["ocr_dist"], [30.0, 40.0, 50.0])
+
+
+def test_analyze_run_from_video_does_not_keep_all_frames(transformer, config, tmp_path):
+    import cv2
+
+    config.two_direction.start_frame = 0
+    config.two_direction.end_frame = None
+    config.estimation.use_offset_moving_average = False
+    video = tmp_path / "tiny.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 5.0, (32, 32))
+    for i in range(6):
+        writer.write(np.full((32, 32, 3), i * 20, dtype=np.uint8))
+    writer.release()
+    config.two_direction.run_A.video_path = str(video)
+    known = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    estimator = CameraEstimator(config.estimation, transformer)
+    recs, extra = FrameAnalyzer(config, estimator, mode="A").analyze_run(
+        config.two_direction.run_A, known_z_mm=known, fps=5.0,
+    )
+    assert extra["frames"] is None
+    assert extra["video_path"] == str(video)
+    assert len(recs) == 6
+    assert extra["start_frame"] == 0
+    assert extra["end_frame"] == 6

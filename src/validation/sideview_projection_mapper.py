@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
-import scipy.ndimage
 
 from src.validation.geometry import pose_R_c2w, world_to_eta
 from src.validation.records import FrameProjectionSummary
@@ -15,7 +15,7 @@ class SideviewProjectionMapper:
     """ColorMapGenerator と同じ逆投影で帯を復元する。
 
     展開図の各 (η, z) を円筒面上の点にし、world_to_pixel でフレーム座標へ戻し、
-    ``scipy.ndimage.map_coordinates(..., order=1)`` で周囲画素を双線形補間する。
+    ``cv2.remap(..., INTER_LINEAR)`` で周囲画素を双線形補間する。
     真横撮影では画像中心が最近壁なので、正面用の内側ドーナツ切欠きは使わない。
     """
 
@@ -108,13 +108,23 @@ class SideviewProjectionMapper:
         )
         map_x = pixels[:, 0].astype(np.float32)
         map_y = pixels[:, 1].astype(np.float32)
-        color_flat = np.stack([
-            scipy.ndimage.map_coordinates(
-                frame[:, :, c], [map_y, map_x], order=1, mode="reflect"
-            )
-            for c in (2, 1, 0)
-        ], axis=-1).astype(np.uint8)
-        colors = color_flat.reshape(height, width, 3)
+        map_x_2d = np.nan_to_num(
+            map_x.reshape(height, width), nan=-1.0, posinf=-1.0, neginf=-1.0
+        )
+        map_y_2d = np.nan_to_num(
+            map_y.reshape(height, width), nan=-1.0, posinf=-1.0, neginf=-1.0
+        )
+        sampled = cv2.remap(
+            frame,
+            map_x_2d,
+            map_y_2d,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        if sampled.ndim == 2:
+            colors = cv2.cvtColor(sampled, cv2.COLOR_GRAY2RGB)
+        else:
+            colors = cv2.cvtColor(sampled, cv2.COLOR_BGR2RGB)
 
         camera = self.transformer.camera
         r_sq = (map_x - camera.cx) ** 2 + (map_y - camera.cy) ** 2

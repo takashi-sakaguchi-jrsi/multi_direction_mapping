@@ -46,3 +46,18 @@ def test_strip_overwrites_by_coordinate(config):
     rgb = acc.colormap_rgb()
     filled = acc.buf.filled[:, :w]
     assert np.all(rgb[:, :w][filled] == np.array([255, 0, 0]))
+
+
+def test_add_strip_grows_past_right_edge(config):
+    acc = BestViewAccumulator(config, z_min=0.0, z_max=8.0, theta_bins=16)
+    initial_w = acc.buf.color.shape[1]
+    h, w = 16, initial_w + 12
+    colors = np.zeros((h, w, 3), dtype=np.uint8)
+    colors[:] = (0, 0, 255)
+    mask = np.ones((h, w), dtype=bool)
+    acc.add_strip(colors, mask, z_min_mm=0.0, run_id="A", frame_num=0)
+    assert acc.buf.color.shape[1] > initial_w
+    assert acc.buf.color.shape[1] >= w
+    written = acc.buf.color[:, :w]
+    assert np.any(np.all(written == np.array([0, 0, 255]), axis=2))
+    assert np.all(acc.buf.filled[:, :w])

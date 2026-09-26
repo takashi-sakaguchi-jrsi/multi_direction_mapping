@@ -25,12 +25,15 @@ PHYSICAL_ROLL_TO_RUN_ID = {
 # カメラカー初期方位 (pitch_car, roll_car) → プログラム姿勢 (roll, yaw, pitch) [deg]
 # カメラカーの roll/pitch はプログラム Euler とは別定義。回転順は変換に使わない。
 # プログラム: CameraState = [roll, yaw, pitch]、R_c2w = R_roll @ R_pitch @ R_yaw。
-# 投影は v_world = v_cam @ R_c2w。生成側 Demo は v_world = R_demo @ v_cam なので
-# R_c2w.T が R_demo と一致する組を使う（光軸だけでなくカメラ上下も合わせる）。
-# 120° の光軸は水平より 30° 下。光軸周りの 180° 不定性は Demo の「上」に合わせ、
-# R のプログラム roll は -90、L は +90。
+# 投影は v_world = v_cam @ R_c2w。生成側 Demo は v_world = R_demo @ v_cam。
+# U/R/L とも R_c2w.T = R_demo（光軸とカメラ上下）。
+# 120° の光軸は水平より 30° 下。R のプログラム roll は -90、L は +90。
+# U は (0,0,90) だと pitch=90° 特異点で車体 roll（XY 振り）を書けず、ねじれ
+# （roll+yaw）に漏れる。(-90,90,90) は (0,0,90) と同一のカメラ姿勢で、
+# dpitch だけが周方向＝車体 roll になる。(90,90,90) は roll 符号が逆で
+# 光軸まわり 180° ずれる。
 _CAPTURE_TO_PROGRAM_RPY_DEG = {
-    (90.0, 0.0): (0.0, 0.0, 90.0),
+    (90.0, 0.0): (-90.0, 90.0, 90.0),
     (90.0, 120.0): (-90.0, 90.0, -30.0),
     (90.0, -120.0): (90.0, -90.0, -30.0),
 }
@@ -101,7 +104,7 @@ def capture_to_program_orientation_deg(
     プログラムの yaw/pitch/roll とは定義が異なる。回転順は問わず、
     プログラム角へは次の対応で変換する。
 
-        (90, 0)    → yaw=0,   pitch=90,  roll=0    → (roll,yaw,pitch)=(0, 0, 90)
+        (90, 0)    → yaw=90,  pitch=90,  roll=-90  → (roll,yaw,pitch)=(-90, 90, 90)
         (90, 120)  → yaw=90,  pitch=-30, roll=-90  → (-90, 90, -30)
         (90, -120) → yaw=-90, pitch=-30, roll=90   → (90, -90, -30)
     """
@@ -230,9 +233,10 @@ def expected_edge_etas(
 def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
     """Mode A で推定する角度 (estimate_yaw, estimate_pitch)。
 
-    U: フレーム残差は (dz, dyaw) を同一予測。yaw=0 付近では dy→dz・dx→dyaw。
-       pitch=90°・roll=0・x=y=0 固定。yaw は 0° 求心。
-       pitch は進行面のチルトなので横残差から推定しない（z 復元を壊す）。
+    U: 初期 (roll,yaw,pitch)=(-90,90,90)。(0,0,90) と同一姿勢。
+       車体 roll はプログラム pitch。yaw と roll は光軸まわり捩れで
+       同じ軸なので両方とも固定（yaw を入れると pitch に相殺が漏れ積算する）。
+       画像 x→pitch、画像 y→z。pitch は 90° 求心。前後のうなずきは dz に載せる。
     R/L: 画像x=pitch, 画像y=z。roll=r0, yaw=y0, x=y=0 固定。pitch は p0 求心。
     """
     key = str(run_id or "").strip().upper()
@@ -240,9 +244,9 @@ def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
         key = "U"
     if key == "B":
         key = "R"
-    if key == "U":
-        return True, False
-    if key in ("R", "L"):
+    if key == "C":
+        key = "L"
+    if key in ("U", "R", "L"):
         return False, True
     return True, False
 
@@ -252,6 +256,8 @@ def mode_a_use_frame_xy_residual(run_id: str) -> bool:
     key = str(run_id or "").strip().upper()
     if key == "A":
         key = "U"
+    if key == "C":
+        key = "L"
     return key == "U"
 
 
@@ -262,6 +268,8 @@ def theta_in_camera_car_sector(eta, run_id: str) -> np.ndarray:
         key = "U"
     if key in ("B",):
         key = "R"
+    if key in ("C",):
+        key = "L"
     if key not in SECTOR_CAMERA_CAR_DEG:
         raise ValueError(f"未知の run_id: {run_id}")
     lo, hi = SECTOR_CAMERA_CAR_DEG[key]

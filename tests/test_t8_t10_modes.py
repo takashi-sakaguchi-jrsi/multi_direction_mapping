@@ -7,13 +7,16 @@ from src.camera_estimation import CameraEstimator
 from src.validation.geometry import build_run_reference, mode_a_estimate_yaw_pitch
 
 
-def _known_correspondences(transformer, physical_roll_deg=0.0, n=20, yaw_off_deg=0.0):
+def _known_correspondences(
+    transformer, physical_roll_deg=0.0, n=20, yaw_off_deg=0.0, pitch_off_deg=0.0,
+):
     """光軸付近の円筒点を2姿勢へ投影して対応点を作る"""
     from src.validation.geometry import optical_axis_world
     radius = transformer.pipe_radius
     ref = build_run_reference(physical_roll_deg)
     ori0 = np.array([ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]])
     ori0[1] = ori0[1] + np.radians(float(yaw_off_deg))
+    ori0[2] = ori0[2] + np.radians(float(pitch_off_deg))
     axis = optical_axis_world(*ori0)
     nxy = np.linalg.norm(axis[:2]) + 1e-12
     base = np.array([axis[0] / nxy * radius, axis[1] / nxy * radius, 0.0])
@@ -54,9 +57,10 @@ def _cam_params(transformer):
 
 def test_mode_a_free_angles_by_run():
     from src.validation.geometry import mode_a_use_frame_xy_residual
-    assert mode_a_estimate_yaw_pitch("U") == (True, False)
+    assert mode_a_estimate_yaw_pitch("U") == (False, True)
     assert mode_a_estimate_yaw_pitch("R") == (False, True)
     assert mode_a_estimate_yaw_pitch("L") == (False, True)
+    assert mode_a_estimate_yaw_pitch("C") == (False, True)
     assert mode_a_use_frame_xy_residual("U") is True
     assert mode_a_use_frame_xy_residual("R") is False
 
@@ -80,13 +84,40 @@ def test_mode_a_u_maps_frame_dy_to_dz(transformer, config):
     assert abs(motion["dx"]) < 1e-6
     assert abs(motion["dy"]) < 1e-6
     assert abs(motion["droll"]) < 1e-6
-    assert abs(motion["dpitch"]) < 1e-9
+    assert abs(np.degrees(motion["dpitch"])) < 0.5
     assert motion["dz"] > 1.0
-    assert abs(np.degrees(motion["dyaw"])) < 0.5
+    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+
+
+def test_mode_a_u_pitch_does_not_avalanche_from_offset(transformer, config):
+    """純 z 移動を pitch≠90 から見ても、分割残差のように dpitch を積み増さない。"""
+    estimator = CameraEstimator(config.estimation, transformer)
+    pitch_off = 8.0
+    p0, p1, ref = _known_correspondences(transformer, 0.0, pitch_off_deg=pitch_off)
+    if len(p0) < 4:
+        pytest.skip("投影点が不足")
+    state = {
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([
+            ref["roll_ref_rad"],
+            ref["yaw_ref_rad"],
+            ref["pitch_ref_rad"] + np.radians(pitch_off),
+        ]),
+    }
+    motion = estimator.estimate_motion_flexible(
+        p0, p1, state, _cam_params(transformer),
+        run_reference=ref,
+        center_prior=config.two_direction.center_prior,
+        estimation_mode="A",
+        hard_bounds=config.two_direction.hard_bounds,
+    )
+    assert motion["dz"] > 1.0
+    assert abs(np.degrees(motion["dpitch"])) < 0.5
+    assert abs(np.degrees(motion["dyaw"])) < 1e-6
 
 
 def test_mode_a_u_yaw_does_not_avalanche_from_offset(transformer, config):
-    """純 z 移動を yaw≠0 から見ても、分割残差のように dyaw を積み増さない。"""
+    """純 z 移動を yaw≠90 から見ても、Mode A は yaw を動かさない。"""
     estimator = CameraEstimator(config.estimation, transformer)
     yaw_off = 8.0
     p0, p1, ref = _known_correspondences(transformer, 0.0, yaw_off_deg=yaw_off)
@@ -108,7 +139,8 @@ def test_mode_a_u_yaw_does_not_avalanche_from_offset(transformer, config):
         hard_bounds=config.two_direction.hard_bounds,
     )
     assert motion["dz"] > 1.0
-    assert abs(np.degrees(motion["dyaw"])) < 0.5
+    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+    assert abs(np.degrees(motion["dpitch"])) < 0.5
 
 
 def test_u_pixel_roundtrip_matches_world_to_pixel(transformer):
@@ -127,6 +159,19 @@ def test_u_pixel_roundtrip_matches_world_to_pixel(transformer):
     err = np.linalg.norm(back - pts, axis=1)
     assert float(np.mean(err)) < 1.0
     assert float(np.max(err)) < 3.0
+
+
+def test_u_forward_z_moves_image_up_like_demo(transformer):
+    """U の +z は Demo / 旧 (0,0,90) と同じく画像 y が減る（上へ流れる）。"""
+    ref = build_run_reference(0.0)
+    r, y, p = ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]
+    cam = transformer.camera
+    pos0 = np.array([0.0, 0.0, 0.0])
+    pos1 = np.array([0.0, 0.0, 10.0])
+    pts = np.array([[cam.cx, cam.cy]], dtype=float)
+    world = transformer.pixel_to_world_R_c2w(pts, pos0, r, y, p)
+    pix1 = transformer.world_to_pixel(world, pos1, r, y, p)
+    assert float(pix1[0, 1] - pts[0, 1]) < -1.0
 
 
 def test_mode_a_r_estimates_pitch_freezes_yaw(transformer, config):

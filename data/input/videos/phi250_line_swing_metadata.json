@@ -2304,6 +2304,13 @@
       "physical_roll_internal_deg": 120.0,
       "video_path": "data/input/videos/phi250_line_swing_R.mp4",
       "n_frames": 320
+    },
+    "L": {
+      "run_id": "L",
+      "physical_roll_deg": 240.0,
+      "physical_roll_internal_deg": -120.0,
+      "video_path": "data/input/videos/phi250_line_swing_L.mp4",
+      "n_frames": 320
     }
   }
 }

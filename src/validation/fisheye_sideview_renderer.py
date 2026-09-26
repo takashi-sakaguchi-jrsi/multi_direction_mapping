@@ -290,6 +290,23 @@ class FisheyeSideviewRenderer:
             return frame, hits
         return frame
 
+    def iter_rendered_frames(
+        self,
+        z_values: Sequence[float],
+        roll_deg: float,
+        pitch_deg: float = DEFAULT_PITCH_DEG,
+        cam_xy: Tuple[float, float] = (0.0, 0.0),
+        program_rpy_rad: Optional[Sequence[Sequence[float]]] = None,
+    ):
+        """1 フレームずつ描画する。全長動画ではリスト化せず VideoWriter へ流す。"""
+        for i, z in enumerate(z_values):
+            pos = (float(cam_xy[0]), float(cam_xy[1]), float(z))
+            rpy = None
+            if program_rpy_rad is not None:
+                rpy = program_rpy_rad[i]
+            frame = self.render_view(pos, (roll_deg, pitch_deg), program_rpy_rad=rpy)
+            yield frame, float(z)
+
     def render_sequence(
         self,
         z_values: Sequence[float],
@@ -300,14 +317,64 @@ class FisheyeSideviewRenderer:
     ) -> Tuple[List[np.ndarray], List[float]]:
         frames: List[np.ndarray] = []
         zs: List[float] = []
-        for i, z in enumerate(z_values):
-            pos = (float(cam_xy[0]), float(cam_xy[1]), float(z))
-            rpy = None
-            if program_rpy_rad is not None:
-                rpy = program_rpy_rad[i]
-            frames.append(self.render_view(pos, (roll_deg, pitch_deg), program_rpy_rad=rpy))
-            zs.append(float(z))
+        for frame, z in self.iter_rendered_frames(
+            z_values,
+            roll_deg=roll_deg,
+            pitch_deg=pitch_deg,
+            cam_xy=cam_xy,
+            program_rpy_rad=program_rpy_rad,
+        ):
+            frames.append(frame)
+            zs.append(z)
         return frames, zs
+
+    def accumulate_reconstruct(
+        self,
+        canvas: np.ndarray,
+        filled: np.ndarray,
+        dmin: np.ndarray,
+        frame: np.ndarray,
+        pos: Sequence[float],
+        ori: Sequence[float],
+    ) -> None:
+        """既知姿勢の1フレームを展開図キャンバスへ足す。"""
+        ori = tuple(float(v) for v in ori)
+        if len(ori) >= 3:
+            _, hits = self.render_view(pos, ori[:2], return_hits=True, program_rpy_rad=ori[:3])
+        else:
+            _, hits = self.render_view(pos, ori, return_hits=True)
+        valid = hits["valid"]
+        if not np.any(valid):
+            return
+        x = np.where(valid, hits["X"], 0.0)
+        y = np.where(valid, hits["Y"], 0.0)
+        z = np.where(valid, hits["Z"], 0.0)
+        angle = demo_wall_angle_deg(x, y)
+        eq_x = np.rint(z / self.horiz_mm_per_px).astype(np.int32)
+        eq_y = np.rint(angle / self.vert_deg_per_px).astype(np.int32) % self.eq_h
+        yy = frame.shape[0]
+        xx = frame.shape[1]
+        jj, ii = np.meshgrid(np.arange(yy), np.arange(xx), indexing="ij")
+        sel = (
+            valid
+            & (eq_x >= 0) & (eq_x < self.eq_w)
+            & (eq_y >= 0) & (eq_y < self.eq_h)
+        )
+        if not np.any(sel):
+            return
+        ix = eq_x[sel]
+        iy = eq_y[sel]
+        dw = hits["d_wall"][sel].astype(np.float32)
+        colors = frame[jj[sel], ii[sel]]
+        better = dw < dmin[iy, ix]
+        unset = ~filled[iy, ix]
+        take = better | unset
+        if not np.any(take):
+            return
+        iy, ix = iy[take], ix[take]
+        canvas[iy, ix] = colors[take]
+        dmin[iy, ix] = dw[take]
+        filled[iy, ix] = True
 
     def reconstruct_from_hits(
         self,
@@ -320,43 +387,7 @@ class FisheyeSideviewRenderer:
         filled = np.zeros((self.eq_h, self.eq_w), dtype=bool)
         dmin = np.full((self.eq_h, self.eq_w), np.inf, dtype=np.float32)
         for frame, pos, ori in zip(frames, positions, orientations):
-            ori = tuple(float(v) for v in ori)
-            if len(ori) >= 3:
-                _, hits = self.render_view(pos, ori[:2], return_hits=True, program_rpy_rad=ori[:3])
-            else:
-                _, hits = self.render_view(pos, ori, return_hits=True)
-            valid = hits["valid"]
-            if not np.any(valid):
-                continue
-            x = np.where(valid, hits["X"], 0.0)
-            y = np.where(valid, hits["Y"], 0.0)
-            z = np.where(valid, hits["Z"], 0.0)
-            angle = demo_wall_angle_deg(x, y)
-            eq_x = np.rint(z / self.horiz_mm_per_px).astype(np.int32)
-            eq_y = np.rint(angle / self.vert_deg_per_px).astype(np.int32) % self.eq_h
-            yy = frame.shape[0]
-            xx = frame.shape[1]
-            jj, ii = np.meshgrid(np.arange(yy), np.arange(xx), indexing="ij")
-            sel = (
-                valid
-                & (eq_x >= 0) & (eq_x < self.eq_w)
-                & (eq_y >= 0) & (eq_y < self.eq_h)
-            )
-            if not np.any(sel):
-                continue
-            ix = eq_x[sel]
-            iy = eq_y[sel]
-            dw = hits["d_wall"][sel].astype(np.float32)
-            colors = frame[jj[sel], ii[sel]]
-            better = dw < dmin[iy, ix]
-            unset = ~filled[iy, ix]
-            take = better | unset
-            if not np.any(take):
-                continue
-            iy, ix = iy[take], ix[take]
-            canvas[iy, ix] = colors[take]
-            dmin[iy, ix] = dw[take]
-            filled[iy, ix] = True
+            self.accumulate_reconstruct(canvas, filled, dmin, frame, pos, ori)
         canvas[~filled] = 0
         return canvas, filled
 
@@ -465,19 +496,29 @@ def resolve_colormap_path(explicit: Optional[Union[str, Path]] = None) -> Path:
     )
 
 
-def write_mp4(path: Path, frames: Sequence[np.ndarray], fps: float) -> None:
-    if not frames:
-        raise ValueError("フレームが空です")
-    h, w = frames[0].shape[:2]
+def open_mp4_writer(
+    path: Path, frame_size_wh: Tuple[int, int], fps: float
+) -> cv2.VideoWriter:
+    """1 フレームずつ書く VideoWriter。全フレームを RAM に持たない。"""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = int(frame_size_wh[0]), int(frame_size_wh[1])
     writer = cv2.VideoWriter(
         str(path),
         cv2.VideoWriter_fourcc(*"mp4v"),
         float(fps),
-        (w, h),
+        (width, height),
     )
     if not writer.isOpened():
         raise RuntimeError(f"動画を開けません: {path}")
+    return writer
+
+
+def write_mp4(path: Path, frames: Sequence[np.ndarray], fps: float) -> None:
+    if not frames:
+        raise ValueError("フレームが空です")
+    h, w = frames[0].shape[:2]
+    writer = open_mp4_writer(path, (w, h), fps)
     try:
         for frame in frames:
             writer.write(frame)

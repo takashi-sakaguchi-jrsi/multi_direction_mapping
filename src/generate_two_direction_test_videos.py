@@ -32,9 +32,9 @@ from src.validation.fisheye_sideview_renderer import (
     N_FRAMES_HINT_MIN,
     FisheyeSideviewRenderer,
     crop_colormap_z_window,
+    open_mp4_writer,
     pixels_per_mm_from_equirect,
     resolve_colormap_path,
-    write_mp4,
     z_values_for_segment,
 )
 from src.validation.ocr_simulation import (
@@ -137,6 +137,10 @@ def generate_two_direction_videos(
         logger.info(
             f"生成区間 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, step={z_step_mm} mm"
         )
+    logger.info(
+        f"フレームは逐次エンコードします（RAM に全枚保持しない）: "
+        f"{len(zs)} frames × {len(runs)} runs, {width}x{height}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir
     result: Dict = {
@@ -162,8 +166,16 @@ def generate_two_direction_videos(
         "phase1": False,
         "runs": {},
     }
-    all_frames: Dict[str, List[np.ndarray]] = {}
-    for run in runs:
+    rec_canvas = None
+    rec_filled = None
+    rec_dmin = None
+    if reconstruct:
+        rec_canvas = np.zeros_like(renderer.equirect_img)
+        rec_filled = np.zeros((renderer.eq_h, renderer.eq_w), dtype=bool)
+        rec_dmin = np.full((renderer.eq_h, renderer.eq_w), np.inf, dtype=np.float32)
+    n_runs = len(runs)
+    progress_every = 50 if len(zs) >= 100 else max(1, len(zs))
+    for run_i, run in enumerate(runs):
         roll = SUFFIX_TO_PHYSICAL_ROLL_DEG[run]
         rpy_list = None
         if jitter:
@@ -179,42 +191,60 @@ def generate_two_direction_videos(
                 for i in range(len(zs))
             ]
             program_rpy_by_run[run] = rpy_list
-        frames, _ = renderer.render_sequence(
-            zs, roll_deg=roll, pitch_deg=pitch_deg, program_rpy_rad=rpy_list
-        )
-        all_frames[run] = frames
         video_path = videos_dir / f"{name}_{run}.mp4"
-        write_mp4(video_path, frames, fps)
+        writer = open_mp4_writer(
+            video_path, (renderer.output_width, renderer.output_height), fps
+        )
+        frame_dir = None
         if save_png:
             frame_dir = videos_dir / f"{name}_{run}_frames"
             frame_dir.mkdir(parents=True, exist_ok=True)
-            for i, frame in enumerate(frames):
-                cv2.imwrite(str(frame_dir / f"{i:04d}.png"), frame)
+        n_written = 0
+        try:
+            for i, (frame, z) in enumerate(
+                renderer.iter_rendered_frames(
+                    zs, roll_deg=roll, pitch_deg=pitch_deg, program_rpy_rad=rpy_list
+                )
+            ):
+                writer.write(frame)
+                if frame_dir is not None:
+                    cv2.imwrite(str(frame_dir / f"{i:06d}.png"), frame)
+                if reconstruct:
+                    ori = (
+                        program_rpy_by_run[run][i]
+                        if jitter
+                        else (float(roll), float(pitch_deg))
+                    )
+                    renderer.accumulate_reconstruct(
+                        rec_canvas,
+                        rec_filled,
+                        rec_dmin,
+                        frame,
+                        (0.0, 0.0, float(z)),
+                        ori,
+                    )
+                n_written += 1
+                if (i + 1) % progress_every == 0 or (i + 1) == len(zs):
+                    logger.info(
+                        f"{run}: {i + 1}/{len(zs)} frames "
+                        f"(run {run_i + 1}/{n_runs})"
+                    )
+        finally:
+            writer.release()
         result["runs"][run] = {
             "run_id": run_id_from_physical_roll(roll),
             "physical_roll_deg": float(roll),
             "physical_roll_internal_deg": float(physical_roll_to_internal_deg(roll)),
             "video_path": str(video_path),
-            "n_frames": len(frames),
+            "n_frames": n_written,
         }
-        logger.info(f"{run}: {video_path} ({len(frames)} frames, roll={roll})")
+        logger.info(f"{run}: {video_path} ({n_written} frames, roll={roll})")
 
     if reconstruct:
         rec_dir = output_dir / "reconstruct_skip_phase1"
         rec_dir.mkdir(parents=True, exist_ok=True)
-        frames_all = []
-        positions = []
-        orientations = []
-        for run in runs:
-            roll = SUFFIX_TO_PHYSICAL_ROLL_DEG[run]
-            for i, (frame, z) in enumerate(zip(all_frames[run], zs)):
-                frames_all.append(frame)
-                positions.append((0.0, 0.0, float(z)))
-                if jitter:
-                    orientations.append(program_rpy_by_run[run][i])
-                else:
-                    orientations.append((float(roll), float(pitch_deg)))
-        canvas, filled = renderer.reconstruct_from_hits(frames_all, positions, orientations)
+        rec_canvas[~rec_filled] = 0
+        canvas, filled = rec_canvas, rec_filled
         preview = crop_colormap_z_window(canvas, renderer, float(zs[0]), float(zs[-1]))
         source_preview = crop_colormap_z_window(
             renderer.equirect_img, renderer, float(zs[0]), float(zs[-1])
@@ -287,7 +317,10 @@ def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
         "--frames",
         type=int,
         default=DEFAULT_N_FRAMES,
-        help=f"生成フレーム数（目視確認は {N_FRAMES_HINT_MIN}～{N_FRAMES_HINT_MAX} 程度）",
+        help=(
+            f"生成フレーム数（目視確認は {N_FRAMES_HINT_MIN}～{N_FRAMES_HINT_MAX} 程度。"
+            "全長でも1フレームずつ書き出す）"
+        ),
     )
     p.add_argument("--fps", type=float, default=10.0)
     p.add_argument(

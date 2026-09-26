@@ -140,6 +140,40 @@ def test_cli_writes_mp4_and_skips_phase1(tmp_path: Path):
     assert result["ocr_z_mm"][0] == 0.0 or result["ocr_z_mm"][0] == 10.0
 
 
+def test_generate_streams_mp4_without_holding_all_frames(tmp_path: Path):
+    tex = make_demo_layout_colormap(radius_mm=125.0, z_max_mm=80.0, pixels_per_mm=0.4)
+    cmap = tmp_path / "map.png"
+    import cv2
+
+    cv2.imwrite(str(cmap), tex)
+    out = tmp_path / "videos"
+    result = generate_two_direction_videos(
+        colormap=cmap,
+        output_dir=out,
+        runs=["U"],
+        width=32,
+        height=32,
+        radius_mm=125.0,
+        fov_deg=181.0,
+        pitch_deg=90.0,
+        n_frames=8,
+        fps=5.0,
+        name="stream_side",
+        z_start_mm=8.0,
+        z_step_mm=6.0,
+        z_margin_mm=1.0,
+        shading=False,
+        reconstruct=False,
+        save_png=False,
+    )
+    video = Path(result["runs"]["U"]["video_path"])
+    assert video.is_file()
+    assert result["runs"]["U"]["n_frames"] == 8
+    cap = cv2.VideoCapture(str(video))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 8
+    cap.release()
+
+
 def test_z_start_selects_different_segment():
     tex = make_demo_layout_colormap(radius_mm=125.0, z_max_mm=400.0, pixels_per_mm=0.4)
     renderer = FisheyeSideviewRenderer(

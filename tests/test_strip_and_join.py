@@ -10,7 +10,10 @@ from src.validation.geometry import (
     theta_in_camera_car_sector,
 )
 from src.validation.geometry import build_run_reference
-from src.validation.seam_join import join_at_overlap_centers
+from src.validation.seam_join import (
+    join_at_overlap_centers,
+    unwrap_row_camera_car_deg,
+)
 from src.validation.strip_correction import warp_z_to_ocr, warp_theta_to_edge_center
 
 
@@ -56,8 +59,7 @@ def test_join_cuts_at_sixty_and_keeps_one_run():
         pixels_per_mm=ppm,
         z_pad_mm=0.0,
     )
-    eta = np.linspace(0.0, 2.0 * np.pi, h)
-    car = eta_to_camera_car_deg(eta)
+    car = unwrap_row_camera_car_deg(h)
     u_rows = out["rgb"][:, 10, 0] > 0
     r_rows = out["rgb"][:, 10, 1] > 0
     assert np.any(u_rows)
@@ -69,6 +71,123 @@ def test_join_cuts_at_sixty_and_keeps_one_run():
     row_r = int(np.argmin(np.abs((car - 120.0 + 180) % 360 - 180)))
     assert u_rows[row_u]
     assert r_rows[row_r]
+    # 最終展開の上端は真上。60° 接合は内部
+    assert abs((float(car[0]) + 180.0) % 360.0 - 180.0) < 360.0 / h * 1.5
+    row_seam = int(np.argmin(np.abs((car - 60.0 + 180) % 360 - 180)))
+    assert row_seam > 1
+
+
+def test_join_three_runs_covers_full_circle():
+    """U/R/L を渡すと 120° 帯が全周を埋め、行ごとに1 run だけ残る。"""
+    h, w = 72, 40
+    ppm = 1.0
+    filled = np.ones((h, w), dtype=bool)
+    rgb_u = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb_r = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb_l = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb_u[:] = (255, 0, 0)
+    rgb_r[:] = (0, 255, 0)
+    rgb_l[:] = (0, 0, 255)
+    out = join_at_overlap_centers(
+        [
+            {"rgb": rgb_u, "filled": filled, "z_min": 0.0, "z_max": 40.0, "run_id": "U"},
+            {"rgb": rgb_r, "filled": filled, "z_min": 0.0, "z_max": 40.0, "run_id": "R"},
+            {"rgb": rgb_l, "filled": filled, "z_min": 0.0, "z_max": 40.0, "run_id": "L"},
+        ],
+        pixels_per_mm=ppm,
+        z_pad_mm=0.0,
+    )
+    car = unwrap_row_camera_car_deg(h)
+    u_rows = out["rgb"][:, 10, 0] > 0
+    r_rows = out["rgb"][:, 10, 1] > 0
+    l_rows = out["rgb"][:, 10, 2] > 0
+    assert np.any(u_rows) and np.any(r_rows) and np.any(l_rows)
+    assert not np.any(u_rows & r_rows)
+    assert not np.any(u_rows & l_rows)
+    assert not np.any(r_rows & l_rows)
+    assert np.mean(out["filled"]) > 0.95
+    row_u = int(np.argmin(np.abs((car - 0.0 + 180) % 360 - 180)))
+    row_r = int(np.argmin(np.abs((car - 120.0 + 180) % 360 - 180)))
+    row_l = int(np.argmin(np.abs((car - 240.0 + 180) % 360 - 180)))
+    assert u_rows[row_u]
+    assert r_rows[row_r]
+    assert l_rows[row_l]
+    for name in ("U", "R", "L"):
+        assert name in out["adoption"]
+        assert 0.2 < out["adoption"][name] < 0.45
+    assert abs((float(car[0]) + 180.0) % 360.0 - 180.0) < 360.0 / h * 1.5
+    assert out["cut_camera_car_deg"] == 0.0
+    for seam in (60.0, -60.0, 180.0):
+        row_s = int(np.argmin(np.abs((car - seam + 180) % 360 - 180)))
+        assert 0.08 * h < row_s < 0.92 * h
+
+
+def test_join_fills_one_pixel_wrap_gap_at_180():
+    """旧 η=0 ラップの欠行は、最終図の 180° で黒線にしない。"""
+    from src.validation.seam_join import unwrap_eta_for_rows
+
+    h, w = 72, 40
+    ppm = 1.0
+    filled_u = np.ones((h, w), dtype=bool)
+    filled_r = np.ones((h, w), dtype=bool)
+    filled_l = np.ones((h, w), dtype=bool)
+    rgb_u = np.full((h, w, 3), (255, 0, 0), dtype=np.uint8)
+    rgb_r = np.full((h, w, 3), (0, 255, 0), dtype=np.uint8)
+    rgb_l = np.full((h, w, 3), (0, 0, 255), dtype=np.uint8)
+    eta = unwrap_eta_for_rows(h)
+    car0 = eta_to_camera_car_deg(eta)
+    wrap = int(np.argmin(np.abs((car0 - 180.0 + 180) % 360 - 180)))
+    filled_l[wrap] = False
+    rgb_l[wrap] = 0
+    out = join_at_overlap_centers(
+        [
+            {"rgb": rgb_u, "filled": filled_u, "z_min": 0.0, "z_max": 40.0, "run_id": "U"},
+            {"rgb": rgb_r, "filled": filled_r, "z_min": 0.0, "z_max": 40.0, "run_id": "R"},
+            {"rgb": rgb_l, "filled": filled_l, "z_min": 0.0, "z_max": 40.0, "run_id": "L"},
+        ],
+        pixels_per_mm=ppm,
+        z_pad_mm=0.0,
+    )
+    car = unwrap_row_camera_car_deg(h)
+    row_180 = int(np.argmin(np.abs((car - 180.0 + 180) % 360 - 180)))
+    assert np.all(out["filled"][row_180])
+    assert np.any(out["rgb"][row_180] > 0)
+
+
+def test_join_fills_multi_row_wrap_gap_at_180():
+    """接合ワープが数行黒くしても、180° の短い挟まれた穴は閉じる。"""
+    from src.validation.seam_join import unwrap_eta_for_rows
+
+    h, w = 72, 40
+    filled_u = np.ones((h, w), dtype=bool)
+    filled_r = np.ones((h, w), dtype=bool)
+    filled_l = np.ones((h, w), dtype=bool)
+    rgb_u = np.full((h, w, 3), (255, 0, 0), dtype=np.uint8)
+    rgb_r = np.full((h, w, 3), (0, 255, 0), dtype=np.uint8)
+    rgb_l = np.full((h, w, 3), (0, 0, 255), dtype=np.uint8)
+    eta = unwrap_eta_for_rows(h)
+    car0 = eta_to_camera_car_deg(eta)
+    wrap = int(np.argmin(np.abs((car0 - 180.0 + 180) % 360 - 180)))
+    for d in range(-2, 3):
+        y = (wrap + d) % h
+        filled_l[y] = False
+        rgb_l[y] = 0
+        filled_r[y] = False
+        rgb_r[y] = 0
+    out = join_at_overlap_centers(
+        [
+            {"rgb": rgb_u, "filled": filled_u, "z_min": 0.0, "z_max": 40.0, "run_id": "U"},
+            {"rgb": rgb_r, "filled": filled_r, "z_min": 0.0, "z_max": 40.0, "run_id": "R"},
+            {"rgb": rgb_l, "filled": filled_l, "z_min": 0.0, "z_max": 40.0, "run_id": "L"},
+        ],
+        pixels_per_mm=1.0,
+        z_pad_mm=0.0,
+    )
+    car = unwrap_row_camera_car_deg(h)
+    row_180 = int(np.argmin(np.abs((car - 180.0 + 180) % 360 - 180)))
+    assert np.all(out["filled"][row_180])
+    assert np.any(out["rgb"][row_180] > 0)
+
 
 
 def test_z_warp_moves_columns_toward_ocr():
