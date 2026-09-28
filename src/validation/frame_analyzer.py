@@ -251,7 +251,10 @@ class FrameAnalyzer:
                     position[1] = reference["y_ref_mm"]
                     orientation[0] = reference["roll_ref_rad"]
                     est_yaw, est_pitch = mode_a_estimate_yaw_pitch(run_id)
-                    if not est_yaw:
+                    yaw_second = bool(
+                        getattr(self.config.two_direction, "mode_a_yaw_second_stage", False)
+                    )
+                    if not est_yaw and not yaw_second:
                         orientation[1] = reference["yaw_ref_rad"]
                     if not est_pitch:
                         orientation[2] = reference["pitch_ref_rad"]
@@ -320,6 +323,9 @@ class FrameAnalyzer:
             else:
                 match_count = len(pts1)
                 camera_state = {"position": position.copy(), "orientation": orientation.copy()}
+                yaw_second = bool(
+                    getattr(self.config.two_direction, "mode_a_yaw_second_stage", False)
+                )
                 motion = self.estimator.estimate_motion_flexible(
                     pts1, pts2, camera_state, camera_params,
                     constraints=constraints.get(local_i),
@@ -327,6 +333,7 @@ class FrameAnalyzer:
                     center_prior=self.config.two_direction.center_prior,
                     estimation_mode=self.mode,
                     hard_bounds=self.config.two_direction.hard_bounds,
+                    yaw_second_stage=yaw_second,
                 )
                 motion_raw = np.array([
                     motion.get("dx", 0.0), motion.get("dy", 0.0), motion.get("dz", 0.0),
@@ -347,7 +354,10 @@ class FrameAnalyzer:
                     motion_final[1] = 0.0
                     motion_final[3] = 0.0
                     est_yaw, est_pitch = mode_a_estimate_yaw_pitch(run_id)
-                    if not est_yaw:
+                    yaw_second = bool(
+                        getattr(self.config.two_direction, "mode_a_yaw_second_stage", False)
+                    )
+                    if not est_yaw and not yaw_second:
                         motion_final[4] = 0.0
                     if not est_pitch:
                         motion_final[5] = 0.0

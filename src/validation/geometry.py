@@ -234,8 +234,9 @@ def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
     """Mode A で推定する角度 (estimate_yaw, estimate_pitch)。
 
     U: 初期 (roll,yaw,pitch)=(-90,90,90)。(0,0,90) と同一姿勢。
-       車体 roll はプログラム pitch。yaw と roll は光軸まわり捩れで
-       同じ軸なので両方とも固定（yaw を入れると pitch に相殺が漏れ積算する）。
+       車体 roll はプログラム pitch。1段階の自由変数は dz+dpitch のみ
+       （yaw を同時に入れると pitch に相殺が漏れ積算する）。
+       2段階 yaw（`mode_a_yaw_second_stage`）は実験用で既定オフ。
        画像 x→pitch、画像 y→z。pitch は 90° 求心。前後のうなずきは dz に載せる。
     R/L: 画像x=pitch, 画像y=z。roll=r0, yaw=y0, x=y=0 固定。pitch は p0 求心。
     """

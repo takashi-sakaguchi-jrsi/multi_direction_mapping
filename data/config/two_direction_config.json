@@ -43,6 +43,7 @@
     "z_source": "known",
     "known_z_metadata_path": "data/input/videos/phi250_baseline_metadata.json",
     "match_source_pixels_per_mm": true,
+    "mode_a_yaw_second_stage": false,
     "capture": {
       "usable_outer_radius_ratio": 0.8,
       "derived_usable_half_fov_deg": 71.97,

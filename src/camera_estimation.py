@@ -2304,6 +2304,7 @@ class CameraEstimator:
         center_prior: Optional[Any] = None,
         estimation_mode: Optional[str] = None,
         hard_bounds: Optional[Any] = None,
+        yaw_second_stage: Optional[bool] = None,
     ) -> Dict[str, float]:
         """柔軟なパラメータ推定（段階的テスト用）
 
@@ -2354,6 +2355,7 @@ class CameraEstimator:
                 center_prior,
                 estimation_mode,
                 hard_bounds,
+                yaw_second_stage=yaw_second_stage,
             )
         if n_points < self.config.feature_matching.min_match_count:
             self.logger.warning(
@@ -3349,10 +3351,10 @@ class CameraEstimator:
         yaw2: float,
         pitch2: float,
     ) -> np.ndarray:
-        """U Mode A: フレーム残差を (dz, dpitch) の同一予測で説明する。
+        """U Mode A: フレーム残差を同一予測で説明する。
 
         初期 (-90,90,90) は (0,0,90) と同一姿勢。pitch が周方向（車体 roll）。
-        yaw は光軸まわり捩れで roll と同じ軸のため固定（pitch への相殺漏れを防ぐ）。
+        1段階は yaw 固定（dz+dpitch）。2段階 yaw は既定オフ。
         逆投影は world_to_pixel と同一の R_c2w 視線を使う。
         """
         pos_z = np.array([x0, y0, z0 + dz], dtype=float)
@@ -3374,6 +3376,7 @@ class CameraEstimator:
         center_prior: Optional[Any],
         estimation_mode: Optional[str],
         hard_bounds: Optional[Any],
+        yaw_second_stage: Optional[bool] = None,
     ) -> Dict[str, float]:
         """run_reference 中心。特徴点残差と prior を同一 least_squares で相互補正する。"""
         from src.validation.geometry import (
@@ -3400,6 +3403,9 @@ class CameraEstimator:
         else:
             estimate_yaw, estimate_pitch = mode_a_estimate_yaw_pitch(run_id)
             use_frame_xy = mode_a_use_frame_xy_residual(run_id)
+        do_yaw2 = bool(yaw_second_stage) if yaw_second_stage is not None else False
+        if mode != "A" or estimate_yaw:
+            do_yaw2 = False
         param_names = []
         bounds_lower = []
         bounds_upper = []
@@ -3490,7 +3496,12 @@ class CameraEstimator:
                 dpitch = frozen.get("dpitch", dpitch)
             pos1 = np.array([x0 + dx, y0 + dy, z0 + dz], dtype=float)
             roll2 = roll_0 + droll if estimate_roll else roll_ref
-            yaw2 = yaw_0 + dyaw if estimate_yaw else yaw_ref
+            if estimate_yaw:
+                yaw2 = yaw_0 + dyaw
+            elif do_yaw2:
+                yaw2 = yaw_0
+            else:
+                yaw2 = yaw_ref
             pitch2 = pitch_0 + dpitch if estimate_pitch else pitch_ref
             try:
                 if use_frame_xy:
@@ -3580,6 +3591,83 @@ class CameraEstimator:
         constrained["bound_hit"] = bound_hit
         constrained["prior_norm"] = motion.get("prior_norm", 0.0)
         constrained["residual_rms"] = motion.get("residual_rms", 0.0)
+
+        if do_yaw2:
+            constrained = self._mode_a_yaw_second_stage(
+                constrained, prev_points, curr_points, p0, use_frame_xy,
+                x0, y0, z0, roll_0, yaw_0, pitch_0,
+                yaw_ref, pitch_ref, max_dyaw, scale, sigmas,
+                pos, ori, run_reference, hard_bounds, estimate_pitch,
+            )
+        return constrained
+
+    def _mode_a_yaw_second_stage(
+        self,
+        motion: Dict[str, float],
+        prev_points: np.ndarray,
+        curr_points: np.ndarray,
+        p0: np.ndarray,
+        use_frame_xy: bool,
+        x0: float, y0: float, z0: float,
+        roll_0: float, yaw_0: float, pitch_0: float,
+        yaw_ref: float, pitch_ref: float, max_dyaw: float,
+        scale: float, sigmas: Dict[str, float],
+        pos: np.ndarray, ori: np.ndarray,
+        run_reference: Dict[str, float],
+        hard_bounds: Optional[Any],
+        estimate_pitch: bool,
+    ) -> Dict[str, float]:
+        """1段階の dz/dpitch を固定し、yaw だけを最小二乗する。"""
+        from src.validation.geometry import wrap_angle_rad
+
+        dz = float(motion.get("dz", 0.0))
+        dpitch = float(motion.get("dpitch", 0.0))
+        n_feat = (2 * len(prev_points)) if use_frame_xy else len(prev_points)
+        sigma_yaw = max(float(sigmas.get("yaw", np.radians(5.0))), 1e-6)
+
+        def residuals_yaw(params):
+            dyaw = float(params[0])
+            pos1 = np.array([x0, y0, z0 + dz], dtype=float)
+            yaw2 = yaw_0 + dyaw
+            pitch2 = pitch_0 + dpitch if estimate_pitch else pitch_ref
+            try:
+                if use_frame_xy:
+                    feat = self._u_frame_xy_feature_residual(
+                        p0, curr_points, x0, y0, z0, dz,
+                        roll_0, yaw_0, pitch_0, yaw2, pitch2,
+                    )
+                else:
+                    p1 = self.transformer.pixel_to_world(
+                        curr_points, pos1, roll_0, yaw2, pitch2
+                    )
+                    feat = np.linalg.norm(p0 - p1, axis=1)
+            except Exception:
+                return np.full(n_feat + 1, 1e6)
+            prior = scale * wrap_angle_rad(yaw2 - yaw_ref) / sigma_yaw
+            return np.concatenate([np.asarray(feat, dtype=float), [prior]])
+
+        try:
+            result = least_squares(
+                residuals_yaw, [0.0],
+                bounds=([-max_dyaw], [max_dyaw]),
+                loss="soft_l1",
+            )
+        except Exception:
+            return motion
+        motion = dict(motion)
+        motion["dyaw"] = float(result.x[0])
+        motion["dtheta"] = motion["dyaw"]
+        motion["residual_rms"] = float(np.sqrt(np.mean(result.fun[:n_feat] ** 2)))
+        motion["prior_norm"] = float(abs(result.fun[n_feat])) if result.fun.size > n_feat else 0.0
+        constrained, bound_hit = self._apply_reference_hard_bounds(
+            motion, pos, ori, run_reference, hard_bounds,
+            False, False, True, estimate_pitch,
+        )
+        hit = dict(motion.get("bound_hit") or {})
+        hit.update(bound_hit)
+        constrained["bound_hit"] = hit
+        constrained["prior_norm"] = motion["prior_norm"]
+        constrained["residual_rms"] = motion["residual_rms"]
         return constrained
 
     def _apply_reference_hard_bounds(

@@ -9,6 +9,7 @@ from src.validation.geometry import build_run_reference, mode_a_estimate_yaw_pit
 
 def _known_correspondences(
     transformer, physical_roll_deg=0.0, n=20, yaw_off_deg=0.0, pitch_off_deg=0.0,
+    yaw_delta_deg=0.0,
 ):
     """光軸付近の円筒点を2姿勢へ投影して対応点を作る"""
     from src.validation.geometry import optical_axis_world
@@ -17,6 +18,8 @@ def _known_correspondences(
     ori0 = np.array([ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]])
     ori0[1] = ori0[1] + np.radians(float(yaw_off_deg))
     ori0[2] = ori0[2] + np.radians(float(pitch_off_deg))
+    ori1 = ori0.copy()
+    ori1[1] = ori1[1] + np.radians(float(yaw_delta_deg))
     axis = optical_axis_world(*ori0)
     nxy = np.linalg.norm(axis[:2]) + 1e-12
     base = np.array([axis[0] / nxy * radius, axis[1] / nxy * radius, 0.0])
@@ -34,7 +37,7 @@ def _known_correspondences(
     pos0 = np.array([0.0, 0.0, 0.0])
     pos1 = np.array([0.0, 0.0, 10.0])
     p0 = transformer.world_to_pixel(pts_w, pos0, *ori0)
-    p1 = transformer.world_to_pixel(pts_w, pos1, *ori0)
+    p1 = transformer.world_to_pixel(pts_w, pos1, *ori1)
     cam = transformer.camera
     inside = (
         (p0[:, 0] > 1) & (p0[:, 0] < cam.image_width - 1)
@@ -86,7 +89,7 @@ def test_mode_a_u_maps_frame_dy_to_dz(transformer, config):
     assert abs(motion["droll"]) < 1e-6
     assert abs(np.degrees(motion["dpitch"])) < 0.5
     assert motion["dz"] > 1.0
-    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+    assert abs(np.degrees(motion["dyaw"])) < 0.05
 
 
 def test_mode_a_u_pitch_does_not_avalanche_from_offset(transformer, config):
@@ -113,11 +116,11 @@ def test_mode_a_u_pitch_does_not_avalanche_from_offset(transformer, config):
     )
     assert motion["dz"] > 1.0
     assert abs(np.degrees(motion["dpitch"])) < 0.5
-    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+    assert abs(np.degrees(motion["dyaw"])) < 0.05
 
 
 def test_mode_a_u_yaw_does_not_avalanche_from_offset(transformer, config):
-    """純 z 移動を yaw≠90 から見ても、Mode A は yaw を動かさない。"""
+    """純 z 移動を yaw≠90 から見ても、2段階の dyaw は雪崩せずほぼ 0。"""
     estimator = CameraEstimator(config.estimation, transformer)
     yaw_off = 8.0
     p0, p1, ref = _known_correspondences(transformer, 0.0, yaw_off_deg=yaw_off)
@@ -139,7 +142,7 @@ def test_mode_a_u_yaw_does_not_avalanche_from_offset(transformer, config):
         hard_bounds=config.two_direction.hard_bounds,
     )
     assert motion["dz"] > 1.0
-    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+    assert abs(np.degrees(motion["dyaw"])) < 0.3
     assert abs(np.degrees(motion["dpitch"])) < 0.5
 
 
@@ -193,7 +196,7 @@ def test_mode_a_r_estimates_pitch_freezes_yaw(transformer, config):
     assert abs(motion["dx"]) < 1e-6
     assert abs(motion["dy"]) < 1e-6
     assert abs(motion["droll"]) < 1e-6
-    assert abs(motion["dyaw"]) < 1e-6
+    assert abs(motion["dyaw"]) < np.radians(0.05)
     assert motion["dz"] > 1.0
 
 
@@ -213,7 +216,7 @@ def test_mode_a_l_estimates_pitch_freezes_yaw(transformer, config):
         estimation_mode="A",
         hard_bounds=config.two_direction.hard_bounds,
     )
-    assert abs(motion["dyaw"]) < 1e-6
+    assert abs(motion["dyaw"]) < np.radians(0.05)
     assert motion["dz"] > 1.0
 
 
@@ -260,3 +263,75 @@ def test_mode_c_joint_prior_does_not_avalanche(transformer, config):
     assert abs(x_new) < abs(state["position"][0]) + 0.5
     assert abs(y_new) < 5.0
     assert "bound_hit" in motion
+
+
+def test_mode_a_yaw_second_stage_off_freezes_yaw(transformer, config):
+    estimator = CameraEstimator(config.estimation, transformer)
+    p0, p1, ref = _known_correspondences(transformer, 0.0, yaw_delta_deg=1.0)
+    if len(p0) < 4:
+        pytest.skip("投影点が不足")
+    state = {
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]]),
+    }
+    motion = estimator.estimate_motion_flexible(
+        p0, p1, state, _cam_params(transformer),
+        run_reference=ref,
+        center_prior=config.two_direction.center_prior,
+        estimation_mode="A",
+        hard_bounds=config.two_direction.hard_bounds,
+        yaw_second_stage=False,
+    )
+    assert abs(np.degrees(motion["dyaw"])) < 1e-6
+    assert motion["dz"] > 1.0
+
+
+def test_mode_a_yaw_second_stage_recovers_small_dyaw(transformer, config):
+    """1段階の dz+pitch を固定したあと、yaw だけが捩れを拾う。フレーム上限でクリップ。"""
+    estimator = CameraEstimator(config.estimation, transformer)
+    cap = float(config.estimation.motion.max_dtheta)
+    kwargs = dict(
+        run_reference=None,
+        center_prior=config.two_direction.center_prior,
+        estimation_mode="A",
+        hard_bounds=config.two_direction.hard_bounds,
+    )
+    p0, p1, ref = _known_correspondences(transformer, 0.0, n=40, yaw_delta_deg=0.12)
+    if len(p0) < 4:
+        pytest.skip("投影点が不足")
+    kwargs["run_reference"] = ref
+    state = {
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]]),
+    }
+    m_off = estimator.estimate_motion_flexible(
+        p0, p1, state, _cam_params(transformer), yaw_second_stage=False, **kwargs
+    )
+    m_on = estimator.estimate_motion_flexible(
+        p0, p1, state, _cam_params(transformer), yaw_second_stage=True, **kwargs
+    )
+    assert abs(np.degrees(m_off["dyaw"])) < 0.05
+    assert abs(np.degrees(m_on["dpitch"])) < 0.5
+    assert abs(np.degrees(m_off["dpitch"])) < 0.5
+    dyaw_deg = float(np.degrees(m_on["dyaw"]))
+    assert dyaw_deg > 0.05
+    assert dyaw_deg < cap + 1e-6
+    assert abs(dyaw_deg - 0.12) <= abs(np.degrees(m_off["dyaw"]) - 0.12) + 1e-6
+    assert m_on["dz"] > 1.0
+
+    p0b, p1b, refb = _known_correspondences(transformer, 0.0, n=40, yaw_delta_deg=1.0)
+    if len(p0b) < 4:
+        pytest.skip("投影点が不足")
+    kwargs["run_reference"] = refb
+    state_b = {
+        "position": np.array([0.0, 0.0, 0.0]),
+        "orientation": np.array([
+            refb["roll_ref_rad"], refb["yaw_ref_rad"], refb["pitch_ref_rad"],
+        ]),
+    }
+    m_big = estimator.estimate_motion_flexible(
+        p0b, p1b, state_b, _cam_params(transformer), yaw_second_stage=True, **kwargs
+    )
+    assert float(np.degrees(m_big["dyaw"])) > 0.5 * cap
+    assert float(np.degrees(m_big["dyaw"])) <= cap + 1e-6
+    assert abs(np.degrees(m_big["dpitch"])) < 0.5

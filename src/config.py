@@ -1167,7 +1167,7 @@ class TwoDirectionConfig:
     """2または3方向合成PoC設定（main_twopass と同じ4層マージに載せる）"""
     enabled: bool = True
     modes: List[str] = field(default_factory=lambda: ["A", "C"])
-    """A: U/R/L とも dz+pitch（xy/roll/yaw 固定。U は pitch=車体 roll。捩れは推定しない）。C: 6DoF+prior。"""
+    """A: dz+pitch（yaw 固定）。2段階 yaw は実験用で既定オフ。C: 6DoF+prior。"""
     output_dir: str = "data/output/two_direction"
     cache_projection_maps: bool = False
     z_source: str = "ocr"
@@ -1194,6 +1194,8 @@ class TwoDirectionConfig:
     """第3走行（L）。video_path が空なら 2 方向のままスキップする。"""
     center_prior: CenterPriorConfig = field(default_factory=CenterPriorConfig)
     hard_bounds: HardBoundsConfig = field(default_factory=HardBoundsConfig)
+    mode_a_yaw_second_stage: bool = False
+    """Mode A: dz+pitch のあと yaw 1変数を最小二乗する。全長では pitch が悪化するため既定オフ。"""
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     seam_warp: SeamWarpConfig = field(default_factory=SeamWarpConfig)
     best_view: BestViewConfig = field(default_factory=BestViewConfig)
