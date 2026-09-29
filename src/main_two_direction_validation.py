@@ -12,6 +12,7 @@ import json
 import logging
 import struct
 import sys
+import time
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,12 @@ import numpy as np
 from src.camera_estimation import CameraEstimator
 from src.calibration import load_calibration
 from src.config import Config, load_config
+from src.progress_reporter import ProgressReporter
+from src.product_runtime import (
+    copy_final_colormap,
+    copy_validation_report_to_reports,
+    write_three_direction_excel,
+)
 from src.coordinate_transform import CoordinateTransformer, FisheyeCamera
 from src.validation.best_view_accumulator import BestViewAccumulator
 from src.validation.frame_analyzer import FrameAnalyzer, resolve_frame_window, zip_records_with_frames
@@ -52,6 +59,28 @@ from src.validation.strip_correction import correct_strip, apply_pitch_trend_war
 
 
 logger = logging.getLogger(__name__)
+
+
+def _progress_start(rep: Optional[ProgressReporter], step_id: int) -> None:
+    if rep is None:
+        return
+    if rep._get_step(step_id).status == "pending":
+        rep.start_step(step_id)
+
+
+def _progress_complete(
+    rep: Optional[ProgressReporter], step_id: int, success: bool = True
+) -> None:
+    if rep is None:
+        return
+    if rep._get_step(step_id).status == "in_progress":
+        rep.complete_step(step_id, success=success)
+
+
+def _direction_plan(rep: Optional[ProgressReporter]):
+    if rep is None:
+        return None
+    return getattr(rep, "direction_plan", None)
 
 
 GENERATION_F_PX = 341.87536947032544
@@ -113,7 +142,10 @@ def run_two_direction_validation(
     frames_c: Optional[List[np.ndarray]] = None,
     modes: Optional[List[str]] = None,
     known_z_mm: Optional[np.ndarray] = None,
+    progress_rep: Optional[ProgressReporter] = None,
+    timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
+    t_run = time.perf_counter()
     td = config.two_direction
     modes = modes or list(td.modes)
     frames_by_tag = {"A": frames_a, "B": frames_b, "C": frames_c}
@@ -168,16 +200,65 @@ def run_two_direction_validation(
         "n_runs": len(jobs),
         "run_tags": [tag for tag, _ in jobs],
         "modes": {},
+        "step_timing_sec": {},
     }
 
+    analyzed: List[Dict[str, Any]] = []
+    t_init = time.perf_counter() - t_run
+    t_analyze = 0.0
+    t_accumulate = 0.0
+    t_seam = 0.0
+    plan = _direction_plan(progress_rep)
+    seam_step = plan.seam_step if plan is not None else 4
     for mode in modes:
         analyzer = FrameAnalyzer(config, estimator, mode=mode)
-        analyzed: List[Dict[str, Any]] = []
-        for tag, run_cfg in jobs:
+        analyzed = []
+        n_jobs = len(jobs)
+        t_analyze_0 = time.perf_counter()
+        for job_i, (tag, run_cfg) in enumerate(jobs):
+            rid_hint = run_cfg.run_id or tag
+            analyze_step = plan.analyze_id(rid_hint) if plan is not None else 2
+            _progress_start(progress_rep, analyze_step)
+
+            def _run_progress(
+                done: int,
+                total: int,
+                extra: Optional[Dict[str, Any]] = None,
+                _job_i: int = job_i,
+                _rid: str = rid_hint,
+                _step: int = analyze_step,
+            ):
+                if progress_rep is None or total <= 0:
+                    return
+                extra = extra or {}
+                phase = str(extra.get("phase") or "motion")
+                inner = 0.25 * done / total if phase == "ocr" else 0.25 + 0.75 * done / total
+                pct = 100.0 * inner
+                try:
+                    progress_rep.update_step(
+                        _step,
+                        min(100.0, pct),
+                        details={
+                            "run_id": _rid,
+                            "run_index": _job_i + 1,
+                            "n_runs": n_jobs,
+                            "current_frame": int(done),
+                            "total_frames": int(total),
+                            "phase": phase,
+                        },
+                    )
+                except Exception:
+                    pass
+
             rec, extra = analyzer.analyze_run(
-                run_cfg, frames=frames_by_tag.get(tag), known_z_mm=known_z_mm
+                run_cfg,
+                frames=frames_by_tag.get(tag),
+                known_z_mm=known_z_mm,
+                progress_callback=_run_progress,
             )
             analyzed.append({"tag": tag, "run_cfg": run_cfg, "rec": rec, "extra": extra})
+            _progress_complete(progress_rep, analyze_step, success=True)
+        t_analyze += time.perf_counter() - t_analyze_0
 
         zs_all = [
             r.position[2]
@@ -202,18 +283,55 @@ def run_two_direction_validation(
         mode_dir.mkdir(parents=True, exist_ok=True)
         theta_min = 0.0
         theta_max = 2.0 * np.pi
-        for item in analyzed:
+        t_acc_0 = time.perf_counter()
+        for acc_i, item in enumerate(analyzed):
             rid = _run_id(item["rec"], item["tag"])
+            acc_step = plan.accumulate_id(rid) if plan is not None else 3
+            _progress_start(progress_rep, acc_step)
             logger.info(f"{rid}: 帯の蓄積を開始")
+
+            def _acc_progress(
+                done: int,
+                total: int,
+                _sid: int = acc_step,
+                _rid: str = rid,
+                _i: int = acc_i,
+            ):
+                if progress_rep is None or total <= 0:
+                    return
+                try:
+                    progress_rep.update_step(
+                        _sid,
+                        min(100.0, 90.0 * done / total),
+                        details={
+                            "run_id": _rid,
+                            "run_index": _i + 1,
+                            "n_runs": n_jobs,
+                            "current_frame": int(done),
+                            "total_frames": int(total),
+                            "phase": "accumulate",
+                        },
+                    )
+                except Exception:
+                    pass
+
             item["acc"] = _accumulate_run(
                 mapper, item["rec"], item["extra"],
                 item["extra"]["run_reference"], config,
                 z_min=z_lo, z_max=z_hi,
+                progress_callback=_acc_progress,
             )
             item["unfilled"] = item["acc"].unfilled_ratio()
             theta_min = item["acc"].theta_min
             theta_max = item["acc"].theta_max
             _save_rgb_png(mode_dir / f"partial_{rid}.png", item["acc"].colormap_rgb())
+            if progress_rep is not None:
+                try:
+                    progress_rep.update_step(
+                        acc_step, 95.0, details={"run_id": rid, "phase": "strip_correct"}
+                    )
+                except Exception:
+                    pass
             item["corr"] = _correct_accumulated(
                 item["acc"], item["rec"], item["extra"],
                 ppm, half_fov, spacing, warp_theta=apply_edge,
@@ -223,6 +341,15 @@ def run_two_direction_validation(
             )
             item["acc"] = None
             gc.collect()
+            _progress_complete(progress_rep, acc_step, success=True)
+        t_accumulate += time.perf_counter() - t_acc_0
+        _progress_start(progress_rep, seam_step)
+        t_seam_0 = time.perf_counter()
+        if progress_rep is not None:
+            try:
+                progress_rep.update_step(seam_step, 10.0, details={"phase": "seam_warp"})
+            except Exception:
+                pass
         seam = warp_strips_to_seams(
             [
                 {
@@ -303,9 +430,57 @@ def run_two_direction_validation(
             mode_payload[f"run_{rid}"] = summarize_records(item["rec"])
             mode_payload["coverage"][f"{rid}_unfilled"] = float(item["unfilled"])
         results["modes"][mode] = mode_payload
+        if progress_rep is not None:
+            try:
+                progress_rep.update_step(seam_step, 90.0, details={"phase": "report"})
+            except Exception:
+                pass
+        t_seam += time.perf_counter() - t_seam_0
 
+    total_s = t_init + t_analyze + t_accumulate + t_seam
+    if total_s <= 0:
+        total_s = 1.0
+    timing_sec = {
+        "init": round(t_init, 3),
+        "analyze": round(t_analyze, 3),
+        "accumulate": round(t_accumulate, 3),
+        "seam": round(t_seam, 3),
+    }
+    timing_pct = {
+        key: round(100.0 * val / total_s, 2) for key, val in timing_sec.items()
+    }
+    results["step_timing_sec"] = timing_sec
+    results["step_timing_pct"] = timing_pct
+    logger.info(
+        "step timing: "
+        + ", ".join(
+            f"{key}={val:.1f}s ({timing_pct[key]:.1f}%)"
+            for key, val in timing_sec.items()
+        )
+        + f", total={total_s:.1f}s"
+    )
+
+    stamp = timestamp or ""
     report_path = write_validation_report(output_dir, results)
     results["report_path"] = str(report_path)
+    first_mode = modes[0] if modes else "A"
+    records_by_run: Dict[str, Any] = {}
+    if analyzed:
+        for item in analyzed:
+            records_by_run[_run_id(item["rec"], item["tag"])] = item["rec"]
+    if timestamp and records_by_run and getattr(config.output, "report_path", None):
+        xlsx = Path(str(config.output.report_path).replace("{timestamp}", timestamp))
+        try:
+            results["excel_path"] = str(write_three_direction_excel(xlsx, records_by_run))
+        except Exception as exc:
+            logger.warning(f"Excel レポート出力に失敗: {exc}")
+        copied = copy_validation_report_to_reports(Path(report_path), timestamp)
+        if copied:
+            results["reports_json"] = str(copied)
+        cmap = copy_final_colormap(config, mode=first_mode, timestamp=timestamp)
+        if cmap:
+            results["colormap_path"] = str(cmap)
+    _progress_complete(progress_rep, seam_step, success=True)
     return results
 
 
@@ -484,7 +659,8 @@ def _correct_accumulated(
 
 
 def _accumulate_run(
-    mapper, records, extra, reference, config, z_min=None, z_max=None
+    mapper, records, extra, reference, config, z_min=None, z_max=None,
+    progress_callback=None,
 ) -> BestViewAccumulator:
     zs = [r.position[2] for r in records]
     z_min = min(zs) - 50.0
@@ -522,6 +698,11 @@ def _accumulate_run(
         )
         if (i + 1) % 50 == 0 or (i + 1) == n:
             logger.info(f"{run_id}: accumulate {i + 1}/{n}")
+            if progress_callback is not None:
+                try:
+                    progress_callback(i + 1, n)
+                except Exception:
+                    pass
     h, w = acc.buf.color.shape[:2]
     logger.info(f"{run_id}: canvas shape=({h}, {w})")
     return acc

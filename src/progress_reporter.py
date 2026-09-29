@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -110,13 +110,48 @@ class ProcessProgress:
     Attributes:
         process_id: プロセスID（タイムスタンプ形式）
         overall_progress: 全体進捗率（0-100%）
-        current_step: 現在のステップID（1-5、None=未開始/完了）
+        current_step: 現在のステップID（None=未開始/完了）
         steps: 各ステップの情報リスト
+        start_time: 処理開始時刻（ISO 8601）
+        elapsed_time_seconds: 経過時間（秒）
+        estimated_remaining_seconds: 推定残り時間（秒、未算出時は None）
+        estimated_end_time: 終了予定時刻（ISO 8601、未算出時は None）
     """
     process_id: str
     overall_progress: float
     current_step: Optional[int]
     steps: List[StepInfo]
+    start_time: Optional[str] = None
+    elapsed_time_seconds: float = 0.0
+    estimated_remaining_seconds: Optional[float] = None
+    estimated_end_time: Optional[str] = None
+
+
+def estimate_remaining_seconds(
+    elapsed_s: float,
+    overall_progress: float,
+    skip_weight: float,
+    *,
+    min_elapsed_s: float = 5.0,
+    min_work_progress: float = 0.5,
+) -> Optional[float]:
+    """スキップ分を除いた実作業進捗から残り秒を推定する。
+
+    初期化スキップ直後は進捗だけ先に進むため、最低経過時間と
+    実作業進捗が揃うまで None を返す。
+    """
+    if elapsed_s < min_elapsed_s:
+        return None
+    work_done = max(0.0, float(overall_progress) - float(skip_weight))
+    work_total = max(0.0, 100.0 - float(skip_weight))
+    if work_total <= 0.0:
+        return 0.0
+    if work_done < min_work_progress:
+        return None
+    if work_done >= work_total - 1e-6:
+        return 0.0
+    remaining_pct = work_total - work_done
+    return max(0.0, remaining_pct * elapsed_s / work_done)
 
 
 # ========================================
@@ -506,10 +541,10 @@ class ProgressReporter:
         # 開始時刻を記録
         self.start_time = time.perf_counter()
         
-        # ステップ数の検証
-        if len(steps) != 4:
+        # ステップ数の検証（製品の方向分割では 4 以外もあり得る）
+        if len(steps) < 2:
             raise ProgressReporterError(
-                f"ステップ数は4である必要があります: {len(steps)}"
+                f"ステップ数は2以上である必要があります: {len(steps)}"
             )
         
         # ステップIDの重複チェック
@@ -545,11 +580,16 @@ class ProgressReporter:
         
         # ProcessProgressオブジェクトを作成
         process_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        wall_start = datetime.now()
         self.process_progress = ProcessProgress(
             process_id=process_id,
             overall_progress=0.0,
             current_step=None,
-            steps=step_infos
+            steps=step_infos,
+            start_time=wall_start.isoformat(),
+            elapsed_time_seconds=0.0,
+            estimated_remaining_seconds=None,
+            estimated_end_time=None,
         )
         
         # 5ステップモードを有効化
@@ -559,8 +599,20 @@ class ProgressReporter:
         self._write_progress_5steps()
         
         logger.info(
-            f"5ステップ進捗管理初期化完了: process_id={process_id}"
+            f"進捗ステップ初期化完了: process_id={process_id}, n_steps={len(steps)}"
         )
+
+    def _ensure_step_id(self, step_id: int) -> None:
+        if not self.use_5steps or self.process_progress is None:
+            raise ProgressReporterError(
+                "ステップ進捗が初期化されていません。"
+                "initialize_steps()を先に呼び出してください。"
+            )
+        known = {s.step_id for s in self.process_progress.steps}
+        if step_id not in known:
+            raise ProgressReporterError(
+                f"無効なステップIDです: {step_id}（定義済み: {sorted(known)}）"
+            )
     
     def start_step(self, step_id: int, start_time: Optional[str] = None) -> None:
         """ステップの開始
@@ -582,12 +634,7 @@ class ProgressReporter:
                 "5ステップモードが初期化されていません。"
                 "initialize_steps()を先に呼び出してください。"
             )
-        
-        # ステップIDの検証
-        if not 1 <= step_id <= 4:
-            raise ProgressReporterError(
-                f"無効なステップIDです: {step_id}（1-4の範囲で指定してください）"
-            )
+        self._ensure_step_id(step_id)
         
         # ステップオブジェクトを取得
         step = self._get_step(step_id)
@@ -647,12 +694,7 @@ class ProgressReporter:
             raise ProgressReporterError(
                 "5ステップモードが初期化されていません。"
             )
-        
-        # ステップIDの検証
-        if not 1 <= step_id <= 4:
-            raise ProgressReporterError(
-                f"無効なステップIDです: {step_id}"
-            )
+        self._ensure_step_id(step_id)
         
         # 進捗率の検証
         if not 0.0 <= progress <= 100.0:
@@ -722,12 +764,7 @@ class ProgressReporter:
             raise ProgressReporterError(
                 "5ステップモードが初期化されていません。"
             )
-        
-        # ステップIDの検証
-        if not 1 <= step_id <= 4:
-            raise ProgressReporterError(
-                f"無効なステップIDです: {step_id}"
-            )
+        self._ensure_step_id(step_id)
         
         # ステップオブジェクトを取得
         step = self._get_step(step_id)
@@ -794,12 +831,7 @@ class ProgressReporter:
             raise ProgressReporterError(
                 "5ステップモードが初期化されていません。"
             )
-        
-        # ステップIDの検証
-        if not 1 <= step_id <= 4:
-            raise ProgressReporterError(
-                f"無効なステップIDです: {step_id}"
-            )
+        self._ensure_step_id(step_id)
         
         # ステップオブジェクトを取得
         step = self._get_step(step_id)
@@ -866,6 +898,56 @@ class ProgressReporter:
             overall += step_progress * weight / 100.0
         
         self.process_progress.overall_progress = overall
+        self._refresh_timing()
+
+    def _skip_weight(self) -> float:
+        if self.process_progress is None:
+            return 0.0
+        total = 0.0
+        for step in self.process_progress.steps:
+            if step.status == "skipped":
+                total += float(self.step_weights.get(step.step_id, 0.0))
+        return total
+
+    def _all_steps_finished(self) -> bool:
+        if self.process_progress is None or not self.process_progress.steps:
+            return False
+        return all(
+            step.status in ("completed", "skipped", "error")
+            for step in self.process_progress.steps
+        )
+
+    def _has_error_step(self) -> bool:
+        if self.process_progress is None:
+            return False
+        return any(step.status == "error" for step in self.process_progress.steps)
+
+    def _refresh_timing(self) -> None:
+        pp = self.process_progress
+        if pp is None:
+            return
+        elapsed = 0.0
+        if self.start_time:
+            elapsed = max(0.0, time.perf_counter() - self.start_time)
+        pp.elapsed_time_seconds = round(elapsed, 3)
+        if self._has_error_step():
+            pp.estimated_remaining_seconds = None
+            pp.estimated_end_time = None
+            return
+        if self._all_steps_finished() or pp.overall_progress >= 100.0 - 1e-6:
+            pp.estimated_remaining_seconds = 0.0
+            pp.estimated_end_time = datetime.now().isoformat(timespec="seconds")
+            return
+        remaining = estimate_remaining_seconds(
+            elapsed, pp.overall_progress, self._skip_weight()
+        )
+        if remaining is None:
+            pp.estimated_remaining_seconds = None
+            pp.estimated_end_time = None
+            return
+        pp.estimated_remaining_seconds = round(float(remaining), 1)
+        eta = datetime.now() + timedelta(seconds=float(remaining))
+        pp.estimated_end_time = eta.isoformat(timespec="seconds")
     
     def _write_progress_5steps(self, retry_on_error: bool = True) -> None:
         """5ステップ進捗データをJSONファイルに書き込む

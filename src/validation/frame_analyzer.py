@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import logging
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -125,6 +125,7 @@ class FrameAnalyzer:
         frames: Optional[List[np.ndarray]] = None,
         fps: float = 30.0,
         known_z_mm: Optional[np.ndarray] = None,
+        progress_callback: Optional[Callable[[int, int, Dict], None]] = None,
     ) -> Tuple[List[FrameAnalysisRecord], Dict]:
         physical_roll = run_cfg.physical_roll_deg
         if run_cfg.video_path:
@@ -174,6 +175,14 @@ class FrameAnalyzer:
             if n_expect is not None:
                 known_z_mm = known_z_mm[:n_expect]
 
+        def _ocr_progress(done: int, total: int) -> None:
+            if progress_callback is None or total <= 0:
+                return
+            try:
+                progress_callback(done, total, {"phase": "ocr"})
+            except Exception:
+                pass
+
         constraints, z_positions, ocr_dist, success = compute_distance_constraints_only(
             video_path=Path(video_path) if video_path and keep_frames is None else None,
             start_frame=start,
@@ -186,6 +195,7 @@ class FrameAnalyzer:
             ocr_preprocessing_enabled=self.config.ocr.preprocessing_enabled,
             max_distance_increment_mm=float(self.config.ocr.max_distance_increment_mm),
             known_z_mm=known_z_mm,
+            progress_callback=_ocr_progress if progress_callback is not None else None,
         )
 
         n_target = int(success.size)
@@ -267,6 +277,15 @@ class FrameAnalyzer:
             ))
             if (local_i + 1) % 50 == 0 or (local_i + 1) == n_target:
                 logger.info(f"{run_id}: analyze {local_i + 1}/{n_target}")
+            if progress_callback is not None and (
+                (local_i + 1) % 5 == 0 or (local_i + 1) == n_target
+            ):
+                try:
+                    progress_callback(
+                        local_i + 1, n_target, {"phase": "motion", "run_id": run_id}
+                    )
+                except Exception:
+                    pass
             if (local_i + 1) % 100 == 0:
                 gc.collect()
 

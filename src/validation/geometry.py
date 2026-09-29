@@ -85,9 +85,12 @@ def physical_roll_from_suffix(suffix: str) -> float:
 
 
 def infer_suffix_from_path(video_path: str) -> Optional[str]:
-    """パス末尾の _U/_R/_L を検出する。無ければ None"""
+    """パス末尾の _U/_R/_L、またはファイル名そのものが U/R/L のとき検出する。無ければ None"""
     name = video_path.replace("\\", "/").split("/")[-1]
     stem = name.rsplit(".", 1)[0]
+    upper = stem.upper()
+    if upper in ("U", "R", "L"):
+        return upper
     for suffix in ("U", "R", "L"):
         if stem.endswith(f"_{suffix}"):
             return suffix

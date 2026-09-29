@@ -2,12 +2,23 @@
 
 仕様書 `doc/2方向動画合成カラーマップ生成_検証仕様書_v0_4_rev3.docx` に対する実装の採用事項・改修経緯は `doc/2方向動画合成カラーマップ生成_実装ノート.md`。
 
-## 実行
+## 製品版
+
+```bash
+python src/main_twopass.py --help
+python src/main_twopass.py --input data/input --output data/output --start 1 --end 500
+```
+
+Windows 向け一式は `build/build_installer.bat` が `dist/main_twopass_<VERSION>/` に出力します。進捗ウィンドウは `progress_viewer/`（元プログラムを 3 方向の progress.json に合わせて更新。経過・残り・終了予定を表示）。
+
+仮想検証（既知 z）は従来どおり:
 
 ```bash
 python src/main_two_direction_validation.py --config data/config/two_direction_config.json
 pytest tests/ -q
 ```
+
+## 実行
 
 CLI は `src/main_twopass.py` と同じ4層設定です（dataclass 初期値 < default_config.json < `--config` < 個別引数）。
 

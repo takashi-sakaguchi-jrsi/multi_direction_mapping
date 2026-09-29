@@ -239,7 +239,7 @@ def test_two_direction_config_loads_three_runs():
     cfg = load_config("data/config/two_direction_config.json")
     assert cfg.two_direction.run_C.run_id == "L"
     assert cfg.two_direction.run_C.physical_roll_deg == pytest.approx(240.0)
-    assert "phi250_line_swing_L.mp4" in cfg.two_direction.run_C.video_path
+    assert "phi250_baseline_L.mp4" in cfg.two_direction.run_C.video_path
     tags = [t for t, _ in cfg.two_direction.active_run_slots()]
     assert tags == ["A", "B", "C"]
 

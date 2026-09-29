@@ -97,10 +97,10 @@ class OutputConfig:
         report_path: レポート出力パス
         progress_path: 進捗情報出力パス（{process_id}はプロセスIDに置換）
     """
-    colormap_path: str = "data/output/colormaps/colormap_{timestamp}.png"
-    temporary_colormap_path: str = "data/output/colormaps/colormap_{timestamp}_temp.png"
-    report_path: str = "data/output/reports/report_{timestamp}.xlsx"
-    progress_path: str = "data/output/progress/progress_{process_id}.json"
+    colormap_path: str = "data/output/colormap.png"
+    temporary_colormap_path: str = "data/output/colormap_temp.png"
+    report_path: str = "reports/report_{timestamp}.xlsx"
+    progress_path: str = "progress/progress.json"
 
 
 @dataclass
@@ -996,9 +996,9 @@ class DebugConfig:
     console_output: bool = False
     save_intermediate: bool = False
     save_interval: int = 100
-    output_dir: str = "data/output/debug"
+    output_dir: str = "debug"
     output_debug_images: bool = False
-    debug_image_path: str = "data/output/debug/"
+    debug_image_path: str = "debug/"
     window_size: Tuple[int, int] = (1920, 1080)
     grid_color: Tuple[int, int, int] = (0, 255, 0)
     grid_thickness: int = 1
@@ -1025,7 +1025,7 @@ class LoggingConfig:
         backup_count: ローテーション時に保持するバックアップファイル数
     """
     level: str = "WARNING"
-    file: str = "data/output/process.log"
+    file: str = "Log/process.log"
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     console_output: bool = True
     max_bytes: int = 5_000_000  # 5MB
@@ -1179,7 +1179,7 @@ class TwoDirectionConfig:
     enabled: bool = True
     modes: List[str] = field(default_factory=lambda: ["A", "C"])
     """A: dz+pitch（yaw 固定）。2段階 yaw は実験用で既定オフ。C: 6DoF+prior。"""
-    output_dir: str = "data/output/two_direction"
+    output_dir: str = "data/output"
     cache_projection_maps: bool = False
     z_source: str = "ocr"
     """距離の入力元。ocr=Tesseract、known=生成 metadata の z を OCR 代用（第1段階）"""

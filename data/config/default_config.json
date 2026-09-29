@@ -6,7 +6,7 @@
   "output": {
     "colormap_path": "data/output/colormap.png",
     "temporary_colormap_path": "data/output/colormap_temp.png",
-    "report_path": "reports/report.xlsx",
+    "report_path": "reports/report_{timestamp}.xlsx",
     "progress_path": "progress/progress.json"
   },
   "camera": {
@@ -25,6 +25,8 @@
     "default_position_z": 0.0
   },
   "estimation": {
+    "use_vanishing_point_constraints": false,
+    "use_ocr_z_constraints": true,
     "feature_matching": {
       "method": "ORB",
       "max_features": 500,
@@ -43,7 +45,7 @@
       "max_distance_threshold": 120.0,
       "spatial_grid_theta_bins": 8,
       "spatial_grid_phi_bins": 8,
-      "use_cylindrical_matching": true,
+      "use_cylindrical_matching": false,
       "cylindrical": {
         "theta_resolution": 720,
         "z_resolution": 500,
@@ -90,14 +92,14 @@
       "estimate_dx": true,
       "estimate_dz": true,
       "estimate_droll": true,
-      "estimate_dyaw": false,
-      "estimate_dpitch": false,
-      "use_vanishing_point_yaw": true,
-      "use_vanishing_point_pitch": true,
+      "estimate_dyaw": true,
+      "estimate_dpitch": true,
+      "use_vanishing_point_yaw": false,
+      "use_vanishing_point_pitch": false,
       "fixed_yaw": 0.0,
       "fixed_pitch": 0.0,
       "fixed_roll": 0.0,
-      "fix_angles_to_vanishing_point": true,
+      "fix_angles_to_vanishing_point": false,
       "dz_adaptive_bounds_enabled": true,
       "dz_adaptive_margin": 3.0,
       "hybrid_two_stage_enabled": false,
@@ -298,7 +300,7 @@
     "max_bytes": 5000000,
     "backup_count": 3
   },
-  "auto_tune_enabled": true,
+  "auto_tune_enabled": false,
   "auto_tune_sample_frames": null,
   "auto_tune_frame_skip": 100,
   "auto_tune_motion_multiplier": 4.0,
@@ -306,5 +308,115 @@
   "auto_tune_feature_matching_sample_pairs": 4,
   "auto_tune_feature_matching_target_points": 20,
   "auto_tune_feature_matching_pass_ratio": 0.75,
-  "auto_tune_brightness_edge_frames": 5
+  "auto_tune_brightness_edge_frames": 5,
+  "two_direction": {
+    "enabled": true,
+    "modes": ["A"],
+    "output_dir": "data/output",
+    "cache_projection_maps": false,
+    "z_source": "ocr",
+    "known_z_metadata_path": null,
+    "match_source_pixels_per_mm": false,
+    "mode_a_yaw_second_stage": false,
+    "capture": {
+      "usable_outer_radius_ratio": 0.8,
+      "derived_usable_half_fov_deg": 71.97,
+      "nominal_sector_half_deg": 60.0,
+      "required_margin_deg": 5.0,
+      "image_height_px": 1080,
+      "image_width_px": 1920
+    },
+    "run_A": {
+      "video_path": "data/input/U.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 0.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "U"
+    },
+    "run_B": {
+      "video_path": "data/input/R.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 120.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "R"
+    },
+    "run_C": {
+      "video_path": "data/input/L.mp4",
+      "physical_pitch_deg": 90.0,
+      "physical_roll_deg": 240.0,
+      "yaw_ref_deg": 0.0,
+      "x_ref_mm": 0.0,
+      "y_ref_mm": 0.0,
+      "run_id": "L"
+    },
+    "center_prior": {
+      "scale": 1.0,
+      "sigma_x_mm": 1.0,
+      "sigma_y_mm": 2.0,
+      "sigma_roll_deg": 3.0,
+      "sigma_yaw_deg": 5.0,
+      "sigma_pitch_deg": 8.0
+    },
+    "hard_bounds": {
+      "max_x_dev_mm": 5.0,
+      "max_y_dev_mm": 10.0,
+      "max_roll_dev_deg": 15.0,
+      "max_yaw_dev_deg": 20.0,
+      "max_pitch_dev_deg": 25.0
+    },
+    "registration": {
+      "z_search_margin_mm": 50.0,
+      "theta_search_margin_deg": 15.0,
+      "ransac_iterations": 500,
+      "ransac_inlier_threshold_mm": 5.0,
+      "min_inliers": 8,
+      "lambda_ocr": 1.0,
+      "lambda_smooth": 1.0,
+      "max_correction_mm": 50.0
+    },
+    "seam_warp": {
+      "enabled": true,
+      "apply_edge_theta": false,
+      "half_band_deg": 8.0,
+      "control_spacing_mm": 30.0,
+      "max_dz_mm": 40.0,
+      "max_dtheta_deg": 6.0,
+      "min_matches": 6,
+      "ncc_window_mm": 40.0,
+      "ncc_step_mm": 15.0,
+      "iqr_window_mm": 400.0
+    },
+    "pitch_trend_warp": {
+      "enabled": true,
+      "window_mm": 800.0,
+      "max_dtheta_deg": 15.0
+    },
+    "best_view": {
+      "scoring": "overwrite",
+      "distance_tie_tolerance_mm": 1.0
+    },
+    "feature_matching_sideview": {
+      "use_radius_filter": false,
+      "max_pixel_displacement_sideview": 250.0,
+      "ratio_test_threshold": 0.75,
+      "min_match_count": 10,
+      "center_rect_half_ratio": 0.4,
+      "reject_reverse_travel": true,
+      "reverse_flow_tolerance_px": 1.0,
+      "outlier_iqr_multiplier": 1.5,
+      "outlier_min_points": 4
+    },
+    "projection": {
+      "allow_signed_relative_z": true,
+      "distance_metric": "coordinate",
+      "sample_stride": 2
+    },
+    "legacy_vp": {
+      "enabled": false
+    }
+  }
 }

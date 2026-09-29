@@ -17,6 +17,22 @@ original_colormap/
 # Generated validation outputs
 data/output/
 
+# PyInstaller
+dist/
+build/main_twopass/
+
+# Runtime product folders
+Log/*.log
+Log/*.log.*
+progress/*.json
+reports/*.xlsx
+reports/*.csv
+reports/validation_report_*.json
+debug/**
+!debug/.gitkeep
+progress_viewer/bin/
+progress_viewer/obj/
+
 # Large generated / captured videos (regenerate via src/generate_two_direction_test_videos.py)
 *.mp4
 *.avi

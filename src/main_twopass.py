@@ -76,6 +76,12 @@ from src.progress_reporter import ProgressReporter
 from src.camera_utils import compute_fisheye_focal_length
 from src.auto_tuner import AutoTuner
 from src.image_size_correction import apply_camera_correction
+from src.main_two_direction_validation import run_two_direction_validation
+from src.product_runtime import (
+    apply_product_cli,
+    create_progress_reporter,
+    ensure_product_cwd,
+)
 
 
 # ============================================================================
@@ -2222,24 +2228,16 @@ def parse_arguments() -> argparse.Namespace:
         パース結果
     """
     parser = argparse.ArgumentParser(
-        description='管内カメラカーシミュレーション用カラーマップ生成（2パスフロー版）',
+        description='管内カメラカーシミュレーション用カラーマップ生成（3方向合成）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-  # デフォルト設定で実行
-  python src/main.py --input data/input/videos/sample.mp4
+  main_twopass.exe --config data/config/default_config.json
+  main_twopass.exe --input data/input --output data/output --start 1 --end 500
+  main_twopass.exe --pi 250 --ppm 2.55 --debug
 
-  # カスタム設定で実行
-  python src/main.py --input video.mp4 --config config.json
-
-  # 処理範囲指定
-  python src/main.py --input video.mp4 --start 100 --end 500
-
-  # デバッグモード
-  python src/main.py --input video.mp4 --debug
-
-  # 主要パラメータ指定
-  python src/main.py --input video.mp4 --aov 185.0 --pi 250.0
+--start/--end は製品の1始まり（含む）。内部の解析区間は [start-1, end) です。
+--input にフォルダを指定すると U/R/L 動画を割り当てます。
         """
     )
     
@@ -2248,7 +2246,7 @@ def parse_arguments() -> argparse.Namespace:
         '--input',
         type=Path,
         default=None,
-        help='入力動画ファイルパス'
+        help='入力動画ファイル、または U/R/L を含むフォルダ'
     )
     
     # オプション引数（設定ファイル）
@@ -2424,32 +2422,15 @@ def main() -> int:
         終了コード（0: 成功、1: 失敗）
     """
     try:
+        ensure_product_cwd()
         # 引数パース
         args = parse_arguments()
         
         # 設定読み込み
         config = load_config(str(args.config) if args.config else None)
         
-        # CLI引数で設定を上書き
-        if args.input:
-            config.input.video_path = str(args.input)
-        if args.output:
-            config.output.colormap_path = str(args.output)
-        if args.start is not None:
-            config.input.start_frame = args.start
-        if args.end is not None:
-            config.input.end_frame = args.end
-        if args.debug:
-            config.debug.enabled = True
-            config.logging.level = "DEBUG"
-        if args.aov is not None:
-            config.camera.fov_degrees = args.aov
-        if args.pi is not None:
-            config.pipe.diameter_mm = args.pi
-        if args.ppm is not None:
-            config.colormap.pixels_per_mm = args.ppm
-        if args.use_average_speed:
-            config.estimation.use_offset_moving_average = False
+        # CLI引数で設定を上書き（製品版共通フラグ）
+        apply_product_cli(config, args)
 
         # バリデーション
         config.validate()
@@ -2459,131 +2440,39 @@ def main() -> int:
         logger = logging.getLogger(__name__)
         
         logger.info("=" * 60)
-        logger.info("管内カメラカーシミュレーション用壁面画像生成処理（2パスフロー版）")
+        logger.info("管内カメラカーシミュレーション用壁面画像生成処理（3方向合成）")
         logger.info("=" * 60)
-        logger.info(f"入力動画: {config.input.video_path}")
-        logger.info(f"画角: {config.camera.fov_degrees}度")
+        logger.info(f"出力: {config.two_direction.output_dir}")
         logger.info(f"管径: {config.pipe.diameter_mm}mm")
         logger.info(f"デバッグモード: {config.debug.enabled}")
         logger.info("=" * 60)
         
-        # ========================================
-        # ProgressReporter 早期生成
-        # ========================================
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        progress_rep: Optional[ProgressReporter] = None
+        progress_rep = create_progress_reporter(config, timestamp)
+        if progress_rep:
+            progress_rep.skip_step(1, reason="3方向合成では自動チューニングを使わない")
+            logger.info(f"進捗ファイル: {progress_rep.output_path}")
 
-        if config.output.progress_path:
-            # 総フレーム数を取得
-            video_path = str(config.input.video_path)
-            cap = cv2.VideoCapture(video_path)
-            if cap.isOpened():
-                effective_end_frame = config.input.end_frame
-                if effective_end_frame is None:
-                    effective_end_frame = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                cap.release()
-                total_frames = effective_end_frame - config.input.start_frame + 1
-
-                progress_rep = ProgressReporter(
-                    output_path=Path(config.output.progress_path.replace(
-                        '{process_id}', timestamp
-                    )),
-                    total_frames=total_frames
-                )
-                steps = [
-                    {"step_id": 1, "name_ja": "パラメータ調整", "name_en": "Parameter Tuning"},
-                    {"step_id": 2, "name_ja": "フレーム解析", "name_en": "Frame Analysis"},
-                    {"step_id": 3, "name_ja": "カラーマップ生成", "name_en": "Colormap Generation"},
-                    {"step_id": 4, "name_ja": "カラーマップ補正", "name_en": "Colormap Correction"}
-                ]
-                progress_rep.initialize_steps(steps)
-                logger.info("ProgressReporter早期初期化完了（main()内）")
-            else:
-                cap.release()
-
-        # ========================================
-        # 自動チューニング機能（Phase Config-2.5）
-        # ========================================
-        
-        auto_tune_start_time = None
-        auto_tune_end_time = None
-
-        if config.auto_tune_enabled:
-            logger.info("=" * 80)
-            logger.info("自動チューニング機能: 有効")
-            logger.info(f"分析対象: {config.input.video_path}")
-            logger.info(f"サンプルフレーム数: {config.auto_tune_sample_frames}")
-            logger.info(f"フレームスキップ: {config.auto_tune_frame_skip}")
-            logger.info("=" * 80)
-
-            auto_tune_start_time = datetime.now().isoformat()
-
-            # Step 1 開始
-            if progress_rep:
-                progress_rep.start_step(1)
-
-            try:
-                # AutoTuner初期化
-                auto_tuner = AutoTuner(config, config.input.video_path, logger)
-
-                # 進捗コールバック（1%単位で間引き）
-                _step1_last_pct = [-1.0]  # mutableでクロージャから更新
-
-                def auto_tune_progress_callback(processed: int, total: int) -> None:
-                    """AutoTuner進捗コールバック（1%刻み）"""
-                    if progress_rep:
-                        try:
-                            pct = (processed / total) * 100.0 if total > 0 else 0.0
-                            if pct - _step1_last_pct[0] >= 1.0 or processed >= total:
-                                progress_rep.update_step(1, pct)
-                                _step1_last_pct[0] = pct
-                        except Exception:
-                            pass  # 進捗更新失敗は無視
-
-                # 動画分析
-                logger.info("動画特性分析を開始します...")
-                video_stats = auto_tuner.analyze_video(
-                    num_sample_frames=config.auto_tune_sample_frames,
-                    frame_skip=config.auto_tune_frame_skip,
-                    progress_callback=auto_tune_progress_callback
-                )
-
-                # パラメータ調整
-                logger.info("パラメータ自動調整を開始します...")
-                config = auto_tuner.tune_parameters(video_stats)
-
-                logger.info("自動チューニング完了")
-                logger.info("=" * 80)
-
-                # Step 1 完了
-                if progress_rep:
-                    progress_rep.complete_step(1, success=True)
-
-            except FileNotFoundError as e:
-                logger.error(f"自動チューニング失敗（動画ファイルなし）: {e}")
-                logger.warning("デフォルト設定で処理を続行します")
-                if progress_rep:
-                    progress_rep.complete_step(1, success=False, error_message=str(e))
-            except Exception as e:
-                logger.warning(f"自動チューニング失敗（予期しないエラー）: {e}")
-                logger.warning("デフォルト設定で処理を続行します")
-                if progress_rep:
-                    progress_rep.complete_step(1, success=False, error_message=str(e))
-                # 元のconfigで続行（フォールバック）
-
-            auto_tune_end_time = datetime.now().isoformat()
-        else:
-            # auto_tune無効時はスキップ
-            if progress_rep:
-                progress_rep.skip_step(1, reason="auto_tune_enabled=false")
-
-        # パイプライン実行
-        pipeline = ColorMapPipelineTwoPass(config)
-        pipeline.auto_tune_start_time = auto_tune_start_time
-        pipeline.auto_tune_end_time = auto_tune_end_time
-        pipeline.progress_rep = progress_rep
-        pipeline._timestamp = timestamp
-        pipeline.run()
+        try:
+            result = run_two_direction_validation(
+                config, progress_rep=progress_rep, timestamp=timestamp
+            )
+            logger.info(f"validation_report: {result.get('report_path')}")
+            if result.get("excel_path"):
+                logger.info(f"Excel: {result['excel_path']}")
+            if result.get("colormap_path"):
+                logger.info(f"colormap: {result['colormap_path']}")
+        except Exception:
+            if progress_rep and progress_rep.process_progress:
+                cur = progress_rep.process_progress.current_step
+                if cur:
+                    try:
+                        progress_rep.complete_step(
+                            int(cur), success=False, error_message="処理失敗"
+                        )
+                    except Exception:
+                        pass
+            raise
         
         logger.info("=" * 60)
         logger.info("正常終了")
