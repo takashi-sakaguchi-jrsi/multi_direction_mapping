@@ -1116,6 +1116,17 @@ class SeamWarpConfig:
     min_matches: int = 6
     ncc_window_mm: float = 40.0
     ncc_step_mm: float = 15.0
+    iqr_window_mm: float = 400.0
+    """接合マッチの IQR 窓[mm]。0 なら IQR なし。行程一括ではなく z 近傍のみ。"""
+
+
+@dataclass
+class PitchTrendWarpConfig:
+    """推定 pitch の移動平均トレンドを、展開図の θ 平行移動で戻す。"""
+    enabled: bool = True
+    window_mm: float = 800.0
+    """移動平均の全幅[mm]。jitter 周期より長く、終盤の歩きは追う。"""
+    max_dtheta_deg: float = 15.0
 
 
 @dataclass
@@ -1198,6 +1209,8 @@ class TwoDirectionConfig:
     """Mode A: dz+pitch のあと yaw 1変数を最小二乗する。全長では pitch が悪化するため既定オフ。"""
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     seam_warp: SeamWarpConfig = field(default_factory=SeamWarpConfig)
+    pitch_trend_warp: PitchTrendWarpConfig = field(default_factory=PitchTrendWarpConfig)
+    """OCR z 補正のあと、pitch 移動平均の θ シフト。接合の前。"""
     best_view: BestViewConfig = field(default_factory=BestViewConfig)
     feature_matching_sideview: FeatureMatchingSideviewConfig = field(
         default_factory=FeatureMatchingSideviewConfig
@@ -1238,7 +1251,7 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
         return TwoDirectionConfig()
     top = {k: v for k, v in data.items() if k not in {
         "capture", "run_A", "run_B", "run_C", "center_prior", "hard_bounds",
-        "registration", "seam_warp", "best_view", "feature_matching_sideview",
+        "registration", "seam_warp", "pitch_trend_warp", "best_view", "feature_matching_sideview",
         "projection", "legacy_vp",
     }}
     cfg = _dataclass_from_dict(TwoDirectionConfig, top)
@@ -1252,6 +1265,9 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
     cfg.hard_bounds = _dataclass_from_dict(HardBoundsConfig, data.get("hard_bounds"))
     cfg.registration = _dataclass_from_dict(RegistrationConfig, data.get("registration"))
     cfg.seam_warp = _dataclass_from_dict(SeamWarpConfig, data.get("seam_warp"))
+    cfg.pitch_trend_warp = _dataclass_from_dict(
+        PitchTrendWarpConfig, data.get("pitch_trend_warp")
+    )
     cfg.best_view = _dataclass_from_dict(BestViewConfig, data.get("best_view"))
     cfg.feature_matching_sideview = _dataclass_from_dict(
         FeatureMatchingSideviewConfig, data.get("feature_matching_sideview")

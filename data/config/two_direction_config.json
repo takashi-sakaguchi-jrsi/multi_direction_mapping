@@ -113,7 +113,13 @@
       "max_dtheta_deg": 6.0,
       "min_matches": 6,
       "ncc_window_mm": 40.0,
-      "ncc_step_mm": 15.0
+      "ncc_step_mm": 15.0,
+      "iqr_window_mm": 400.0
+    },
+    "pitch_trend_warp": {
+      "enabled": true,
+      "window_mm": 800.0,
+      "max_dtheta_deg": 15.0
     },
     "best_view": {
       "scoring": "overwrite",

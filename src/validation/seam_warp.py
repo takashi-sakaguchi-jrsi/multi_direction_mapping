@@ -290,8 +290,10 @@ def _match_seam_pair(
     keep &= np.abs(mz_arr) <= max_dz
     keep &= np.abs(mth_arr) <= max_dth
     z_arr, mz_arr, mth_arr = z_arr[keep], mz_arr[keep], mth_arr[keep]
-    keep = _iqr_keep(mz_arr) & _iqr_keep(mth_arr)
-    z_arr, mz_arr, mth_arr = z_arr[keep], mz_arr[keep], mth_arr[keep]
+    iqr_win = float(_cfg_val(cfg, "iqr_window_mm", 400.0))
+    if iqr_win > 0.0 and z_arr.size >= 4:
+        loc = _local_iqr_keep(z_arr, mz_arr, mth_arr, iqr_win)
+        z_arr, mz_arr, mth_arr = z_arr[loc], mz_arr[loc], mth_arr[loc]
 
     min_n = int(_cfg_val(cfg, "min_matches", 6))
     if z_arr.size < max(2, min_n // 2):
@@ -367,15 +369,59 @@ def _bin_medians(
     return zc[uniq], np.asarray(a, dtype=float)[uniq], np.asarray(b, dtype=float)[uniq]
 
 
-def _iqr_keep(vals: np.ndarray, mult: float = 1.5, min_pts: int = 4) -> np.ndarray:
+def _iqr_keep(
+    vals: np.ndarray,
+    mult: float = 1.5,
+    min_pts: int = 4,
+    floor: float = 0.0,
+) -> np.ndarray:
     if vals.size < min_pts:
         return np.ones(vals.size, dtype=bool)
     q1, q3 = np.percentile(vals, [25.0, 75.0])
-    iqr = q3 - q1
-    if iqr < 1e-9:
-        return np.ones(vals.size, dtype=bool)
+    iqr = max(float(q3 - q1), float(floor))
     lo, hi = q1 - mult * iqr, q3 + mult * iqr
     return (vals >= lo) & (vals <= hi)
+
+
+def _local_iqr_keep(
+    z_mm: np.ndarray,
+    mz_mm: np.ndarray,
+    mth_rad: np.ndarray,
+    window_mm: float,
+    mult: float = 1.5,
+    min_pts: int = 4,
+) -> np.ndarray:
+    """各点を z 近傍の IQR で判定する。行程全体の分布は見ない。"""
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    mz = np.asarray(mz_mm, dtype=float).reshape(-1)
+    mth = np.asarray(mth_rad, dtype=float).reshape(-1)
+    n = int(z.size)
+    keep = np.ones(n, dtype=bool)
+    if n == 0 or window_mm <= 0.0:
+        return keep
+    order = np.argsort(z)
+    zs = z[order]
+    mz_s = mz[order]
+    mt_s = mth[order]
+    half = 0.5 * float(window_mm)
+    out = np.ones(n, dtype=bool)
+    lo = 0
+    hi = 0
+    floor_mz = 1.0
+    floor_th = np.radians(0.3)
+    for i in range(n):
+        while zs[lo] < zs[i] - half:
+            lo += 1
+        while hi < n and zs[hi] <= zs[i] + half:
+            hi += 1
+        if hi - lo < min_pts:
+            continue
+        k = _iqr_keep(mz_s[lo:hi], mult, min_pts, floor_mz) & _iqr_keep(
+            mt_s[lo:hi], mult, min_pts, floor_th
+        )
+        out[i] = bool(k[i - lo])
+    keep[order] = out
+    return keep
 
 
 def _to_gray(

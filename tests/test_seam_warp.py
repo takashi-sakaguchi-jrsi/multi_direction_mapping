@@ -190,3 +190,22 @@ def test_remap_keeps_theta_wrap_filled():
     assert int(out["rgb"][0].max()) > 0
     assert int(out["rgb"][-1].max()) > 0
 
+
+def test_local_iqr_drops_spike_keeps_slow_ramp():
+    from src.validation.seam_warp import _local_iqr_keep
+
+    z = np.linspace(0.0, 2000.0, 80)
+    mz = np.zeros(z.size)
+    mth = np.radians(np.linspace(0.0, 4.0, z.size))
+    keep_ramp = _local_iqr_keep(z, mz, mth, window_mm=400.0)
+    assert bool(np.all(keep_ramp))
+
+    mth_spk = np.zeros(z.size)
+    mth_spk[10] = np.radians(5.0)
+    keep_spk = _local_iqr_keep(z, mz, mth_spk, window_mm=400.0)
+    assert not bool(keep_spk[10])
+    assert int(np.sum(~keep_spk)) <= 3
+
+    keep_off = _local_iqr_keep(z, mz, mth_spk, window_mm=0.0)
+    assert bool(np.all(keep_off))
+

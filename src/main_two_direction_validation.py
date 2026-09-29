@@ -48,7 +48,7 @@ from src.validation.report import (
 from src.validation.seam_join import join_at_overlap_centers
 from src.validation.seam_warp import normalize_run_id, warp_strips_to_seams
 from src.validation.sideview_projection_mapper import SideviewProjectionMapper
-from src.validation.strip_correction import correct_strip
+from src.validation.strip_correction import correct_strip, apply_pitch_trend_warp
 
 
 logger = logging.getLogger(__name__)
@@ -217,6 +217,9 @@ def run_two_direction_validation(
             item["corr"] = _correct_accumulated(
                 item["acc"], item["rec"], item["extra"],
                 ppm, half_fov, spacing, warp_theta=apply_edge,
+                pitch_trend=getattr(td, "pitch_trend_warp", None),
+                theta_min=item["acc"].theta_min,
+                theta_max=item["acc"].theta_max,
             )
             item["acc"] = None
             gc.collect()
@@ -441,7 +444,10 @@ def _run_id(records, fallback: str) -> str:
     return normalize_run_id(raw)
 
 
-def _correct_accumulated(acc, records, extra, ppm, half_fov_rad, spacing_mm, warp_theta=True):
+def _correct_accumulated(
+    acc, records, extra, ppm, half_fov_rad, spacing_mm, warp_theta=True,
+    pitch_trend=None, theta_min=0.0, theta_max=2.0 * np.pi,
+):
     z_est = np.array([r.position[2] for r in records], dtype=float)
     z_ocr = np.asarray(extra.get("ocr_dist"), dtype=float)
     if z_ocr.size != z_est.size:
@@ -454,13 +460,27 @@ def _correct_accumulated(acc, records, extra, ppm, half_fov_rad, spacing_mm, war
     ori = np.array([
         ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]
     ], dtype=float)
-    return correct_strip(
+    result = correct_strip(
         acc.colormap_rgb(), acc.buf.filled, acc.buf.z_min, ppm,
         z_est, z_ocr, ori, half_fov_rad,
         theta_min=acc.theta_min, theta_max=acc.theta_max,
         control_spacing_mm=spacing_mm,
         warp_theta=warp_theta,
     )
+    if pitch_trend is not None and bool(getattr(pitch_trend, "enabled", False)):
+        z_axis = z_ocr if z_ocr.size == z_est.size else z_est
+        pitch = np.array([float(r.orientation[2]) for r in records], dtype=float)
+        n = min(z_axis.size, pitch.size)
+        result = apply_pitch_trend_warp(
+            result, z_axis[:n], pitch[:n],
+            float(ori[0]), float(ori[1]), float(ori[2]),
+            ppm,
+            theta_min=float(theta_min),
+            theta_max=float(theta_max),
+            window_mm=float(getattr(pitch_trend, "window_mm", 800.0)),
+            max_dtheta_deg=float(getattr(pitch_trend, "max_dtheta_deg", 15.0)),
+        )
+    return result
 
 
 def _accumulate_run(

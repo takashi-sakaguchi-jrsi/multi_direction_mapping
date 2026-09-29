@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-from src.validation.geometry import expected_edge_etas, wrap_angle_rad
+from src.validation.geometry import expected_edge_etas, optical_axis_eta, wrap_angle_rad
 
 
 @dataclass
@@ -26,6 +26,7 @@ class StripCorrectionResult:
     dtheta_rad: Optional[np.ndarray]
     z_ctrl: Optional[np.ndarray]
     message: str
+    pitch_dtheta_rad: Optional[np.ndarray] = None
 
 
 def correct_strip(
@@ -88,6 +89,25 @@ def _eval_pchip_hold(x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray
     yq = np.where(xq < x[0], y[0], yq)
     yq = np.where(xq > x[-1], y[-1], yq)
     return yq
+
+
+def _centered_ma_1d(values: np.ndarray, z_mm: np.ndarray, window_mm: float) -> np.ndarray:
+    """z 間隔から決めたフレーム幅の中央移動平均。端は欠ける窓。"""
+    v = np.asarray(values, dtype=float).reshape(-1)
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    n = int(v.size)
+    if n == 0:
+        return v.copy()
+    if n == 1 or window_mm <= 0.0:
+        return v.copy()
+    dz = float(np.median(np.abs(np.diff(z)))) if n > 1 else float(window_mm)
+    dz = max(dz, 1e-6)
+    half_n = max(1, int(round(0.5 * float(window_mm) / dz)))
+    c = np.cumsum(np.concatenate([[0.0], v]))
+    idx = np.arange(n)
+    lo = np.maximum(0, idx - half_n)
+    hi = np.minimum(n, idx + half_n + 1)
+    return (c[hi] - c[lo]) / np.maximum(hi - lo, 1).astype(float)
 
 
 def _flatten_end_slopes(
@@ -463,3 +483,117 @@ def warp_theta_to_edge_center(
         dtheta,
         f"θ補正 ctrl={zs.size} center={np.degrees(center):.1f}deg",
     )
+
+
+def pitch_trend_dtheta_rad(
+    z_mm: np.ndarray,
+    pitch_rad: np.ndarray,
+    roll_ref: float,
+    yaw_ref: float,
+    pitch_ref: float,
+    window_mm: float = 800.0,
+    max_dtheta_deg: float = 15.0,
+) -> np.ndarray:
+    """各サンプルの Δη = η(基準) − η(pitch 移動平均)。変動は残しトレンドだけ戻す。"""
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    pitch = np.asarray(pitch_rad, dtype=float).reshape(-1)
+    n = min(z.size, pitch.size)
+    z, pitch = z[:n], pitch[:n]
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    unwrapped = np.unwrap(pitch)
+    ma = _centered_ma_1d(unwrapped, z, window_mm)
+    eta_ref = optical_axis_eta(float(roll_ref), float(yaw_ref), float(pitch_ref))
+    dth = np.empty(n, dtype=float)
+    max_abs = np.radians(float(max_dtheta_deg))
+    for i, p_ma in enumerate(ma):
+        eta_ma = optical_axis_eta(float(roll_ref), float(yaw_ref), float(p_ma))
+        dth[i] = wrap_angle_rad(eta_ref - eta_ma)
+    return np.clip(dth, -max_abs, max_abs)
+
+
+def _remap_theta_shift_chunks(
+    rgb: np.ndarray,
+    filled: np.ndarray,
+    dtheta: np.ndarray,
+    theta_min: float,
+    theta_max: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = rgb.shape[:2]
+    span = float(theta_max - theta_min)
+    d_rows = np.asarray(dtheta, dtype=float).reshape(-1) / max(span, 1e-12) * h
+    rows = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    if rgb.ndim == 3:
+        rgb_o = np.zeros((h, w, rgb.shape[2]), dtype=rgb.dtype)
+    else:
+        rgb_o = np.zeros((h, w), dtype=rgb.dtype)
+    filled_o = np.zeros((h, w), dtype=bool)
+    xs = np.arange(w, dtype=np.float32)
+    chunk = 512
+    for x0 in range(0, w, chunk):
+        x1 = min(w, x0 + chunk)
+        map_x = np.repeat(xs[x0:x1].reshape(1, -1), h, axis=0)
+        map_y = rows - d_rows[x0:x1].reshape(1, -1).astype(np.float32)
+        cr, cf = remap_with_periodic_theta(rgb, filled, map_x, map_y)
+        rgb_o[:, x0:x1] = cr
+        filled_o[:, x0:x1] = cf
+        del map_x, map_y, cr, cf
+    return rgb_o, filled_o
+
+
+def apply_pitch_trend_warp(
+    result: StripCorrectionResult,
+    z_mm: np.ndarray,
+    pitch_rad: np.ndarray,
+    roll_ref: float,
+    yaw_ref: float,
+    pitch_ref: float,
+    pixels_per_mm: float,
+    theta_min: float = 0.0,
+    theta_max: float = 2.0 * np.pi,
+    window_mm: float = 800.0,
+    max_dtheta_deg: float = 15.0,
+) -> StripCorrectionResult:
+    """z 補正後の部分図に、pitch 移動平均トレンドの θ シフトを掛ける。"""
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    pitch = np.asarray(pitch_rad, dtype=float).reshape(-1)
+    n = min(z.size, pitch.size)
+    if n < 8:
+        result.message = f"{result.message}; pitch θトレンドスキップ（点不足）"
+        return result
+    z, pitch = z[:n], pitch[:n]
+    valid = np.isfinite(z) & np.isfinite(pitch)
+    z, pitch = z[valid], pitch[valid]
+    if z.size < 8:
+        result.message = f"{result.message}; pitch θトレンドスキップ（有効点不足）"
+        return result
+    dth_s = pitch_trend_dtheta_rad(
+        z, pitch, roll_ref, yaw_ref, pitch_ref, window_mm, max_dtheta_deg,
+    )
+    zs, ds = _strict_increasing(z, dth_s)
+    if zs.size < 2:
+        result.message = f"{result.message}; pitch θトレンドスキップ（z 非単調）"
+        return result
+    h, w = result.rgb.shape[:2]
+    ppm = max(float(pixels_per_mm), 1e-9)
+    z_cols = float(result.z_min) + np.arange(w, dtype=float) / ppm
+    dtheta = _eval_pchip_hold(zs, ds, z_cols)
+    peak = float(np.max(np.abs(dtheta))) if dtheta.size else 0.0
+    if peak < 1e-8:
+        result.pitch_dtheta_rad = dtheta
+        result.message = (
+            f"{result.message}; pitch θトレンド skip(max={np.degrees(peak):.3f}deg)"
+        )
+        return result
+    rgb_o, filled_o = _remap_theta_shift_chunks(
+        result.rgb, result.filled, dtheta, theta_min, theta_max,
+    )
+    result.rgb = rgb_o
+    result.filled = filled_o
+    result.pitch_dtheta_rad = dtheta
+    result.message = (
+        f"{result.message}; pitch θトレンド "
+        f"win={float(window_mm):.0f}mm max={np.degrees(peak):.2f}deg"
+    )
+    return result
+
