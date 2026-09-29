@@ -17,6 +17,7 @@
 
 ビルド:
   dotnet build progress_viewer/ProgressViewer.csproj
+  （net8.0-windows 向け。RollForward=LatestMajor なので .NET 10 ランタイムでも起動します）
 
 実行:
   ProgressViewer.exe [progress.json のパス]

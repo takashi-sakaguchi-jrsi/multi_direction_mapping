@@ -1,10 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
+    <!-- 実行・配布は .NET 8 ランタイム想定。.NET 10 SDK があればそのままビルド可能。 -->
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- ユーザ PC に .NET 8 のみ／新しめのランタイムのみ、など差を吸収（*.runtimeconfig.json に反映） -->
+    <RollForward>LatestMajor</RollForward>
     <AssemblyName>ProgressViewer</AssemblyName>
     <RootNamespace>ProgressViewer</RootNamespace>
   </PropertyGroup>
