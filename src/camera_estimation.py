@@ -2796,57 +2796,17 @@ class CameraEstimator:
         呼び出し側でbase_ocr_distanceにprev_ocr_distance（直前の成功OCR値）を
         渡し、frame_gapにその成功フレームからの差を渡すことで、
         per-frame incrementベースの検証を行う。
-
-        Args:
-            frame_idx: 現在のフレーム番号
-            ocr_distance: 現在フレームのOCR読取り結果(mm)
-            prev_ocr_distance: 前フレームのOCR距離(mm)（逆転チェック用）
-            prev_ocr_success: 前フレームのOCR読取り成功フラグ
-            base_ocr_distance: 参照距離(mm)（prev_ocr_distanceまたはbase）
-            frame_gap: 参照フレームからのフレーム差
-            max_increment: 1フレームあたりの最大移動量(mm)
-
-        Returns:
-            検証済みOCR距離(mm)。破棄の場合はNone
-
-        検証ルール:
-            1. ocr_distance が None の場合はそのまま返す（読取り失敗）
-            2. 参照距離なし（最初のフレーム）→ 検証なしで合格
-            3. 逆転検出（前フレーム成功時のみ）: ocr_distance < prev_ocr_distance → 破棄
-            4. 範囲チェック: ocr_distance ∈ [ref, ref + max_increment * gap]
         """
-        # 読取り失敗の場合はそのまま返す
-        if ocr_distance is None:
-            return None
-
-        # 最初のフレーム（基準なし）→ 検証なしで合格
-        if base_ocr_distance is None:
-            return ocr_distance
-
-        # 逆転チェック（前フレーム成功時のみ）
-        if prev_ocr_success and prev_ocr_distance is not None:
-            if ocr_distance < prev_ocr_distance:
-                self.logger.warning(
-                    f"OCR距離の逆転を検出: frame={frame_idx}, "
-                    f"value={ocr_distance:.1f}mm < prev={prev_ocr_distance:.1f}mm、破棄"
-                )
-                return None
-
-        # 基準フレームからの範囲チェック
-        min_distance = base_ocr_distance
-        max_distance = base_ocr_distance + max_increment * frame_gap
-
-        if not (min_distance <= ocr_distance <= max_distance):
-            self.logger.warning(
-                f"OCR距離検証失敗: frame={frame_idx}, "
-                f"value={ocr_distance:.1f}mm, "
-                f"expected=[{min_distance:.1f}, {max_distance:.1f}]mm (gap={frame_gap}), "
-                f"reason=範囲外"
-            )
-            return None
-
-        # 検証合格
-        return ocr_distance
+        return validate_ocr_distance_value(
+            frame_idx=frame_idx,
+            ocr_distance=ocr_distance,
+            prev_ocr_distance=prev_ocr_distance,
+            prev_ocr_success=prev_ocr_success,
+            base_ocr_distance=base_ocr_distance,
+            frame_gap=frame_gap,
+            max_increment=max_increment,
+            logger=self.logger,
+        )
 
     def _collect_reference_frames(
         self,
@@ -6183,6 +6143,49 @@ def compute_frame_constraints(
     return constraints_dict, z_positions_output, vanishing_points_output
 
 
+def validate_ocr_distance_value(
+    frame_idx: int,
+    ocr_distance: Optional[float],
+    prev_ocr_distance: Optional[float],
+    prev_ocr_success: bool,
+    base_ocr_distance: Optional[float],
+    frame_gap: int,
+    max_increment: float,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[float]:
+    """OCR距離の妥当性を検証（物理制約ベース、オリジナル BUG-011 と同じ規則）。
+
+    検証ルール:
+        1. ocr_distance が None の場合はそのまま返す（読取り失敗）
+        2. 参照距離なし（最初のフレーム）→ 検証なしで合格
+        3. 逆転検出（前フレーム成功時のみ）: ocr_distance < prev_ocr_distance → 破棄
+        4. 範囲チェック: ocr_distance ∈ [ref, ref + max_increment * gap]
+    """
+    log = logger or logging.getLogger(__name__)
+    if ocr_distance is None:
+        return None
+    if base_ocr_distance is None:
+        return ocr_distance
+    if prev_ocr_success and prev_ocr_distance is not None:
+        if ocr_distance < prev_ocr_distance:
+            log.warning(
+                f"OCR距離の逆転を検出: frame={frame_idx}, "
+                f"value={ocr_distance:.1f}mm < prev={prev_ocr_distance:.1f}mm、破棄"
+            )
+            return None
+    min_distance = base_ocr_distance
+    max_distance = base_ocr_distance + max_increment * frame_gap
+    if not (min_distance <= ocr_distance <= max_distance):
+        log.warning(
+            f"OCR距離検証失敗: frame={frame_idx}, "
+            f"value={ocr_distance:.1f}mm, "
+            f"expected=[{min_distance:.1f}, {max_distance:.1f}]mm (gap={frame_gap}), "
+            f"reason=範囲外"
+        )
+        return None
+    return ocr_distance
+
+
 def compute_distance_constraints_only(
     video_path: Optional['Path'] = None,
     start_frame: int = 0,
@@ -6200,7 +6203,10 @@ def compute_distance_constraints_only(
     """OCR-only の距離制約。暗部・輝度・VP 系列は呼び出さない。
 
     known_z_mm を渡すと Tesseract を呼ばず、その値を OCR 読み取り結果として使う
-    （第1段階: 仮想動画の生成距離を代用する）。
+    （第1段階: 仮想動画の生成距離を代用する）。既知zは逆転・ジャンプ検証しない。
+
+    実 Tesseract 経路はオリジナルと同じ逆転・ジャンプ検証を通す
+    （1フレームあたり max_distance_increment_mm、既定 10 mm）。
 
     Returns:
         constraints_dict, z_positions, ocr_dist, success
@@ -6220,14 +6226,91 @@ def compute_distance_constraints_only(
         if estimator is None:
             raise ValueError("estimator または config が必要です")
         config = estimator.config
+    ocr_logger = estimator.logger if estimator is not None else logger
 
     _ocr_config = OCRConfigUtils(
         psm_mode=OCRConfigUtils._extract_psm_mode(ocr_tesseract_config),
         preprocessing_enabled=ocr_preprocessing_enabled,
     )
 
-    loaded: List[np.ndarray] = []
-    ocr_from_video = False
+    prev_ocr_distance: Optional[float] = None
+    prev_ocr_success = False
+    prev_ocr_frame_idx: Optional[int] = None
+    base_ocr_distance: Optional[float] = None
+    base_ocr_frame_idx: Optional[int] = None
+    last_successful_threshold: Optional[int] = None
+    ocr_raw_success_count = 0
+    ocr_validated_success_count = 0
+
+    def _ref_for_frame(frame_idx: int):
+        if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
+            gap = frame_idx - prev_ocr_frame_idx
+            ref = prev_ocr_distance
+        elif base_ocr_distance is not None and base_ocr_frame_idx is not None:
+            gap = frame_idx - base_ocr_frame_idx
+            ref = base_ocr_distance
+        else:
+            gap = 1
+            ref = None
+        if gap < 1:
+            gap = 1
+        expected = None
+        if ref is not None:
+            expected = (ref, ref + max_distance_increment_mm * gap)
+        return gap, ref, expected
+
+    def _accept(distance_raw: Optional[float], frame_idx: int) -> Tuple[float, bool]:
+        nonlocal prev_ocr_distance, prev_ocr_success, prev_ocr_frame_idx
+        nonlocal base_ocr_distance, base_ocr_frame_idx, ocr_validated_success_count
+        gap, ref, _ = _ref_for_frame(frame_idx)
+        distance = validate_ocr_distance_value(
+            frame_idx=frame_idx,
+            ocr_distance=distance_raw,
+            prev_ocr_distance=prev_ocr_distance,
+            prev_ocr_success=prev_ocr_success,
+            base_ocr_distance=ref,
+            frame_gap=gap,
+            max_increment=max_distance_increment_mm,
+            logger=ocr_logger,
+        )
+        if distance is not None and not np.isnan(distance):
+            prev_ocr_distance = distance
+            prev_ocr_success = True
+            prev_ocr_frame_idx = frame_idx
+            if base_ocr_distance is None:
+                base_ocr_distance = distance
+                base_ocr_frame_idx = frame_idx
+            elif distance >= base_ocr_distance + 10.0:
+                base_ocr_distance = distance
+                base_ocr_frame_idx = frame_idx
+            ocr_validated_success_count += 1
+            return float(distance), True
+        prev_ocr_success = False
+        return np.nan, False
+
+    def _extract_one(frame, frame_idx: int) -> Tuple[float, bool]:
+        nonlocal last_successful_threshold, ocr_raw_success_count
+        _, _, expected = _ref_for_frame(frame_idx)
+        dist_raw: Optional[float] = None
+        try:
+            dist_raw, used_th = extract_distance_from_frame(
+                frame,
+                ocr_roi_ratio,
+                _ocr_config,
+                expected_range_mm=expected,
+                preferred_threshold=last_successful_threshold,
+            )
+            if dist_raw is not None:
+                ocr_raw_success_count += 1
+            if used_th is not None:
+                last_successful_threshold = used_th
+        except OCRTextNotFoundError:
+            dist_raw = None
+        except Exception as exc:
+            logger.debug(f"OCR-only frame {frame_idx} failed: {exc}")
+            dist_raw = None
+        return _accept(dist_raw, frame_idx)
+
     if known_z_mm is not None:
         known = np.asarray(known_z_mm, dtype=float).reshape(-1)
         if frames is not None and len(frames) > 0 and known.size != len(frames):
@@ -6243,25 +6326,17 @@ def compute_distance_constraints_only(
         if progress_callback:
             progress_callback(n_frames, n_frames)
     elif frames is not None:
-        loaded = frames
-        n_frames = len(loaded)
+        n_frames = len(frames)
         ocr_dist = np.full(n_frames, np.nan, dtype=float)
         success = np.zeros(n_frames, dtype=bool)
-        for i, frame in enumerate(loaded):
-            try:
-                distance, _ = extract_distance_from_frame(
-                    frame, ocr_roi_ratio, _ocr_config
-                )
-                ocr_dist[i] = distance
-                success[i] = True
-            except OCRTextNotFoundError:
-                pass
-            except Exception as exc:
-                logger.debug(f"OCR-only frame {i} failed: {exc}")
+        start = int(start_frame or 0)
+        for i, frame in enumerate(frames):
+            dist, ok = _extract_one(frame, start + i)
+            ocr_dist[i] = dist
+            success[i] = ok
             if progress_callback:
                 progress_callback(i + 1, n_frames)
     elif video_path is not None:
-        ocr_from_video = True
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise ValueError(f"動画を開けません: {video_path}")
@@ -6278,17 +6353,7 @@ def compute_distance_constraints_only(
                 ok, frame = cap.read()
                 if not ok:
                     break
-                dist = np.nan
-                succeeded = False
-                try:
-                    dist, _ = extract_distance_from_frame(
-                        frame, ocr_roi_ratio, _ocr_config
-                    )
-                    succeeded = True
-                except OCRTextNotFoundError:
-                    pass
-                except Exception as exc:
-                    logger.debug(f"OCR-only frame {idx} failed: {exc}")
+                dist, succeeded = _extract_one(frame, idx)
                 ocr_vals.append(dist)
                 ok_flags.append(succeeded)
                 idx += 1
@@ -6301,6 +6366,18 @@ def compute_distance_constraints_only(
         success = np.asarray(ok_flags, dtype=bool)
     else:
         raise ValueError("video_path または frames が必要です")
+
+    if known_z_mm is None and n_frames > 0:
+        discarded = ocr_raw_success_count - ocr_validated_success_count
+        rate = (
+            discarded / ocr_raw_success_count * 100.0
+            if ocr_raw_success_count > 0 else 0.0
+        )
+        logger.info(
+            f"OCR距離検証統計: raw={ocr_raw_success_count}, "
+            f"validated={ocr_validated_success_count}, "
+            f"discarded={discarded} ({rate:.2f}%)"
+        )
 
     z_positions = None
     if n_frames == 0:

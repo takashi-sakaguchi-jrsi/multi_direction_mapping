@@ -49,6 +49,23 @@ def test_known_z_skips_tesseract_and_fills_ocr_dist(transformer, config):
     assert dz_min <= 5.0 <= dz_max
 
 
+def test_known_z_skips_jump_validation(transformer, config):
+    config.estimation.use_offset_moving_average = False
+    estimator = CameraEstimator(config.estimation, transformer)
+    frames = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(3)]
+    known = np.array([100.0, 4100.0, 110.0])
+    with patch("src.ocr_utils.extract_distance_from_frame") as ocr:
+        _, _, ocr_dist, success = compute_distance_constraints_only(
+            frames=frames,
+            estimator=estimator,
+            config=config.estimation,
+            known_z_mm=known,
+        )
+        ocr.assert_not_called()
+    np.testing.assert_allclose(ocr_dist, known)
+    assert np.all(success)
+
+
 def test_known_z_length_mismatch_raises(transformer, config):
     estimator = CameraEstimator(config.estimation, transformer)
     frames = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(3)]
