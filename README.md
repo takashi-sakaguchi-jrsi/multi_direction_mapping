@@ -9,7 +9,7 @@ python src/main_twopass.py --help
 python src/main_twopass.py --input data/input --output data/output --start 1 --end 500
 ```
 
-Windows 向け一式は `build/build_installer.bat` が `dist/main_twopass_<VERSION>/` に出力します。進捗ウィンドウは `progress_viewer/`（元プログラムを 3 方向の progress.json に合わせて更新。経過・残り・終了予定を表示）。
+Windows 向け一式は `build\build_installer.bat` が `dist\main_twopass_<VERSION>\` に出力します（`python` または `py -3` が PATH にあること。PyInstaller は `python -m PyInstaller` で呼び出します）。進捗ウィンドウは同じフォルダへ `ProgressViewer.exe` として入ります。
 
 仮想検証（既知 z）は従来どおり:
 
