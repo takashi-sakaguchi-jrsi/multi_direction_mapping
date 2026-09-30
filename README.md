@@ -31,6 +31,7 @@ CLI は `src/main_twopass.py` と同じ4層設定です（dataclass 初期値 < 
 
 ```bash
 python src/generate_two_direction_test_videos.py --fov 181 --runs U,R --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
+python src/generate_two_direction_test_videos.py --calibration data/calibration/fisheye_recalibrated_20260217.json --runs U,R,L --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
 ```
 
 プロジェクトルートで実行してください。`python src/...` でも動くようにしてあります。

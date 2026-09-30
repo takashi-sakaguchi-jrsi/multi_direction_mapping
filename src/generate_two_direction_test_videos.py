@@ -12,7 +12,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -21,6 +21,7 @@ if str(_ROOT) not in sys.path:
 import cv2
 import numpy as np
 
+from src.calibration import fisheye_intrinsics_for_size, load_calibration
 from src.validation.fisheye_sideview_renderer import (
     DEFAULT_COLORMAP_RELATIVE,
     DEFAULT_FOV_DEG,
@@ -88,7 +89,28 @@ def generate_two_direction_videos(
     save_png: bool,
     jitter: bool = False,
     jitter_seed: int = 0,
+    calibration_path: Optional[str] = None,
 ) -> Dict:
+    calib = None
+    dist_coeffs = None
+    f_px = None
+    cx = None
+    cy = None
+    fy = None
+    if calibration_path:
+        calib = load_calibration(str(calibration_path))
+        f_px, cx, cy, dist_coeffs, calib_fov = fisheye_intrinsics_for_size(
+            calib, int(width), int(height)
+        )
+        if calib_fov > 0.0:
+            fov_deg = float(calib_fov)
+        fy = float(getattr(calib, "fy", 0.0) or 0.0)
+        if fy > 0.0 and int(getattr(calib, "image_width", 0) or 0) > 0:
+            fy = fy * float(width) / float(calib.image_width)
+        logger.info(
+            f"校正レンズ: {calibration_path} f={f_px:.4f} cx={cx:.3f} cy={cy:.3f} "
+            f"k={dist_coeffs} size={int(width)}x{int(height)}"
+        )
     renderer = FisheyeSideviewRenderer(
         colormap=colormap,
         output_size=(width, height),
@@ -96,6 +118,10 @@ def generate_two_direction_videos(
         fov_deg=fov_deg,
         apply_distance_shading=shading,
         keep=radius_mm if shading else 0.0,
+        f_px=f_px,
+        cx=cx,
+        cy=cy,
+        dist_coeffs=dist_coeffs,
     )
     if n_frames < N_FRAMES_HINT_MIN or n_frames > N_FRAMES_HINT_MAX:
         logger.warning(
@@ -145,9 +171,21 @@ def generate_two_direction_videos(
     videos_dir = output_dir
     result: Dict = {
         "colormap": str(colormap),
-        "camera_model": "fisheye_equidistant",
+        "camera_model": (
+            "fisheye_calibrated" if calib is not None else "fisheye_equidistant"
+        ),
+        "lens_calibration_file": str(calibration_path) if calib is not None else None,
         "fov_deg": float(fov_deg),
         "f_px": float(renderer.f),
+        "fx": float(renderer.f),
+        "fy": float(fy) if fy else float(renderer.f),
+        "cx": float(renderer.cx),
+        "cy": float(renderer.cy),
+        "distortion_k": (
+            [float(v) for v in renderer.dist_coeffs]
+            if renderer.dist_coeffs is not None
+            else [0.0, 0.0, 0.0, 0.0]
+        ),
         "width": int(width),
         "height": int(height),
         "radius_mm": float(radius_mm),
@@ -296,10 +334,16 @@ def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
     )
     p.add_argument("--name", type=str, default="phi250_fisheye_side")
     p.add_argument("--runs", type=str, default="U,R")
-    p.add_argument("--width", type=int, default=1920)
-    p.add_argument("--height", type=int, default=1080)
+    p.add_argument("--width", type=int, default=None)
+    p.add_argument("--height", type=int, default=None)
     p.add_argument("--radius-mm", type=float, default=DEFAULT_RADIUS_MM)
     p.add_argument("--fov", type=float, default=DEFAULT_FOV_DEG)
+    p.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="レンズ校正 JSON（fx/cx/cy と Kannala-Brandt 歪み。解析と同じファイル）",
+    )
     p.add_argument("--pitch", type=float, default=DEFAULT_PITCH_DEG)
     p.add_argument(
         "--z-start-mm",
@@ -352,12 +396,25 @@ def main(argv: Sequence[str] = None) -> int:
     try:
         colormap = resolve_colormap_path(args.colormap)
         runs = parse_runs(args.runs)
+        calib_path = str(args.calibration) if args.calibration else None
+        width = args.width
+        height = args.height
+        if calib_path:
+            calib = load_calibration(calib_path)
+            if width is None and int(getattr(calib, "image_width", 0) or 0) > 0:
+                width = int(calib.image_width)
+            if height is None and int(getattr(calib, "image_height", 0) or 0) > 0:
+                height = int(calib.image_height)
+        if width is None:
+            width = 1920
+        if height is None:
+            height = 1080
         result = generate_two_direction_videos(
             colormap=colormap,
             output_dir=args.output_dir,
             runs=runs,
-            width=args.width,
-            height=args.height,
+            width=width,
+            height=height,
             radius_mm=args.radius_mm,
             fov_deg=args.fov,
             pitch_deg=args.pitch,
@@ -372,6 +429,7 @@ def main(argv: Sequence[str] = None) -> int:
             save_png=args.save_png,
             jitter=bool(args.jitter),
             jitter_seed=int(args.jitter_seed),
+            calibration_path=calib_path,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error(str(exc))

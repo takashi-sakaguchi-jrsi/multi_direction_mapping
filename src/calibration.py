@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +269,43 @@ class LensCalibration:
                 f"calibration_rms_errorは非負である必要があります: "
                 f"{self.calibration_rms_error}"
             )
+
+
+def fisheye_intrinsics_for_size(
+    calib: "LensCalibration",
+    width: int,
+    height: int,
+) -> Tuple[float, float, float, List[float], float]:
+    """校正 JSON の fx/cx/cy を出力解像度へスケールする。歪み係数はそのまま。
+
+    解析側 FisheyeCamera は fy を使わず fx を f にする。
+    """
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"不正な出力サイズ: {width}x{height}")
+    fx = float(getattr(calib, "fx", 0.0) or 0.0)
+    if fx <= 0.0:
+        raise ValueError("校正データに有効な fx がありません")
+    cx = float(getattr(calib, "cx", 0.0) or 0.0)
+    cy = float(getattr(calib, "cy", 0.0) or 0.0)
+    src_w = int(getattr(calib, "image_width", 0) or 0)
+    src_h = int(getattr(calib, "image_height", 0) or 0)
+    if cx == 0.0 and cy == 0.0:
+        cx = float(src_w or width) / 2.0
+        cy = float(src_h or height) / 2.0
+    if src_w > 0 and src_h > 0 and (src_w != width or src_h != height):
+        fx = fx * width / src_w
+        cx = cx * width / src_w
+        cy = cy * height / src_h
+    dist = [
+        float(getattr(calib, "radial_distortion_k1", 0.0) or 0.0),
+        float(getattr(calib, "radial_distortion_k2", 0.0) or 0.0),
+        float(getattr(calib, "radial_distortion_k3", 0.0) or 0.0),
+        float(getattr(calib, "radial_distortion_k4", 0.0) or 0.0),
+    ]
+    fov = float(getattr(calib, "fov_degrees", 0.0) or 0.0)
+    return fx, cx, cy, dist, fov
 
 
 # ========================================

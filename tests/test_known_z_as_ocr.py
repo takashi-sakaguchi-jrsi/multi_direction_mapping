@@ -276,3 +276,25 @@ def test_apply_generation_metadata_clears_calib(config):
     assert transformer.camera.f == pytest.approx(341.87536947032544)
     assert transformer.camera.cx == pytest.approx(960.0)
     assert transformer.camera.cy == pytest.approx(540.0)
+
+
+def test_apply_generation_metadata_keeps_calib(config):
+    path = "data/calibration/fisheye_recalibrated_20260217.json"
+    apply_generation_metadata_to_config(
+        config,
+        {
+            "lens_calibration_file": path,
+            "f_px": 343.9361312858878,
+            "fov_deg": 185.0,
+            "width": 1920,
+            "height": 1080,
+            "cx": 980.2892954686431,
+            "cy": 552.6559656218703,
+        },
+    )
+    assert config.camera.lens_calibration_file == path
+    transformer = build_transformer(config)
+    assert transformer.calibration is not None
+    assert transformer.camera.f == pytest.approx(343.9361312858878)
+    assert transformer.camera.cx == pytest.approx(980.2892954686431)
+    assert transformer.camera.cy == pytest.approx(552.6559656218703)

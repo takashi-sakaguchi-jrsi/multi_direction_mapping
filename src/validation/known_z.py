@@ -95,28 +95,39 @@ def load_known_z_mm(metadata_path: Union[str, Path]) -> np.ndarray:
 def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
     """生成時の fx / 画角 / 管径を Config に反映する。
 
-    仮想動画は歪みなし等距離魚眼（主点=画像中心、k=0）で作っているため、
-    本番キャリブレーション（Kannala-Brandt + 主点オフセット）は外す。
+    無歪み等距離で作った仮想動画は本番校正を外す。
+    校正レンズで生成した動画は metadata の lens_calibration_file を残す。
     """
-    config.camera.lens_calibration_file = None
-    config.camera._lens_calibration = None
-    config.camera.center_offset_x = 0
-    config.camera.center_offset_y = 0
+    calib_path = meta.get("lens_calibration_file")
+    if calib_path:
+        config.camera.lens_calibration_file = str(calib_path)
+        config.camera._lens_calibration = None
+    else:
+        config.camera.lens_calibration_file = None
+        config.camera._lens_calibration = None
+        config.camera.center_offset_x = 0
+        config.camera.center_offset_y = 0
     if "f_px" in meta and meta["f_px"]:
         fx = float(meta["f_px"])
         config.camera.fx = fx
-        config.camera.fy = fx
+        config.camera.fy = float(meta["fy"]) if meta.get("fy") else fx
+    if "cx" in meta and meta["cx"] is not None:
+        config.camera.cx = float(meta["cx"])
+    if "cy" in meta and meta["cy"] is not None:
+        config.camera.cy = float(meta["cy"])
     if "fov_deg" in meta and meta["fov_deg"]:
         config.camera.fov_degrees = float(meta["fov_deg"])
     if "width" in meta and meta["width"]:
         w = int(meta["width"])
         config.camera.image_width = w
-        config.camera.cx = w / 2.0
+        if not calib_path and meta.get("cx") is None:
+            config.camera.cx = w / 2.0
         config.two_direction.capture.image_width_px = w
     if "height" in meta and meta["height"]:
         h = int(meta["height"])
         config.camera.image_height = h
-        config.camera.cy = h / 2.0
+        if not calib_path and meta.get("cy") is None:
+            config.camera.cy = h / 2.0
         config.two_direction.capture.image_height_px = h
     if "pipe_diameter_mm" in meta and meta["pipe_diameter_mm"]:
         config.pipe.diameter_mm = float(meta["pipe_diameter_mm"])

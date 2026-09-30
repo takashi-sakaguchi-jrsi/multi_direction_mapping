@@ -18,10 +18,12 @@ PoC は 2 本または 3 本を `data/config/two_direction_config.json` の `run
 ## 展開図からの生成（Phase1省略）
 
 CameraCarDemo 相当の円筒サンプリングで、カメラモデルだけ等距離魚眼（既定 FOV=181°）に差し替えたテスト動画。
+`--calibration` にレンズ JSON を渡すと、解析と同じ fx/cx/cy と歪みで生成します。
 正本展開図は `original_colormap/phi250tenkaizu.png`（φ250mm、半径 125mm）。
 
 ```bash
 python src/generate_two_direction_test_videos.py --fov 181 --runs U,R,L --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
+python src/generate_two_direction_test_videos.py --calibration data/calibration/fisheye_recalibrated_20260217.json --runs U,R,L --frames 150 --z-start-mm 10 --z-step-mm 4.5 --jitter
 ```
 
 `--jitter` はフレームごとの dz / dpitch / dyaw に、十数フレーム周期の緩やかな中程度振動と 2〜3 フレームの小さい振動を合成します。OCR 列 `ocr_z_mm` は真の累積 z に 10mm 遅れモデルを掛けたものです。

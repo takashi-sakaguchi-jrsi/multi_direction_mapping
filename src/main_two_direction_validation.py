@@ -24,7 +24,7 @@ if str(_ROOT) not in sys.path:
 import numpy as np
 
 from src.camera_estimation import CameraEstimator
-from src.calibration import load_calibration
+from src.calibration import fisheye_intrinsics_for_size, load_calibration
 from src.config import Config, load_config
 from src.progress_reporter import ProgressReporter
 from src.product_runtime import (
@@ -100,9 +100,7 @@ def build_transformer(config: Config) -> CoordinateTransformer:
     w = config.two_direction.capture.image_width_px or config.camera.image_width
     h = config.two_direction.capture.image_height_px or config.camera.image_height
     if calib is not None and getattr(calib, "fx", 0) > 0:
-        fx = float(calib.fx)
-        cx = float(getattr(calib, "cx", w / 2.0))
-        cy = float(getattr(calib, "cy", h / 2.0))
+        fx, cx, cy, _dist, _fov = fisheye_intrinsics_for_size(calib, int(w), int(h))
     else:
         calib = None
         fx = float(config.camera.fx) if config.camera.fx else GENERATION_F_PX

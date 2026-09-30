@@ -325,6 +325,54 @@ class FisheyeCamera(CameraModel):
             self.cy + dy * scale
         ])
 
+    def invert_kannala_theta(
+        self,
+        theta_d: np.ndarray,
+        dist_coeffs: np.ndarray,
+        theta_max: float,
+        *,
+        iters: int = 25,
+        atol: float = 1e-4,
+    ) -> np.ndarray:
+        """distort_points の逆。解けない入射角は nan。
+
+        theta_d = r_distorted / f
+        theta * (1 + k1 θ^2 + k2 θ^4 + k3 θ^6 + k4 θ^8) = theta_d
+        """
+        k1, k2, k3, k4 = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)[:4]
+        td = np.asarray(theta_d, dtype=np.float64)
+        tmax = float(theta_max)
+        if tmax <= 0.0:
+            tmax = float(np.pi) * 0.5
+
+        def _poly(th: np.ndarray) -> np.ndarray:
+            t2 = th * th
+            return th * (1.0 + k1 * t2 + k2 * t2 ** 2 + k3 * t2 ** 3 + k4 * t2 ** 4)
+
+        def _dpoly(th: np.ndarray) -> np.ndarray:
+            t2 = th * th
+            return 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t2 ** 2 + 7.0 * k3 * t2 ** 3 + 9.0 * k4 * t2 ** 4
+
+        grid = np.linspace(0.0, tmax, 257)
+        peak = float(grid[int(np.argmax(_poly(grid)))])
+        peak = min(max(peak, 1e-6), tmax)
+        poly_max = float(_poly(np.array([peak]))[0])
+        theta = np.clip(td, 0.0, peak)
+        for _ in range(int(iters)):
+            dp = _dpoly(theta)
+            step = np.zeros_like(theta)
+            np.divide(td - _poly(theta), dp, out=step, where=np.abs(dp) > 1e-12)
+            theta = np.clip(theta + step, 0.0, peak)
+        err = np.abs(_poly(theta) - td)
+        ok = (
+            np.isfinite(td)
+            & (td >= -1e-9)
+            & (td <= poly_max + 1e-5)
+            & (np.abs(_dpoly(theta)) > 1e-8)
+            & (err <= atol + 1e-3 * np.maximum(td, 1e-6))
+        )
+        return np.where(ok, theta, np.nan)
+
 
 # ============================================================================
 # ピンホールカメラモデル

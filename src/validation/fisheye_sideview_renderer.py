@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from src.camera_utils import compute_fisheye_focal_length
+from src.coordinate_transform import FisheyeCamera
 from src.validation.geometry import pose_R_c2w
 
 
@@ -82,6 +83,10 @@ class FisheyeSideviewRenderer:
         decay: float = 0.002,
         min_alpha: float = 0.0001,
         keep: float = 0.0,
+        f_px: Optional[float] = None,
+        cx: Optional[float] = None,
+        cy: Optional[float] = None,
+        dist_coeffs: Optional[Sequence[float]] = None,
     ):
         if isinstance(colormap, np.ndarray):
             img = colormap
@@ -108,13 +113,21 @@ class FisheyeSideviewRenderer:
         self.horiz_mm_per_px = (2.0 * np.pi * self.radius) / self.eq_h
         self.z_extent_mm = self.eq_w * self.horiz_mm_per_px
         self.fov_deg = float(fov_deg)
-        self.f = float(
-            compute_fisheye_focal_length(
-                self.fov_deg, (self.output_height, self.output_width)
+        if f_px is not None and float(f_px) > 0.0:
+            self.f = float(f_px)
+        else:
+            self.f = float(
+                compute_fisheye_focal_length(
+                    self.fov_deg, (self.output_height, self.output_width)
+                )
             )
-        )
-        self.cx = self.output_width / 2.0
-        self.cy = self.output_height / 2.0
+        self.cx = float(cx) if cx is not None else self.output_width / 2.0
+        self.cy = float(cy) if cy is not None else self.output_height / 2.0
+        self.dist_coeffs: Optional[np.ndarray] = None
+        if dist_coeffs is not None:
+            dist = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
+            if dist.size >= 4 and not np.allclose(dist[:4], 0.0):
+                self.dist_coeffs = dist[:4].copy()
         self.r_max = min(self.output_width, self.output_height) / 2.0
         self._view_rays, self._r_px = self._build_fisheye_rays()
 
@@ -127,7 +140,29 @@ class FisheyeSideviewRenderer:
         cam_y = -(j - self.cy)
         r_px = np.hypot(cam_x, cam_y)
         rho = np.maximum(r_px, 1e-12)
-        gamma = r_px / self.f
+        theta_max = np.radians(self.fov_deg) / 2.0
+        if self.dist_coeffs is not None:
+            camera = FisheyeCamera(
+                f=self.f,
+                cx=self.cx,
+                cy=self.cy,
+                image_width=self.output_width,
+                image_height=self.output_height,
+            )
+            gamma = camera.invert_kannala_theta(
+                r_px / self.f, self.dist_coeffs, theta_max
+            )
+        else:
+            gamma = r_px / self.f
+        # FOV は 180°前後。π を超える入射角は裏側へ周回するので捨てる。
+        gamma = np.where(
+            np.isfinite(gamma)
+            & (gamma >= -1e-9)
+            & (gamma <= theta_max + 1e-6)
+            & (gamma < np.pi),
+            np.clip(gamma, 0.0, theta_max),
+            np.nan,
+        )
         vx = np.sin(gamma) * (cam_x / rho)
         vy = np.sin(gamma) * (cam_y / rho)
         vz = np.cos(gamma)
@@ -135,8 +170,14 @@ class FisheyeSideviewRenderer:
         vx = np.where(on_axis, 0.0, vx)
         vy = np.where(on_axis, 0.0, vy)
         vz = np.where(on_axis, 1.0, vz)
+        finite = np.isfinite(gamma)
+        vx = np.where(finite, vx, np.nan)
+        vy = np.where(finite, vy, np.nan)
+        vz = np.where(finite, vz, np.nan)
         rays = np.stack([vx, vy, vz], axis=-1)
-        rays = rays / (np.linalg.norm(rays, axis=-1, keepdims=True) + 1e-12)
+        norms = np.linalg.norm(np.nan_to_num(rays, nan=0.0), axis=-1, keepdims=True)
+        rays = rays / (norms + 1e-12)
+        rays[~finite] = np.nan
         return rays, r_px
 
     @staticmethod
@@ -179,7 +220,14 @@ class FisheyeSideviewRenderer:
         c = x0 * x0 + y0 * y0 - self.radius * self.radius
         disc = b * b - 4.0 * a * c
         in_fov = self._r_px <= (self.r_max + 1e-6)
-        ok = (disc >= 0.0) & (a > 1e-12) & in_fov
+        ok = (
+            (disc >= 0.0)
+            & (a > 1e-12)
+            & in_fov
+            & np.isfinite(dx)
+            & np.isfinite(dy)
+            & np.isfinite(dz)
+        )
         sqrt_d = np.sqrt(np.clip(disc, 0.0, None))
         t1 = (-b - sqrt_d) / (2.0 * a + 1e-15)
         t2 = (-b + sqrt_d) / (2.0 * a + 1e-15)
