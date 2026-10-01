@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+import json
 
 import numpy as np
 
@@ -201,10 +202,127 @@ def product_end_to_exclusive(end: Optional[int]) -> Optional[int]:
     return int(end)
 
 
+class PipelineCliError(ValueError):
+    """--pipeline と入力オプションの組み合わせが不正。"""
+
+
+def effective_pipeline(config: Config) -> str:
+    return str(getattr(config, "pipeline", "sideview") or "sideview").lower()
+
+
+def apply_front_profile(config: Config) -> None:
+    """正面経路の衝突項目を FrontConfig で上書きする。側視の既定値は触らない。"""
+    front = getattr(config, "front", None)
+    if front is None:
+        return
+    config.estimation.use_vanishing_point_constraints = bool(
+        front.use_vanishing_point_constraints
+    )
+    config.estimation.use_ocr_z_constraints = bool(front.use_ocr_z_constraints)
+    motion = config.estimation.motion
+    motion.max_yaw = float(front.max_yaw)
+    motion.max_pitch = float(front.max_pitch)
+    motion.use_vanishing_point_yaw = bool(front.use_vanishing_point_yaw)
+    motion.use_vanishing_point_pitch = bool(front.use_vanishing_point_pitch)
+    if front.auto_tune_enabled is not None:
+        config.auto_tune_enabled = bool(front.auto_tune_enabled)
+
+
+def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:
+    pipeline = str(pipeline or "sideview").lower()
+    has_input = bool(getattr(args, "input", None))
+    has_dir = bool(getattr(args, "input_dir", None))
+    has_name = getattr(args, "name", None) not in (None, "")
+    if has_dir != has_name:
+        raise PipelineCliError("--input-dir と --name は同時に指定してください")
+    if pipeline == "front":
+        if has_input and (has_dir or has_name):
+            raise PipelineCliError(
+                "正面経路では --input と --input-dir/--name を同時に指定できません"
+            )
+        return
+    if pipeline == "sideview":
+        if has_input:
+            raise PipelineCliError(
+                "側視経路では --input は使えません（--input-dir と --name を使ってください）"
+            )
+        return
+    raise PipelineCliError(f"pipeline は front/sideview のみ: {pipeline}")
+
+
+def apply_front_input_path(config: Config, raw: str) -> None:
+    """--input は正面専用。ファイル1本を input.video_path へ。"""
+    path = Path(raw)
+    if path.exists() and path.is_dir():
+        raise PipelineCliError("--input は正面用の動画ファイルです。フォルダは指定できません")
+    config.input.video_path = str(path)
+
+
+def resolve_named_front_video(input_dir: Path, name: str) -> Path:
+    """{dir}/{name}.{ext}。拡張子は .mp4 → .avi → .mov → .mkv の先頭ヒット。"""
+    folder = Path(input_dir)
+    for ext in _VIDEO_SUFFIXES:
+        candidate = folder / f"{name}{ext}"
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"正面動画が見つかりません: {folder}/{name}.{{mp4,avi,mov,mkv}}"
+    )
+
+
+def apply_front_named_input(config: Config, input_dir: str, name: str) -> None:
+    config.input.video_path = str(resolve_named_front_video(Path(input_dir), str(name)))
+
+
+def resolve_named_run_videos(input_dir: Path, name: str) -> Dict[str, Path]:
+    """{dir}/{name}_U/R/L.{ext}。拡張子は .mp4 → .avi → .mov → .mkv の先頭ヒット。"""
+    folder = Path(input_dir)
+    found: Dict[str, Path] = {}
+    mapping = (("U", "A"), ("R", "B"), ("L", "C"))
+    for suf, tag in mapping:
+        for ext in _VIDEO_SUFFIXES:
+            candidate = folder / f"{name}_{suf}{ext}"
+            if candidate.is_file():
+                found[tag] = candidate
+                break
+    if "A" not in found or "B" not in found:
+        raise FileNotFoundError(
+            f"側視動画が見つかりません: {folder}/{name}_U|_R （L は任意）"
+        )
+    return found
+
+
+def apply_sideview_named_input(config: Config, input_dir: str, name: str) -> None:
+    found = resolve_named_run_videos(Path(input_dir), str(name))
+    config.two_direction.run_C.video_path = ""
+    for tag, video in found.items():
+        _set_run_video(config, tag, video)
+    if "C" not in found:
+        config.two_direction.run_C.video_path = ""
+
+
+def apply_pipeline_cli(config: Config, args: Any) -> None:
+    """--pipeline と入力オプションを Config に載せる。"""
+    if getattr(args, "pipeline", None):
+        config.pipeline = str(args.pipeline).lower()
+    pipeline = effective_pipeline(config)
+    validate_pipeline_cli_args(pipeline, args)
+    if pipeline == "front":
+        apply_front_profile(config)
+        if getattr(args, "input", None):
+            apply_front_input_path(config, str(args.input))
+        elif getattr(args, "input_dir", None) and getattr(args, "name", None):
+            apply_front_named_input(config, str(args.input_dir), str(args.name))
+    elif pipeline == "sideview":
+        if getattr(args, "input_dir", None) and getattr(args, "name", None):
+            apply_sideview_named_input(
+                config, str(args.input_dir), str(args.name)
+            )
+
+
 def apply_product_cli(config: Config, args: Any) -> None:
-    """製品 CLI（--input/--output/--start/--end/--debug/--pi/--ppm/--aov）を Config に載せる。"""
-    if getattr(args, "input", None):
-        apply_input_path(config, str(args.input))
+    """製品 CLI（--pipeline/--input/--input-dir/--name/--output/--start/--end）を Config に載せる。"""
+    apply_pipeline_cli(config, args)
     if getattr(args, "output", None):
         apply_output_path(config, str(args.output))
     if getattr(args, "start", None) is not None:
@@ -226,26 +344,16 @@ def apply_product_cli(config: Config, args: Any) -> None:
         config.two_direction.match_source_pixels_per_mm = False
     if getattr(args, "use_average_speed", False):
         config.estimation.use_offset_moving_average = False
+    if getattr(args, "z_source", None):
+        config.z_source = str(args.z_source)
+        config.two_direction.z_source = config.z_source
+    if getattr(args, "save_ocr_metadata", False):
+        config.save_ocr_metadata = True
 
 
 def apply_input_path(config: Config, raw: str) -> None:
-    """--input がファイルなら対応 run、ディレクトリなら U/R/L を割り当てる。"""
-    path = Path(raw)
-    config.input.video_path = str(path)
-    if path.is_dir():
-        found = _find_run_videos_in_dir(path)
-        for tag, video in found.items():
-            _set_run_video(config, tag, video)
-        return
-    suffix = infer_suffix_from_path(str(path))
-    tag = {"U": "A", "R": "B", "L": "C"}.get(suffix or "", "A")
-    _set_run_video(config, tag, path)
-    if path.parent.is_dir():
-        siblings = _find_run_videos_in_dir(path.parent)
-        for other_tag, video in siblings.items():
-            if other_tag == tag:
-                continue
-            _set_run_video(config, other_tag, video)
+    """後方互換。正面はファイル1本。側視は --input-dir/--name を使う。"""
+    apply_front_input_path(config, raw)
 
 
 def apply_output_path(config: Config, raw: str) -> None:
@@ -407,3 +515,113 @@ def copy_validation_report_to_reports(src: Path, timestamp: str) -> Optional[Pat
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     return dest
+
+
+FRONT_PROGRESS_STEPS = [
+    {"step_id": 1, "name_ja": "パラメータ調整", "name_en": "Parameter Tuning"},
+    {"step_id": 2, "name_ja": "フレーム解析", "name_en": "Frame Analysis"},
+    {"step_id": 3, "name_ja": "カラーマップ生成", "name_en": "Colormap Generation"},
+    {"step_id": 4, "name_ja": "カラーマップ補正", "name_en": "Colormap Correction"},
+]
+
+
+def sideview_work_dir(config: Config) -> Path:
+    """側視の中間出力は temporary_colormap_path の親。"""
+    return Path(config.output.temporary_colormap_path).expanduser().parent
+
+
+def apply_sideview_work_dir(config: Config) -> Path:
+    work = sideview_work_dir(config)
+    work.mkdir(parents=True, exist_ok=True)
+    config.two_direction.output_dir = str(work)
+    return work
+
+
+_SIDE_INTERMEDIATE_GLOBS = (
+    "partial_*.png",
+    "partial_*_corrected.png",
+    "*_provenance.npz",
+    "motion_*.csv",
+    "*.npz",
+)
+
+
+def cleanup_sideview_intermediates(config: Config, modes: Optional[Sequence[str]] = None) -> List[Path]:
+    """成功後に部分図・provenance・一時 PNG を消す。Excel / progress / OCR metadata は残す。"""
+    if not config.colormap.delete_temporary_images:
+        return []
+    removed: List[Path] = []
+    work = Path(config.two_direction.output_dir)
+    modes = list(modes) if modes is not None else list(config.two_direction.modes or ["A"])
+    for mode in modes:
+        mode_dir = work / f"mode_{mode}"
+        if not mode_dir.is_dir():
+            continue
+        for pattern in _SIDE_INTERMEDIATE_GLOBS:
+            for path in mode_dir.glob(pattern):
+                if path.name == "final.png":
+                    continue
+                try:
+                    path.unlink()
+                    removed.append(path)
+                except OSError as exc:
+                    logger.warning(f"中間ファイルを削除できません: {path}: {exc}")
+        final_src = mode_dir / "final.png"
+        dest = Path(str(config.output.colormap_path))
+        if final_src.is_file() and dest.is_file():
+            try:
+                if final_src.resolve() != dest.resolve():
+                    final_src.unlink()
+                    removed.append(final_src)
+            except OSError as exc:
+                logger.warning(f"中間 final.png を削除できません: {final_src}: {exc}")
+    temp = Path(config.output.temporary_colormap_path)
+    if temp.is_file():
+        try:
+            temp.unlink()
+            removed.append(temp)
+        except OSError as exc:
+            logger.warning(f"一時カラーマップを削除できません: {temp}: {exc}")
+    return removed
+
+
+def ocr_metadata_output_path(config: Config, timestamp: str) -> Path:
+    dest = Path(config.output.colormap_path).parent / f"ocr_metadata_{timestamp}.json"
+    return dest
+
+
+def save_ocr_metadata_file(
+    path: Path,
+    z_mm: np.ndarray,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "z_ocr_mm": np.asarray(z_mm, dtype=float).reshape(-1).tolist(),
+        "n": int(np.asarray(z_mm).reshape(-1).size),
+    }
+    if extra:
+        payload.update(extra)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"OCR metadata を保存: {path}")
+    return path
+
+
+def create_front_progress_reporter(config: Config, timestamp: str) -> Optional[ProgressReporter]:
+    if not config.output.progress_path:
+        return None
+    video_path = str(config.input.video_path)
+    n = count_video_frames(video_path) if video_path else 0
+    start = int(config.input.start_frame or 1)
+    end = config.input.end_frame if config.input.end_frame is not None else n
+    total = max(1, int(end) - int(start) + 1) if n else 1
+    path = Path(str(config.output.progress_path).replace("{process_id}", timestamp))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reporter = ProgressReporter(path, total_frames=total)
+    reporter.initialize_steps(list(FRONT_PROGRESS_STEPS))
+    if reporter.process_progress is not None:
+        reporter.process_progress.process_id = timestamp
+        reporter._write_progress_5steps()
+    return reporter
+

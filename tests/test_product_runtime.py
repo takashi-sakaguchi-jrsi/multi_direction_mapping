@@ -10,9 +10,9 @@ from src.product_runtime import (
     THREE_DIRECTION_STEPS,
     THREE_DIRECTION_STEP_WEIGHTS,
     THREE_DIRECTION_TIMING_SEC_1000,
-    apply_input_path,
     apply_output_path,
     apply_product_cli,
+    apply_sideview_named_input,
     build_direction_progress_plan,
     derive_progress_weights,
     product_end_to_exclusive,
@@ -31,8 +31,10 @@ def test_product_frame_index_conversion():
 
 def test_apply_product_cli_start_end(config):
     args = Namespace(
-        input=None, output=None, start=10, end=50, debug=False,
+        input=None, input_dir=None, name=None, pipeline=None,
+        output=None, start=10, end=50, debug=False,
         aov=None, pi=300.0, ppm=2.0, use_average_speed=False,
+        z_source=None, save_ocr_metadata=False,
     )
     apply_product_cli(config, args)
     assert config.two_direction.start_frame == 9
@@ -41,11 +43,11 @@ def test_apply_product_cli_start_end(config):
     assert config.colormap.pixels_per_mm == 2.0
 
 
-def test_apply_input_directory(tmp_path, config):
+def test_apply_sideview_named_directory(tmp_path, config):
     (tmp_path / "pipe_U.mp4").write_bytes(b"")
     (tmp_path / "pipe_R.mp4").write_bytes(b"")
     (tmp_path / "pipe_L.mp4").write_bytes(b"")
-    apply_input_path(config, str(tmp_path))
+    apply_sideview_named_input(config, str(tmp_path), "pipe")
     assert config.two_direction.run_A.video_path.endswith("pipe_U.mp4")
     assert config.two_direction.run_B.video_path.endswith("pipe_R.mp4")
     assert config.two_direction.run_C.video_path.endswith("pipe_L.mp4")
@@ -55,14 +57,14 @@ def test_apply_input_directory(tmp_path, config):
     assert config.two_direction.run_C.physical_roll_deg == 240.0
 
 
-def test_apply_input_exact_u_r_l_names(tmp_path, config):
-    (tmp_path / "U.mp4").write_bytes(b"")
-    (tmp_path / "R.mp4").write_bytes(b"")
-    (tmp_path / "L.mp4").write_bytes(b"")
-    apply_input_path(config, str(tmp_path))
-    assert config.two_direction.run_A.video_path.endswith("U.mp4")
-    assert config.two_direction.run_B.video_path.endswith("R.mp4")
-    assert config.two_direction.run_C.video_path.endswith("L.mp4")
+def test_apply_sideview_named_exact_suffixes(tmp_path, config):
+    (tmp_path / "sess_U.mp4").write_bytes(b"")
+    (tmp_path / "sess_R.mp4").write_bytes(b"")
+    (tmp_path / "sess_L.mp4").write_bytes(b"")
+    apply_sideview_named_input(config, str(tmp_path), "sess")
+    assert config.two_direction.run_A.video_path.endswith("sess_U.mp4")
+    assert config.two_direction.run_B.video_path.endswith("sess_R.mp4")
+    assert config.two_direction.run_C.video_path.endswith("sess_L.mp4")
 
 
 def test_create_progress_reporter_four_steps(tmp_path, config):
@@ -94,7 +96,9 @@ def test_apply_output_dir_and_png(tmp_path, config):
 def test_default_config_merges_three_direction():
     cfg = load_config()
     assert cfg.two_direction.enabled is True
-    assert cfg.two_direction.z_source == "ocr"
+    assert cfg.pipeline == "sideview"
+    assert cfg.two_direction.z_source == "known"
+    assert cfg.z_source == "known"
     assert cfg.two_direction.output_dir == "data/output"
     assert cfg.output.progress_path == "progress/progress.json"
     assert cfg.logging.file == "Log/process.log"

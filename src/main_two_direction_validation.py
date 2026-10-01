@@ -30,7 +30,17 @@ from src.progress_reporter import ProgressReporter
 from src.product_runtime import (
     copy_final_colormap,
     copy_validation_report_to_reports,
+    ocr_metadata_output_path,
+    save_ocr_metadata_file,
     write_three_direction_excel,
+)
+from src.validation.known_z import (
+    apply_generation_metadata_to_config,
+    assert_known_z_covers_window,
+    effective_z_source,
+    load_generation_metadata,
+    resolve_known_z_mm,
+    source_pixels_per_mm_from_metadata,
 )
 from src.coordinate_transform import CoordinateTransformer, FisheyeCamera
 from src.validation.best_view_accumulator import BestViewAccumulator
@@ -40,12 +50,6 @@ from src.validation.geometry import (
     derive_usable_half_fov_deg,
     infer_suffix_from_path,
     physical_roll_from_suffix,
-)
-from src.validation.known_z import (
-    apply_generation_metadata_to_config,
-    load_generation_metadata,
-    resolve_known_z_mm,
-    source_pixels_per_mm_from_metadata,
 )
 from src.validation.report import (
     summarize_records,
@@ -156,7 +160,7 @@ def run_two_direction_validation(
             f"{tag}={run_cfg.run_id or tag}" for tag, run_cfg in jobs
         )
     )
-    if known_z_mm is None and str(td.z_source).lower() == "known":
+    if known_z_mm is None and effective_z_source(config) == "known":
         known_z_mm = resolve_known_z_mm(config)
         if td.known_z_metadata_path:
             meta = load_generation_metadata(td.known_z_metadata_path)
@@ -169,6 +173,9 @@ def run_two_direction_validation(
             f"第1段階: 既知zをOCR代用 ({len(known_z_mm)} 点, "
             f"metadata={td.known_z_metadata_path})"
         )
+    win_start, win_end = resolve_frame_window(td)
+    if known_z_mm is not None:
+        assert_known_z_covers_window(known_z_mm, win_start, win_end)
     transformer = build_transformer(config)
     estimator = CameraEstimator(config.estimation, transformer)
     mapper = SideviewProjectionMapper(config, transformer)
@@ -182,7 +189,6 @@ def run_two_direction_validation(
         f"(config={td.capture.derived_usable_half_fov_deg}), "
         f"pixels_per_mm={config.colormap.pixels_per_mm:.6f}"
     )
-    win_start, win_end = resolve_frame_window(td)
     logger.info(
         f"frame window [{win_start}, {win_end if win_end is not None else 'end'}) "
         f"(start_frame={td.start_frame}, end_frame={td.end_frame}, "
@@ -478,6 +484,26 @@ def run_two_direction_validation(
         cmap = copy_final_colormap(config, mode=first_mode, timestamp=timestamp)
         if cmap:
             results["colormap_path"] = str(cmap)
+    if getattr(config, "save_ocr_metadata", False):
+        z_save = known_z_mm
+        if z_save is None and analyzed:
+            rec0 = analyzed[0].get("rec")
+            rows = rec0 if isinstance(rec0, (list, tuple)) else []
+            vals = [getattr(r, "z_ocr", None) for r in rows]
+            if vals and any(v is not None for v in vals):
+                z_save = np.asarray(
+                    [float(v) if v is not None else float("nan") for v in vals],
+                    dtype=float,
+                )
+        if z_save is not None:
+            meta_path = ocr_metadata_output_path(config, stamp or "ocr")
+            results["ocr_metadata_path"] = str(
+                save_ocr_metadata_file(
+                    meta_path,
+                    z_save,
+                    extra={"pipeline": "sideview", "z_source": results.get("z_source")},
+                )
+            )
     _progress_complete(progress_rep, seam_step, success=True)
     return results
 

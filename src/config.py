@@ -1174,6 +1174,18 @@ class LegacyVpConfig:
 
 
 @dataclass
+class FrontConfig:
+    """正面経路でトップレベルへ適用する上書き。pipeline=front のときだけ使う。"""
+    use_vanishing_point_constraints: bool = True
+    use_ocr_z_constraints: bool = True
+    max_yaw: float = 15.0
+    max_pitch: float = 15.0
+    use_vanishing_point_yaw: bool = True
+    use_vanishing_point_pitch: bool = True
+    auto_tune_enabled: Optional[bool] = None
+
+
+@dataclass
 class TwoDirectionConfig:
     """2または3方向合成PoC設定（main_twopass と同じ4層マージに載せる）"""
     enabled: bool = True
@@ -1311,6 +1323,13 @@ class Config:
     debug: DebugConfig = field(default_factory=DebugConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     two_direction: TwoDirectionConfig = field(default_factory=TwoDirectionConfig)
+    pipeline: str = "sideview"
+    """実行経路。front=オリジナル正面、sideview=2/3方向側視。CLI --pipeline が優先。"""
+    z_source: str = "ocr"
+    """距離の入力元。ocr=Tesseract、known=生成 metadata。two_direction と同期する。"""
+    known_z_metadata_path: Optional[str] = None
+    save_ocr_metadata: bool = False
+    front: FrontConfig = field(default_factory=FrontConfig)
     
     # Phase 2: 自動チューニング機能
     auto_tune_enabled: bool = False
@@ -1390,6 +1409,11 @@ class Config:
         init=False,
         repr=False  # repr()に含めない
     )
+
+    @property
+    def sideview(self) -> TwoDirectionConfig:
+        """sideview は two_direction の別名（JSON の sideview キーと互換）。"""
+        return self.two_direction
     
     @classmethod
     def from_json(cls, config_path: str) -> "Config":
@@ -1528,9 +1552,27 @@ class Config:
         debug_cfg = DebugConfig(**config_dict.get("debug", {}))
         logging_cfg = LoggingConfig(**config_dict.get("logging", {}))
         correction_cfg = CorrectionConfig(**config_dict.get("correction", {}))
-        two_direction_cfg = build_two_direction_config(
-            config_dict.get("two_direction")
-        )
+        two_direction_raw = config_dict.get("two_direction") or {}
+        if not isinstance(two_direction_raw, dict):
+            two_direction_raw = {}
+        sideview_raw = config_dict.get("sideview")
+        if isinstance(sideview_raw, dict):
+            two_direction_raw = cls._deep_merge(two_direction_raw, sideview_raw)
+        two_direction_cfg = build_two_direction_config(two_direction_raw)
+        front_cfg = _dataclass_from_dict(FrontConfig, config_dict.get("front"))
+
+        pipeline = str(config_dict.get("pipeline", "sideview")).lower()
+        if "z_source" in config_dict:
+            z_source = str(config_dict.get("z_source") or "ocr")
+            two_direction_cfg.z_source = z_source
+        else:
+            z_source = two_direction_cfg.z_source
+        if "known_z_metadata_path" in config_dict:
+            known_meta = config_dict.get("known_z_metadata_path")
+            two_direction_cfg.known_z_metadata_path = known_meta
+        else:
+            known_meta = two_direction_cfg.known_z_metadata_path
+        save_ocr_metadata = bool(config_dict.get("save_ocr_metadata", False))
 
         config = cls(
             input=input_cfg,
@@ -1554,10 +1596,20 @@ class Config:
             auto_tune_feature_matching_pass_ratio=config_dict.get("auto_tune_feature_matching_pass_ratio", 0.75),
             auto_tune_brightness_edge_frames=config_dict.get("auto_tune_brightness_edge_frames", 5),
             two_direction=two_direction_cfg,
+            pipeline=pipeline,
+            z_source=z_source,
+            known_z_metadata_path=known_meta,
+            save_ocr_metadata=save_ocr_metadata,
+            front=front_cfg,
         )
         
         # Phase Config-4: ユーザー定義フィールドパスを抽出して記録
-        config._user_defined_paths = cls._extract_defined_paths(config_dict)
+        defined = cls._extract_defined_paths(config_dict)
+        aliased = set(defined)
+        for path in defined:
+            if path == "sideview" or path.startswith("sideview."):
+                aliased.add("two_direction" + path[len("sideview"):])
+        config._user_defined_paths = aliased
         
         return config
     
@@ -1864,7 +1916,20 @@ class ConfigValidator:
         self.validate_debug_config()
         self.validate_logging_config()
         self.validate_two_direction_config()
-    
+        self.validate_pipeline_config()
+
+    def validate_pipeline_config(self) -> None:
+        pipeline = str(getattr(self.config, "pipeline", "sideview") or "sideview").lower()
+        if pipeline not in ("front", "sideview"):
+            raise ConfigValidationError(
+                f"pipeline は front/sideview のみ: {self.config.pipeline}"
+            )
+        z_source = str(getattr(self.config, "z_source", "ocr") or "ocr").lower()
+        if z_source not in ("ocr", "known"):
+            raise ConfigValidationError(
+                f"z_source は ocr/known のみ: {self.config.z_source}"
+            )
+
     def validate_input_config(self) -> None:
         """入力設定のバリデーション
         

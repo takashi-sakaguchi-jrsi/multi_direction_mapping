@@ -1,4 +1,16 @@
 {
+  "pipeline": "sideview",
+  "z_source": "ocr",
+  "known_z_metadata_path": null,
+  "save_ocr_metadata": true,
+  "front": {
+    "use_vanishing_point_constraints": true,
+    "use_ocr_z_constraints": true,
+    "max_yaw": 15.0,
+    "max_pitch": 15.0,
+    "use_vanishing_point_yaw": true,
+    "use_vanishing_point_pitch": true
+  },
   "input": {
     "start_frame": 1,
     "end_frame": null
@@ -25,8 +37,6 @@
     "default_position_z": 0.0
   },
   "estimation": {
-    "use_vanishing_point_constraints": false,
-    "use_ocr_z_constraints": true,
     "feature_matching": {
       "method": "ORB",
       "max_features": 500,
@@ -45,7 +55,7 @@
       "max_distance_threshold": 120.0,
       "spatial_grid_theta_bins": 8,
       "spatial_grid_phi_bins": 8,
-      "use_cylindrical_matching": false,
+      "use_cylindrical_matching": true,
       "cylindrical": {
         "theta_resolution": 720,
         "z_resolution": 500,
@@ -58,7 +68,7 @@
         "highpass_sigma": 1.0,
         "enable_hanning_window": false,
         "hanning_window_ratio": 0.1,
-        "orb_max_features": 4000,
+        "orb_max_features": 3000,
         "match_max_features": 200,
         "spatial_filter_enabled": true,
         "spatial_grid_rows": 8,
@@ -74,39 +84,41 @@
     },
     "static_frame_detection": {
       "enabled": true,
-      "movement_threshold": 0.05,
-      "min_points": 10
+      "movement_threshold": 0.01,
+      "min_points": 5
     },
     "motion": {
-      "max_dx": 0.5,
-      "max_dy": 0.5,
+      "max_dx": 0.1,
+      "max_dy": 0.1,
       "max_dz": 10.0,
-      "max_droll": 0.1,
+      "max_droll": 0.5,
       "max_dtheta": 0.1,
       "max_dphi": 0.1,
-      "max_x": 1.0,
-      "max_y": 1.0,
+      "max_x": 2.0,
+      "max_y": 2.0,
       "max_yaw": 0.0,
       "max_pitch": 0.0,
-      "max_roll": 1.0,
+      "max_roll": 5.0,
       "estimate_dx": true,
       "estimate_dz": true,
       "estimate_droll": true,
-      "estimate_dyaw": true,
-      "estimate_dpitch": true,
-      "use_vanishing_point_yaw": false,
-      "use_vanishing_point_pitch": false,
+      "estimate_dyaw": false,
+      "estimate_dpitch": false,
+      "use_vanishing_point_yaw": true,
+      "use_vanishing_point_pitch": true,
       "fixed_yaw": 0.0,
       "fixed_pitch": 0.0,
       "fixed_roll": 0.0,
-      "fix_angles_to_vanishing_point": false,
+      "fix_angles_to_vanishing_point": true,
       "dz_adaptive_bounds_enabled": true,
       "dz_adaptive_margin": 3.0,
       "hybrid_two_stage_enabled": false,
       "hybrid_stage1_loss": "soft_l1",
       "hybrid_stage1_dz_min": 0.0,
       "hybrid_stage1_dz_max": null,
-      "hybrid_stage1_ocr_margin_multiplier": 3.0
+      "hybrid_stage1_ocr_margin_multiplier": 3.0,
+      "vp_angle_clamp_degrees": 90.0,
+      "vp_angle_fallback_degrees": 90.0
     },
     "spatial_filter": {
       "enabled": true,
@@ -125,12 +137,12 @@
         5,
         100
       ],
-      "dark_region_radius_limit_ratio": 0.5,
       "brightness_check_enabled": true,
-      "brightness_threshold": 30,
-      "brightness_check_radius": 25,
+      "dark_region_radius_limit_ratio": 0.3,
+      "brightness_check_radius": 50,
+      "brightness_threshold": 20,
       "bright_pixel_count_threshold": 50,
-      "consecutive_brightness_detection_threshold": 5,
+      "consecutive_brightness_detection_threshold": 10,
       "brightness_center_comparison_enabled": true,
       "brightness_center_density_threshold": 0.1,
       "brightness_fallback_method": "average"
@@ -207,11 +219,11 @@
   },
   "ocr": {
     "enabled": true,
-    "tesseract_cmd": "%USERPROFILE%\\AppData\\Local\\Programs\\Tesseract-OCR\\tesseract.exe",
+    "tesseract_cmd": "/usr/bin/tesseract",
     "tesseract_config": "--psm 7 -c tessedit_char_whitelist=0123456789.m",
     "preprocessing_enabled": false,
     "confidence_threshold": 60.0,
-    "max_distance_increment_mm": 10.0,
+    "max_distance_increment_mm": 20.0,
     "preprocessing_method": "otsu",
     "target_roi_height": 200,
     "clahe_clip_limit": 2.0,
@@ -300,7 +312,7 @@
     "max_bytes": 5000000,
     "backup_count": 3
   },
-  "auto_tune_enabled": false,
+  "auto_tune_enabled": true,
   "auto_tune_sample_frames": null,
   "auto_tune_frame_skip": 100,
   "auto_tune_motion_multiplier": 4.0,
@@ -308,14 +320,13 @@
   "auto_tune_feature_matching_sample_pairs": 4,
   "auto_tune_feature_matching_target_points": 20,
   "auto_tune_feature_matching_pass_ratio": 0.75,
-  "auto_tune_brightness_edge_frames": 5,
   "two_direction": {
     "enabled": true,
     "modes": ["A"],
     "output_dir": "data/output",
     "cache_projection_maps": false,
-    "z_source": "ocr",
-    "known_z_metadata_path": null,
+    "z_source": "known",
+    "known_z_metadata_path": "data/input/videos/phi250_baseline_calib_metadata.json",
     "match_source_pixels_per_mm": false,
     "mode_a_yaw_second_stage": false,
     "capture": {

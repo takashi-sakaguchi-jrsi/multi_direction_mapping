@@ -41,7 +41,7 @@
     "output_dir": "data/output/three_direction",
     "cache_projection_maps": false,
     "z_source": "known",
-    "known_z_metadata_path": "data/input/videos/phi250_baseline_metadata.json",
+    "known_z_metadata_path": "data/input/videos/phi250_baseline_calib_metadata.json",
     "match_source_pixels_per_mm": true,
     "mode_a_yaw_second_stage": false,
     "capture": {
@@ -53,7 +53,7 @@
       "image_width_px": 1920
     },
     "run_A": {
-      "video_path": "data/input/videos/phi250_baseline_U.mp4",
+      "video_path": "data/input/videos/phi250_baseline_calib_U.mp4",
       "physical_pitch_deg": 90.0,
       "physical_roll_deg": 0.0,
       "yaw_ref_deg": 0.0,
@@ -62,7 +62,7 @@
       "run_id": "U"
     },
     "run_B": {
-      "video_path": "data/input/videos/phi250_baseline_R.mp4",
+      "video_path": "data/input/videos/phi250_baseline_calib_R.mp4",
       "physical_pitch_deg": 90.0,
       "physical_roll_deg": 120.0,
       "yaw_ref_deg": 0.0,
@@ -71,7 +71,7 @@
       "run_id": "R"
     },
     "run_C": {
-      "video_path": "data/input/videos/phi250_baseline_L.mp4",
+      "video_path": "data/input/videos/phi250_baseline_calib_L.mp4",
       "physical_pitch_deg": 90.0,
       "physical_roll_deg": 240.0,
       "yaw_ref_deg": 0.0,

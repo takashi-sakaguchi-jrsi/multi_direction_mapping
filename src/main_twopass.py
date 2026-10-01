@@ -42,6 +42,10 @@ from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 # サードパーティライブラリ
 import cv2
 import numpy as np
@@ -79,8 +83,21 @@ from src.image_size_correction import apply_camera_correction
 from src.main_two_direction_validation import run_two_direction_validation
 from src.product_runtime import (
     apply_product_cli,
+    apply_sideview_work_dir,
+    cleanup_sideview_intermediates,
+    create_front_progress_reporter,
     create_progress_reporter,
+    effective_pipeline,
     ensure_product_cwd,
+    ocr_metadata_output_path,
+    save_ocr_metadata_file,
+)
+from src.validation.known_z import (
+    apply_generation_metadata_to_config,
+    assert_known_z_covers_window,
+    effective_z_source,
+    load_generation_metadata,
+    resolve_known_z_mm,
 )
 
 
@@ -168,6 +185,7 @@ class ColorMapPipelineTwoPass:
         self.camera_estimator: Optional[CameraEstimator] = None
         self.colormap_gen: Optional[ColorMapGenerator] = None
         self.progress_rep: Optional[ProgressReporter] = None
+        self.known_z_mm: Optional[np.ndarray] = None
 
         # OCRエンジンパス設定（環境変数展開対応: %USERPROFILE%, $HOME 等）
         if self.config.ocr.tesseract_cmd:
@@ -1778,6 +1796,19 @@ class ColorMapPipelineTwoPass:
             constraints_dict, z_positions, vanishing_points = self._compute_constraints_phase1(
                 video_path, actual_start_frame, end_frame, frame_analysis_progress_callback
             )
+            if self.known_z_mm is not None:
+                z_all = np.asarray(self.known_z_mm, dtype=float).reshape(-1)
+                z_positions = z_all[actual_start_frame:end_frame]
+                self.logger.info(
+                    f"既知zをOCR代用: frames[{actual_start_frame}:{end_frame}] "
+                    f"n={len(z_positions)}"
+                )
+            if getattr(self.config, "save_ocr_metadata", False) and z_positions is not None:
+                save_ocr_metadata_file(
+                    ocr_metadata_output_path(self.config, self._timestamp or "ocr"),
+                    z_positions,
+                    extra={"pipeline": "front", "start_frame": int(actual_start_frame), "end_frame": int(end_frame)},
+                )
 
             # Step 2完了時のdetails設定
             total_frames = end_frame - actual_start_frame + 1
@@ -2228,25 +2259,45 @@ def parse_arguments() -> argparse.Namespace:
         パース結果
     """
     parser = argparse.ArgumentParser(
-        description='管内カメラカーシミュレーション用カラーマップ生成（3方向合成）',
+        description='管内カメラカーシミュレーション用カラーマップ生成（正面 / 3方向側視）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-  main_twopass.exe --config data/config/default_config.json
-  main_twopass.exe --input data/input --output data/output --start 1 --end 500
-  main_twopass.exe --pi 250 --ppm 2.55 --debug
+  main_twopass.exe --pipeline sideview --input-dir data/input --name xxx
+  main_twopass.exe --pipeline front --input data/input/video.mp4 --output data/output
+  main_twopass.exe --pipeline front --input-dir data/input --name video
+  main_twopass.exe --config data/config/default_config.json --start 1 --end 500
 
---start/--end は製品の1始まり（含む）。内部の解析区間は [start-1, end) です。
---input にフォルダを指定すると U/R/L 動画を割り当てます。
+--start/--end は製品の1始まり（含む）。側視の内部区間は [start-1, end) です。
+--input は正面専用。--input-dir と --name は正面・側視とも使えます。
+正面は {name}.{ext}、側視は {name}_U/_R/_L.{ext} です。
         """
     )
     
-    # 入力動画ファイル（設定ファイルでも指定可能）
+    parser.add_argument(
+        '--pipeline',
+        choices=['front', 'sideview'],
+        default=None,
+        help='実行経路（未指定時は設定の pipeline、既定 sideview）'
+    )
     parser.add_argument(
         '--input',
         type=Path,
         default=None,
-        help='入力動画ファイル、または U/R/L を含むフォルダ'
+        help='正面用の入力動画ファイル'
+    )
+    parser.add_argument(
+        '--input-dir',
+        type=Path,
+        default=None,
+        dest='input_dir',
+        help='入力フォルダ（--name と併用。正面は {name}.{ext}、側視は {name}_U/_R/_L）'
+    )
+    parser.add_argument(
+        '--name',
+        type=str,
+        default=None,
+        help='入力プレフィックス。正面は {name}.{ext}、側視は {name}_U/_R/_L'
     )
     
     # オプション引数（設定ファイル）
@@ -2310,6 +2361,11 @@ def parse_arguments() -> argparse.Namespace:
         '--use-average-speed',
         action='store_true',
         help='平均速度ベース距離推定法を使用（デフォルトはオフセット移動平均法）'
+    )
+    parser.add_argument(
+        '--save-ocr-metadata',
+        action='store_true',
+        help='使用した z（OCR または既知z）を JSON に保存する'
     )
 
     return parser.parse_args()
@@ -2440,14 +2496,60 @@ def main() -> int:
         logger = logging.getLogger(__name__)
         
         logger.info("=" * 60)
-        logger.info("管内カメラカーシミュレーション用壁面画像生成処理（3方向合成）")
+        pipeline = effective_pipeline(config)
+        title = (
+            "管内カメラカーシミュレーション用壁面画像生成処理（正面）"
+            if pipeline == "front"
+            else "管内カメラカーシミュレーション用壁面画像生成処理（3方向合成）"
+        )
+        logger.info(title)
         logger.info("=" * 60)
-        logger.info(f"出力: {config.two_direction.output_dir}")
+        logger.info(f"pipeline: {pipeline}")
+        if pipeline == "front":
+            logger.info(f"入力: {config.input.video_path}")
+        else:
+            logger.info(f"出力作業ディレクトリ: {config.two_direction.output_dir}")
         logger.info(f"管径: {config.pipe.diameter_mm}mm")
         logger.info(f"デバッグモード: {config.debug.enabled}")
         logger.info("=" * 60)
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if pipeline == "front":
+            progress_rep = create_front_progress_reporter(config, timestamp)
+            pipe = ColorMapPipelineTwoPass(config)
+            pipe._timestamp = timestamp
+            if progress_rep:
+                pipe.progress_rep = progress_rep
+                logger.info(f"進捗ファイル: {progress_rep.output_path}")
+            if effective_z_source(config) == "known":
+                known_z = resolve_known_z_mm(config)
+                if config.known_z_metadata_path or config.two_direction.known_z_metadata_path:
+                    meta_path = config.known_z_metadata_path or config.two_direction.known_z_metadata_path
+                    meta = load_generation_metadata(meta_path)
+                    apply_generation_metadata_to_config(config, meta)
+                start0 = max(0, int(config.input.start_frame or 1) - 1)
+                end_ex = config.input.end_frame
+                assert_known_z_covers_window(known_z, start0, end_ex)
+                pipe.known_z_mm = known_z
+            try:
+                pipe.run()
+            except Exception:
+                if progress_rep and progress_rep.process_progress:
+                    cur = progress_rep.process_progress.current_step
+                    if cur:
+                        try:
+                            progress_rep.complete_step(
+                                int(cur), success=False, error_message="処理失敗"
+                            )
+                        except Exception:
+                            pass
+                raise
+            logger.info("=" * 60)
+            logger.info("正常終了")
+            logger.info("=" * 60)
+            return 0
+
+        apply_sideview_work_dir(config)
         progress_rep = create_progress_reporter(config, timestamp)
         if progress_rep:
             progress_rep.skip_step(1, reason="3方向合成では自動チューニングを使わない")
@@ -2462,6 +2564,10 @@ def main() -> int:
                 logger.info(f"Excel: {result['excel_path']}")
             if result.get("colormap_path"):
                 logger.info(f"colormap: {result['colormap_path']}")
+            if result.get("ocr_metadata_path"):
+                logger.info(f"OCR metadata: {result['ocr_metadata_path']}")
+            mode_ids = list(result.get("modes") or config.two_direction.modes or ["A"])
+            cleanup_sideview_intermediates(config, mode_ids)
         except Exception:
             if progress_rep and progress_rep.process_progress:
                 cur = progress_rep.process_progress.current_step

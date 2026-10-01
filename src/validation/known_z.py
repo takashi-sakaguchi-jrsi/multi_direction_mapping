@@ -135,19 +135,74 @@ def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
         config.pipe.diameter_mm = float(meta["radius_mm"]) * 2.0
 
 
+def effective_z_source(config) -> str:
+    top = str(getattr(config, "z_source", "") or "").lower()
+    td = str(getattr(config.two_direction, "z_source", "") or "").lower()
+    if top in ("ocr", "known"):
+        if top == "known" or td != "known":
+            return top
+    if td in ("ocr", "known"):
+        return td
+    return "ocr"
+
+
+def effective_known_z_metadata_path(config) -> Optional[str]:
+    top = getattr(config, "known_z_metadata_path", None)
+    if top:
+        return str(top)
+    td = getattr(config.two_direction, "known_z_metadata_path", None)
+    if td:
+        return str(td)
+    return None
+
+
+def assert_known_z_covers_window(
+    z_mm: np.ndarray,
+    start: int,
+    end: Optional[int],
+) -> None:
+    """既知 z が [start, end) を包含することを要求する。end が None なら start だけ見る。"""
+    n = int(np.asarray(z_mm).reshape(-1).size)
+    start_i = int(start or 0)
+    if start_i < 0 or start_i >= n:
+        raise ValueError(
+            f"開始フレーム {start_i} が既知z範囲 [0, {n}) に含まれません"
+        )
+    if end is None:
+        return
+    end_i = int(end)
+    if end_i > n:
+        raise ValueError(
+            f"終了フレーム {end_i} が既知z範囲 [0, {n}) を超えています"
+        )
+    if end_i <= start_i:
+        raise ValueError(
+            f"空のフレーム範囲です: start={start_i}, end={end_i}, known_z={n}"
+        )
+
+
 def resolve_known_z_mm(config) -> Optional[np.ndarray]:
     """z_source=known のとき metadata から既知 z を読む。ocr なら None。"""
-    td = config.two_direction
-    if str(td.z_source).lower() != "known":
+    if effective_z_source(config) != "known":
         return None
-    path = td.known_z_metadata_path
+    path = effective_known_z_metadata_path(config)
+    td = config.two_direction
     if path:
+        td.known_z_metadata_path = str(path)
+        config.known_z_metadata_path = str(path)
         return load_known_z_mm(path)
+    if getattr(config.input, "video_path", None):
+        inferred = infer_known_z_metadata_path(config.input.video_path)
+        if inferred is not None:
+            td.known_z_metadata_path = str(inferred)
+            config.known_z_metadata_path = str(inferred)
+            return load_known_z_mm(inferred)
     for _tag, run in td.active_run_slots():
         if run.video_path:
             inferred = infer_known_z_metadata_path(run.video_path)
             if inferred is not None:
                 td.known_z_metadata_path = str(inferred)
+                config.known_z_metadata_path = str(inferred)
                 return load_known_z_mm(inferred)
     raise FileNotFoundError(
         "z_source=known ですが known_z_metadata_path も "

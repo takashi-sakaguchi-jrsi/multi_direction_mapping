@@ -660,21 +660,25 @@ class DebugVisualizer:
         if not self.config.enabled or not self.config.show_frame_window:
             return True
         
-        # ウィンドウ作成（初回のみ）
-        if window_name not in self._window_created or not self._window_created[window_name]:
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(
-                window_name,
-                self.config.window_size[0],
-                self.config.window_size[1]
-            )
-            self._window_created[window_name] = True
-        
-        cv2.imshow(window_name, frame)
-        key = cv2.waitKey(1) & 0xFF
+        try:
+            if window_name not in self._window_created or not self._window_created[window_name]:
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(
+                    window_name,
+                    self.config.window_size[0],
+                    self.config.window_size[1]
+                )
+                self._window_created[window_name] = True
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(1) & 0xFF
+        except cv2.error:
+            return True
         
         if key == ord('q'):
-            cv2.destroyWindow(window_name)
+            try:
+                cv2.destroyWindow(window_name)
+            except cv2.error:
+                pass
             self._window_created[window_name] = False
             return False
         
@@ -830,10 +834,16 @@ class DebugVisualizer:
         """リソース解放
         
         開いているすべてのウィンドウを閉じます。
+        WSL など GUI 無しの OpenCV では destroyAllWindows が未実装のため握りつぶす。
         """
-        for window_name, created in self._window_created.items():
+        for window_name, created in list(self._window_created.items()):
             if created:
-                cv2.destroyWindow(window_name)
-        
+                try:
+                    cv2.destroyWindow(window_name)
+                except cv2.error:
+                    pass
         self._window_created.clear()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
