@@ -126,6 +126,10 @@ class CorrectionConfig:
     enabled: bool = True
     ocr_interval_mm: float = 100.0
     max_image_size: int = 30000
+    attitude_trend_enabled: bool = True
+    """マッチ蓄積 yaw/pitch の z 移動平均を消失点へ合わせる θ ワープ"""
+    attitude_window_mm: float = 800.0
+    attitude_max_dtheta_deg: float = 15.0
 
 
 @dataclass
@@ -1183,6 +1187,8 @@ class FrontConfig:
     use_vanishing_point_yaw: bool = True
     use_vanishing_point_pitch: bool = True
     auto_tune_enabled: Optional[bool] = None
+    physical_z_matching: bool = True
+    """円筒マッチングを管 (θ, Z) にする。展開は前フレーム姿勢。dz と Δyaw/Δpitch はマッチ、roll=0。"""
 
 
 @dataclass

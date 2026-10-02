@@ -15,6 +15,7 @@ from src.validation.geometry import build_run_reference
 from src.validation.known_z import (
     apply_generation_metadata_to_config,
     infer_known_z_metadata_path,
+    is_generation_camera_metadata,
     load_known_z_mm,
     resolve_known_z_mm,
 )
@@ -114,6 +115,40 @@ def test_resolve_known_z_from_config_path(tmp_path, config):
     config.two_direction.known_z_metadata_path = str(meta)
     z = resolve_known_z_mm(config)
     np.testing.assert_allclose(z, [1.0, 2.0])
+
+
+def test_resolve_known_z_from_product_ocr_save(tmp_path, config):
+    meta = tmp_path / "ocr_metadata_save.json"
+    meta.write_text(
+        json.dumps({"z_ocr_mm": [0.0, 1.428, 2.857], "n": 3}),
+        encoding="utf-8",
+    )
+    config.z_source = "known"
+    config.known_z_metadata_path = str(meta)
+    config.two_direction.z_source = "ocr"
+    config.camera.lens_calibration_file = "data/calibration/fisheye_recalibrated_20260217.json"
+    z = resolve_known_z_mm(config)
+    np.testing.assert_allclose(z, [0.0, 1.428, 2.857])
+    apply_generation_metadata_to_config(config, json.loads(meta.read_text(encoding="utf-8")))
+    assert config.camera.lens_calibration_file == (
+        "data/calibration/fisheye_recalibrated_20260217.json"
+    )
+
+
+def test_save_ocr_metadata_roundtrip_as_known(tmp_path, config):
+    from src.product_runtime import save_ocr_metadata_file
+
+    path = save_ocr_metadata_file(tmp_path / "ocr_metadata.json", np.array([0.0, 10.0, 20.0]))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["z_ocr_mm"] == payload["ocr_z_mm"]
+    config.z_source = "known"
+    config.known_z_metadata_path = str(path)
+    np.testing.assert_allclose(resolve_known_z_mm(config), [0.0, 10.0, 20.0])
+
+
+def test_ocr_save_is_not_generation_camera_metadata():
+    assert not is_generation_camera_metadata({"z_ocr_mm": [0.0, 10.0], "n": 2})
+    assert is_generation_camera_metadata({"f_px": 340.0, "fov_deg": 181.0, "width": 1920, "height": 1080})
 
 
 def test_source_pixels_per_mm_from_height():

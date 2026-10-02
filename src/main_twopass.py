@@ -75,7 +75,11 @@ from src.debug_visualizer import (
 from src.feature_matching import FeatureMatcher
 from src.camera_estimation import CameraEstimator, compute_frame_constraints
 from src.colormap_generator import ColorMapGenerator
-from src.colormap_correction import ColormapCorrector, ColormapCorrectionError
+from src.colormap_correction import (
+    ColormapCorrector,
+    ColormapCorrectionError,
+    apply_front_attitude_trend_warp,
+)
 from src.progress_reporter import ProgressReporter
 from src.camera_utils import compute_fisheye_focal_length
 from src.auto_tuner import AutoTuner
@@ -1172,18 +1176,19 @@ class ColorMapPipelineTwoPass:
                         f"フレーム{frame_num}: z={z_current:.2f}mm (OCR推定なし)"
                     )
 
-            # TASK-21: カラーマップ用の一時位置計算（補正前の累積値）
+            # カラーマップ姿勢: 物理 (θ,Z) はマッチ増分を積んだ camera_state をそのまま使う
             if frame_num >= user_start_frame and prev_frame is not None:
-                # 補正前の累積値 = 現在の補正済み累積値 + 補正前の移動量
-                # （現在のcamera_state.positionは前フレームまでの補正済み累積値）
-                temp_position = camera_state.position.copy() + movement_raw[:3]
-                temp_orientation = camera_state.orientation.copy() + movement_raw[3:]
-                camera_state_for_colormap = CameraState(
-                    position=temp_position,
-                    orientation=temp_orientation,
-                    frame_num=camera_state.frame_num,
-                    timestamp=camera_state.timestamp
-                )
+                if self._use_front_physical_matching():
+                    camera_state_for_colormap = camera_state
+                else:
+                    temp_position = camera_state.position.copy() + movement_raw[:3]
+                    temp_orientation = camera_state.orientation.copy() + movement_raw[3:]
+                    camera_state_for_colormap = CameraState(
+                        position=temp_position,
+                        orientation=temp_orientation,
+                        frame_num=camera_state.frame_num,
+                        timestamp=camera_state.timestamp
+                    )
             else:
                 camera_state_for_colormap = camera_state
 
@@ -1351,6 +1356,7 @@ class ColorMapPipelineTwoPass:
 
         # (3) 特徴点マッチング + 移動量推定 (新API使用)
         try:
+            use_physical = False
             # 🆕 estimate_motion_from_frames()を使用
             # 円筒座標マッチング or 従来のORBマッチングを自動選択し、
             # 移動量推定まで一貫して実行
@@ -1360,7 +1366,7 @@ class ColorMapPipelineTwoPass:
                 # 制約はestimate_motion()側で処理される。
                 # ここでは特徴点抽出のみを新APIで行い、移動量推定は既存ロジックを使用
                 prev_points, curr_points, status = self._extract_features_from_frames(
-                    prev_frame, curr_frame
+                    prev_frame, curr_frame, camera_state=camera_state
                 )
 
                 # 静止状態チェック（最重要）
@@ -1382,7 +1388,7 @@ class ColorMapPipelineTwoPass:
             else:
                 # 制約付き移動量推定（既存の方法）
                 prev_points, curr_points, status = self._extract_features_from_frames(
-                    prev_frame, curr_frame
+                    prev_frame, curr_frame, camera_state=camera_state
                 )
 
                 # 静止状態チェック（最重要）
@@ -1397,116 +1403,145 @@ class ColorMapPipelineTwoPass:
                     self.logger.warning("特徴点マッチング失敗、移動量をゼロとします")
                     return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
 
-                # 位相相関結果をチェック
-                fixed_dz = None
-                fixed_droll = None
                 cyl_matcher = self.camera_estimator.cylindrical_matcher
-                if cyl_matcher is not None:
-                    phase_corr = getattr(cyl_matcher, '_last_phase_correlation_result', None)
-                    if phase_corr is not None:
-                        threshold = cyl_matcher.config.phase_correlation_response_threshold
-                        if phase_corr['response'] >= threshold:
-                            fixed_dz = phase_corr['dz_mm']
-                            fixed_droll = np.radians(phase_corr['droll_deg'])
-                            self.logger.info(
-                                f"位相相関採用: dz={fixed_dz:.3f}mm, "
-                                f"droll={phase_corr['droll_deg']:.4f}°, "
-                                f"response={phase_corr['response']:.3f}"
-                            )
-                        else:
-                            self.logger.debug(
-                                f"位相相関信頼度不足: response={phase_corr['response']:.3f} "
-                                f"< threshold={threshold}"
-                            )
-
-                # ハイブリッド2段階推定: 第1段階（円筒座標でdz推定）
-                if (self.config.estimation.motion.hybrid_two_stage_enabled
-                        and cyl_matcher is not None):
-                    prev_cyl = getattr(cyl_matcher, '_last_prev_points_cyl', None)
-                    curr_cyl = getattr(cyl_matcher, '_last_curr_points_cyl', None)
-                    if (prev_cyl is not None and curr_cyl is not None
-                            and len(prev_cyl) >= 2):
-                        # Stage 1 dz bounds: OCR局所平均 × マージンを優先使用
-                        dz_bounds_stage1 = None
-                        if ocr_local_dz is not None and ocr_local_dz > 0:
-                            multiplier = self.config.estimation.motion.hybrid_stage1_ocr_margin_multiplier
-                            ocr_max_dz = ocr_local_dz * multiplier
-                            dz_bounds_stage1 = (0.0, max(1.0, ocr_max_dz))
-                            # 適応的制約もOCR bounds上で適用
-                            if (self.config.estimation.motion.dz_adaptive_bounds_enabled
-                                    and prev_dz is not None):
-                                margin = self.config.estimation.motion.dz_adaptive_margin
-                                adaptive_lower = max(0.0, prev_dz - margin)
-                                adaptive_upper = prev_dz + margin
-                                dz_bounds_stage1 = (
-                                    max(dz_bounds_stage1[0], adaptive_lower),
-                                    min(dz_bounds_stage1[1], adaptive_upper)
-                                )
-                            self.logger.debug(
-                                f"Stage1 OCR bounds: ocr_dz={ocr_local_dz:.2f}, "
-                                f"bounds=[{dz_bounds_stage1[0]:.2f}, {dz_bounds_stage1[1]:.2f}]"
-                            )
-                        else:
-                            # OCRなし: 従来のconstraintsからfallback
-                            dz_bounds_stage1 = constraints.get('dz') if constraints else None
-                        stage1_result = self.camera_estimator.estimate_dz_from_cylindrical(
-                            prev_cyl, curr_cyl,
-                            dz_bounds=dz_bounds_stage1,
-                            pipe_radius_mm=self.config.pipe.diameter_mm / 2.0
+                use_physical = (
+                    cyl_matcher is not None
+                    and str(
+                        getattr(getattr(cyl_matcher, "config", None), "z_axis", "tan")
+                        or "tan"
+                    ).lower()
+                    == "physical"
+                )
+                if use_physical:
+                    prev_cyl = getattr(cyl_matcher, "_last_prev_points_cyl", None)
+                    curr_cyl = getattr(cyl_matcher, "_last_curr_points_cyl", None)
+                    if prev_cyl is None or curr_cyl is None or len(prev_cyl) < 2:
+                        self.logger.warning("物理 (θ,Z) 点が不足、移動量をゼロとします")
+                        return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
+                    dz_bounds_phys = None
+                    if ocr_local_dz is not None and ocr_local_dz > 0:
+                        multiplier = (
+                            self.config.estimation.motion.hybrid_stage1_ocr_margin_multiplier
                         )
-                        if stage1_result['success']:
-                            fixed_dz = stage1_result['dz']
-                            # fixed_droll=None のまま → 3DOFモード起動
-                            self.logger.info(
-                                f"ハイブリッド第1段階成功: dz={fixed_dz:.3f}mm"
-                            )
-                        else:
-                            self.logger.warning(
-                                "ハイブリッド第1段階失敗、従来方式にフォールバック"
-                            )
-
-                # Stage 1成功かつ点数2点: 略式推定（Stage 2スキップ）
-                # Stage 2の3DOF最適化(dx,dy,droll)には最低3点必要
-                n_match_points = len(prev_points) if prev_points is not None else 0
-                if fixed_dz is not None and n_match_points < 3:
-                    droll_stage1_deg = stage1_result.get('droll_composite', 0.0)
-                    # 2点ではdroll推定が不安定なため、droll=0（前フレームからロール変化なし）を採用
-                    droll_stage1_rad = 0.0
-                    # 消失点推定からのyaw/pitch変化量を設定（通常パスと同じ原点）
-                    yaw_0 = camera_state_dict['orientation'][1]
-                    phi_0 = camera_state_dict['orientation'][2]
-                    dtheta_shortcut = camera_state_dict.get('yaw_estimated', yaw_0) - yaw_0
-                    dphi_shortcut = camera_state_dict.get('phi_estimated', phi_0) - phi_0
+                        dz_bounds_phys = (0.0, max(1.0, ocr_local_dz * multiplier))
+                    elif constraints:
+                        dz_bounds_phys = constraints.get("dz")
+                    phys = self.camera_estimator.estimate_dz_droll_physical(
+                        prev_cyl,
+                        curr_cyl,
+                        dz_bounds=dz_bounds_phys,
+                        pipe_radius_mm=self.config.pipe.diameter_mm / 2.0,
+                    )
+                    if not phys.get("success"):
+                        self.logger.warning("物理 (θ,Z) 推定失敗、移動量をゼロとします")
+                        return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
                     motion = {
-                        'dx': 0.0, 'dy': 0.0, 'dz': fixed_dz,
-                        'droll': droll_stage1_rad,
-                        'dtheta': dtheta_shortcut, 'dphi': dphi_shortcut
+                        "dx": 0.0,
+                        "dy": 0.0,
+                        "dz": float(phys["dz"]),
+                        "droll": 0.0,
+                        "dtheta": float(phys.get("dyaw", 0.0)),
+                        "dphi": float(phys.get("dpitch", 0.0)),
                     }
-                    self.logger.info(
-                        f"略式推定(2点): Stage 2スキップ, "
-                        f"dz={fixed_dz:.3f}mm, "
-                        f"droll=0°(raw={droll_stage1_deg:.2f}°, 2点不安定のため前フレーム維持), "
-                        f"dtheta={np.degrees(dtheta_shortcut):.4f}°, "
-                        f"dphi={np.degrees(dphi_shortcut):.4f}°"
-                    )
                 else:
-                    motion = self.camera_estimator.estimate_motion_with_constraints(
-                        prev_points, curr_points, camera_state_dict, self.camera_params,
-                        constraints=constraints,
-                        fix_angles=self.config.estimation.motion.fix_angles_to_vanishing_point,
-                        dz_hint=dz_hint,
-                        fixed_dz=fixed_dz,
-                        fixed_droll=fixed_droll
-                    )
+                    # 位相相関結果をチェック
+                    fixed_dz = None
+                    fixed_droll = None
+                    if cyl_matcher is not None:
+                        phase_corr = getattr(cyl_matcher, '_last_phase_correlation_result', None)
+                        if phase_corr is not None:
+                            threshold = cyl_matcher.config.phase_correlation_response_threshold
+                            if phase_corr['response'] >= threshold:
+                                fixed_dz = phase_corr['dz_mm']
+                                fixed_droll = np.radians(phase_corr['droll_deg'])
+                                self.logger.info(
+                                    f"位相相関採用: dz={fixed_dz:.3f}mm, "
+                                    f"droll={phase_corr['droll_deg']:.4f}°, "
+                                    f"response={phase_corr['response']:.3f}"
+                                )
+                            else:
+                                self.logger.debug(
+                                    f"位相相関信頼度不足: response={phase_corr['response']:.3f} "
+                                    f"< threshold={threshold}"
+                                )
+
+                    if (self.config.estimation.motion.hybrid_two_stage_enabled
+                            and cyl_matcher is not None):
+                        prev_cyl = getattr(cyl_matcher, '_last_prev_points_cyl', None)
+                        curr_cyl = getattr(cyl_matcher, '_last_curr_points_cyl', None)
+                        if (prev_cyl is not None and curr_cyl is not None
+                                and len(prev_cyl) >= 2):
+                            dz_bounds_stage1 = None
+                            if ocr_local_dz is not None and ocr_local_dz > 0:
+                                multiplier = self.config.estimation.motion.hybrid_stage1_ocr_margin_multiplier
+                                ocr_max_dz = ocr_local_dz * multiplier
+                                dz_bounds_stage1 = (0.0, max(1.0, ocr_max_dz))
+                                if (self.config.estimation.motion.dz_adaptive_bounds_enabled
+                                        and prev_dz is not None):
+                                    margin = self.config.estimation.motion.dz_adaptive_margin
+                                    adaptive_lower = max(0.0, prev_dz - margin)
+                                    adaptive_upper = prev_dz + margin
+                                    dz_bounds_stage1 = (
+                                        max(dz_bounds_stage1[0], adaptive_lower),
+                                        min(dz_bounds_stage1[1], adaptive_upper)
+                                    )
+                            else:
+                                dz_bounds_stage1 = constraints.get('dz') if constraints else None
+                            stage1_result = self.camera_estimator.estimate_dz_from_cylindrical(
+                                prev_cyl, curr_cyl,
+                                dz_bounds=dz_bounds_stage1,
+                                pipe_radius_mm=self.config.pipe.diameter_mm / 2.0
+                            )
+                            if stage1_result['success']:
+                                fixed_dz = stage1_result['dz']
+                                self.logger.info(
+                                    f"ハイブリッド第1段階成功: dz={fixed_dz:.3f}mm"
+                                )
+                            else:
+                                self.logger.warning(
+                                    "ハイブリッド第1段階失敗、従来方式にフォールバック"
+                                )
+
+                    n_match_points = len(prev_points) if prev_points is not None else 0
+                    if fixed_dz is not None and n_match_points < 3:
+                        droll_stage1_deg = stage1_result.get('droll_composite', 0.0)
+                        droll_stage1_rad = 0.0
+                        yaw_0 = camera_state_dict['orientation'][1]
+                        phi_0 = camera_state_dict['orientation'][2]
+                        dtheta_shortcut = camera_state_dict.get('yaw_estimated', yaw_0) - yaw_0
+                        dphi_shortcut = camera_state_dict.get('phi_estimated', phi_0) - phi_0
+                        motion = {
+                            'dx': 0.0, 'dy': 0.0, 'dz': fixed_dz,
+                            'droll': droll_stage1_rad,
+                            'dtheta': dtheta_shortcut, 'dphi': dphi_shortcut
+                        }
+                        self.logger.info(
+                            f"略式推定(2点): Stage 2スキップ, "
+                            f"dz={fixed_dz:.3f}mm, "
+                            f"droll=0°(raw={droll_stage1_deg:.2f}°, 2点不安定のため前フレーム維持), "
+                            f"dtheta={np.degrees(dtheta_shortcut):.4f}°, "
+                            f"dphi={np.degrees(dphi_shortcut):.4f}°"
+                        )
+                    else:
+                        motion = self.camera_estimator.estimate_motion_with_constraints(
+                            prev_points, curr_points, camera_state_dict, self.camera_params,
+                            constraints=constraints,
+                            fix_angles=self.config.estimation.motion.fix_angles_to_vanishing_point,
+                            dz_hint=dz_hint,
+                            fixed_dz=fixed_dz,
+                            fixed_droll=fixed_droll
+                        )
 
             # TASK-21: 補正前の移動量を保存
             motion_raw = motion.copy()
 
-            # 姿勢制約を適用（最終防衛線）
-            motion_constrained = self.camera_estimator._constrain_camera_pose(
-                motion, camera_state.position, camera_state.orientation, camera_state.frame_num,
-                camera_state=camera_state_dict
-            )
+            if use_physical:
+                motion_constrained = motion.copy()
+            else:
+                motion_constrained = self.camera_estimator._constrain_camera_pose(
+                    motion, camera_state.position, camera_state.orientation, camera_state.frame_num,
+                    camera_state=camera_state_dict
+                )
 
 
             # TASK-21: 補正前と補正後の両方をnumpy配列に変換
@@ -1542,28 +1577,24 @@ class ColorMapPipelineTwoPass:
     def _extract_features_from_frames(
         self,
         prev_frame: np.ndarray,
-        curr_frame: np.ndarray
+        curr_frame: np.ndarray,
+        camera_state: Optional[CameraState] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
         """フレーム画像から特徴点を抽出（新規メソッド）
 
         円筒座標マッチング or 従来のORBマッチングを自動選択します。
-
-        Args:
-            prev_frame: 前フレーム画像 (H, W, 3) BGR
-            curr_frame: 現フレーム画像 (H, W, 3) BGR
-
-        Returns:
-            prev_points: 前フレーム特徴点 (N, 2) or None
-            curr_points: 現フレーム特徴点 (N, 2) or None
-            status: "SUCCESS" | "STATIC_FRAME" | "FAILED"
         """
         try:
-            # 円筒座標マッチング or 従来のORBマッチング
             if (self.camera_estimator.cylindrical_matcher is not None and
                 self.config.estimation.feature_matching.use_cylindrical_matching):
-                # 円筒座標マッチング
+                params = dict(self.camera_params or {})
+                if camera_state is not None:
+                    params["cam_pos"] = np.asarray(camera_state.position, dtype=float)
+                    params["roll"] = float(camera_state.orientation[0])
+                    params["yaw"] = float(camera_state.orientation[1])
+                    params["pitch"] = float(camera_state.orientation[2])
                 prev_points, curr_points, status = self.camera_estimator.cylindrical_matcher.extract_and_match(
-                    prev_frame, curr_frame, self.camera_params
+                    prev_frame, curr_frame, params
                 )
                 if status == "SUCCESS" and prev_points is not None:
                     self.logger.debug(f"円筒座標マッチング: {len(prev_points)}点")
@@ -1590,7 +1621,13 @@ class ColorMapPipelineTwoPass:
         except Exception as e:
             self.logger.warning(f"特徴点抽出失敗: {e}")
             return None, None, "FAILED"
-    
+
+    def _use_front_physical_matching(self) -> bool:
+        cyl = getattr(self.camera_estimator, "cylindrical_matcher", None)
+        if cyl is None:
+            return False
+        return str(getattr(getattr(cyl, "config", None), "z_axis", "tan") or "tan").lower() == "physical"
+
     def _generate_colormap_frame(
         self,
         curr_frame: np.ndarray,
@@ -1912,6 +1949,8 @@ class ColorMapPipelineTwoPass:
                 excel_path,
                 final_colormap_path
             )
+            if self.config.correction.enabled:
+                self._apply_front_attitude_trend(final_colormap_path, excel_path)
 
             # Step 4完了
             if self.progress_rep:
@@ -2103,6 +2142,64 @@ class ColorMapPipelineTwoPass:
                 f"一時展開画像の削除に失敗しました: {temp_path} - {e}"
             )
             self.logger.warning(f"手動で削除してください: {temp_path}")
+
+    def _apply_front_attitude_trend(self, colormap_path: Path, excel_path: Path) -> None:
+        """マッチ蓄積 yaw/pitch の低周波を消失点へ合わせる。"""
+        corr = self.config.correction
+        if not bool(getattr(corr, "attitude_trend_enabled", True)):
+            return
+        if not self._use_front_physical_matching():
+            return
+        path = Path(colormap_path)
+        if not path.is_file() or not Path(excel_path).is_file():
+            return
+        try:
+            df = pd.read_excel(excel_path)
+        except Exception as exc:
+            self.logger.warning(f"姿勢トレンド補正: Excel を読めません: {exc}")
+            return
+
+        def _col(*names):
+            for name in names:
+                if name in df.columns:
+                    return df[name]
+            return None
+
+        z_est = _col("Z (mm)")
+        z_ocr = _col("Z_OCR (mm)")
+        yaw = _col("Yaw (度)")
+        pitch = _col("Pitch (度)")
+        yaw_vp = _col("Yaw_消失点 (度)")
+        pitch_vp = _col("Pitch_消失点 (度)")
+        roll = _col("Roll (度)")
+        if z_est is None or yaw is None or pitch is None or yaw_vp is None or pitch_vp is None:
+            self.logger.info("姿勢トレンド補正: 必要な列が無いためスキップ")
+            return
+        image = cv2.imread(str(path))
+        if image is None:
+            return
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        z_axis = z_ocr if z_ocr is not None else z_est
+        roll_rad = 0.0
+        if roll is not None:
+            roll_vals = pd.to_numeric(roll, errors="coerce").fillna(0.0).to_numpy()
+            if roll_vals.size:
+                roll_rad = float(np.radians(roll_vals[0]))
+        warped = apply_front_attitude_trend_warp(
+            image,
+            z_mm=pd.to_numeric(z_est, errors="coerce").to_numpy(),
+            yaw_rad=np.radians(pd.to_numeric(yaw, errors="coerce").to_numpy()),
+            pitch_rad=np.radians(pd.to_numeric(pitch, errors="coerce").to_numpy()),
+            yaw_vp_rad=np.radians(pd.to_numeric(yaw_vp, errors="coerce").to_numpy()),
+            pitch_vp_rad=np.radians(pd.to_numeric(pitch_vp, errors="coerce").to_numpy()),
+            pixels_per_mm=float(self.colormap_gen.pixels_per_mm),
+            roll_rad=roll_rad,
+            window_mm=float(getattr(corr, "attitude_window_mm", 800.0)),
+            max_dtheta_deg=float(getattr(corr, "attitude_max_dtheta_deg", 15.0)),
+            z_axis_mm=pd.to_numeric(z_axis, errors="coerce").to_numpy(),
+        )
+        plt.imsave(str(path), warped)
+        self.logger.info("姿勢トレンド補正（消失点へ低周波合わせ）を適用しました")
 
     def _save_colormap(self, color_map_img: Optional[np.ndarray]) -> None:
         """カラーマップを保存

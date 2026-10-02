@@ -69,12 +69,16 @@ def ocr_metadata_fields(
 
 
 def ocr_z_from_metadata(meta: dict, fallback_true_z: Optional[bool] = True) -> np.ndarray:
-    """metadata の OCR 列。無ければ真値 z（後方互換）。"""
-    if meta.get("ocr_z_mm") is not None:
-        z = np.asarray(meta["ocr_z_mm"], dtype=float).reshape(-1)
-        if z.size == 0:
-            raise ValueError("ocr_z_mm が空です")
-        return z
+    """metadata の OCR 列。無ければ真値 z（後方互換）。
+
+    生成 metadata は ``ocr_z_mm``、製品 ``--save-ocr-metadata`` は ``z_ocr_mm``。
+    """
+    for key in ("ocr_z_mm", "z_ocr_mm"):
+        if meta.get(key) is not None:
+            z = np.asarray(meta[key], dtype=float).reshape(-1)
+            if z.size == 0:
+                raise ValueError(f"{key} が空です")
+            return z
     if fallback_true_z and meta.get("z_values_mm") is not None:
         return np.asarray(meta["z_values_mm"], dtype=float).reshape(-1)
-    raise ValueError("metadata に ocr_z_mm / z_values_mm がありません")
+    raise ValueError("metadata に ocr_z_mm / z_ocr_mm / z_values_mm がありません")

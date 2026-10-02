@@ -9,7 +9,8 @@
     "max_yaw": 15.0,
     "max_pitch": 15.0,
     "use_vanishing_point_yaw": true,
-    "use_vanishing_point_pitch": true
+    "use_vanishing_point_pitch": true,
+    "physical_z_matching": true
   },
   "input": {
     "start_frame": 1,
@@ -243,7 +244,10 @@
   "correction": {
     "enabled": true,
     "ocr_interval_mm": 100.0,
-    "max_image_size": 30000
+    "max_image_size": 30000,
+    "attitude_trend_enabled": true,
+    "attitude_window_mm": 800.0,
+    "attitude_max_dtheta_deg": 15.0
   },
   "debug": {
     "enabled": false,

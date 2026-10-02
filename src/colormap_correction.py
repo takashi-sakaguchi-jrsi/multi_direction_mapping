@@ -20,6 +20,8 @@ import pandas as pd
 from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 
+from src.validation.geometry import optical_axis_eta, wrap_angle_rad
+
 
 class ColormapCorrectionError(Exception):
     """展開画像補正処理のエラー"""
@@ -370,3 +372,114 @@ class ColormapCorrector:
         )
 
         return corrected
+
+
+def _moving_average_by_z(values: np.ndarray, z_mm: np.ndarray, window_mm: float) -> np.ndarray:
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    v = np.asarray(values, dtype=float).reshape(-1)
+    n = min(z.size, v.size)
+    z, v = z[:n], v[:n]
+    out = np.empty(n, dtype=float)
+    half = max(float(window_mm), 1.0) / 2.0
+    for i, zi in enumerate(z):
+        mask = np.abs(z - zi) <= half
+        out[i] = float(np.mean(v[mask])) if np.any(mask) else float(v[i])
+    return out
+
+
+def front_attitude_trend_dtheta_rad(
+    z_mm: np.ndarray,
+    yaw_rad: np.ndarray,
+    pitch_rad: np.ndarray,
+    yaw_vp_rad: np.ndarray,
+    pitch_vp_rad: np.ndarray,
+    roll_rad: float = 0.0,
+    window_mm: float = 800.0,
+    max_dtheta_deg: float = 15.0,
+) -> np.ndarray:
+    """マッチ蓄積姿勢の z 移動平均を消失点へ戻す θ シフト。"""
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    yaw = np.asarray(yaw_rad, dtype=float).reshape(-1)
+    pitch = np.asarray(pitch_rad, dtype=float).reshape(-1)
+    yaw_vp = np.asarray(yaw_vp_rad, dtype=float).reshape(-1)
+    pitch_vp = np.asarray(pitch_vp_rad, dtype=float).reshape(-1)
+    n = min(z.size, yaw.size, pitch.size, yaw_vp.size, pitch_vp.size)
+    if n == 0:
+        return np.zeros(0, dtype=float)
+    z = z[:n]
+    valid = (
+        np.isfinite(z)
+        & np.isfinite(yaw[:n])
+        & np.isfinite(pitch[:n])
+        & np.isfinite(yaw_vp[:n])
+        & np.isfinite(pitch_vp[:n])
+    )
+    dth = np.zeros(n, dtype=float)
+    if int(np.sum(valid)) < 4:
+        return dth
+    zv, yawv, pitchv = z[valid], yaw[:n][valid], pitch[:n][valid]
+    yaw_vp_v, pitch_vp_v = yaw_vp[:n][valid], pitch_vp[:n][valid]
+    yaw_ma = _moving_average_by_z(yawv, zv, window_mm)
+    pitch_ma = _moving_average_by_z(pitchv, zv, window_mm)
+    yaw_vp_ma = _moving_average_by_z(yaw_vp_v, zv, window_mm)
+    pitch_vp_ma = _moving_average_by_z(pitch_vp_v, zv, window_mm)
+    eta_match = np.array(
+        [
+            optical_axis_eta(float(roll_rad), float(ym), float(pm))
+            for ym, pm in zip(yaw_ma, pitch_ma)
+        ]
+    )
+    eta_vp = np.array(
+        [
+            optical_axis_eta(float(roll_rad), float(ym), float(pm))
+            for ym, pm in zip(yaw_vp_ma, pitch_vp_ma)
+        ]
+    )
+    dth_valid = np.array(
+        [wrap_angle_rad(float(ev) - float(em)) for ev, em in zip(eta_vp, eta_match)]
+    )
+    max_abs = np.radians(float(max_dtheta_deg))
+    dth[valid] = np.clip(dth_valid, -max_abs, max_abs)
+    return dth
+
+
+def apply_front_attitude_trend_warp(
+    image: np.ndarray,
+    z_mm: np.ndarray,
+    yaw_rad: np.ndarray,
+    pitch_rad: np.ndarray,
+    yaw_vp_rad: np.ndarray,
+    pitch_vp_rad: np.ndarray,
+    pixels_per_mm: float,
+    roll_rad: float = 0.0,
+    window_mm: float = 800.0,
+    max_dtheta_deg: float = 15.0,
+    z_axis_mm: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """展開図の各 z 列を、消失点との姿勢差だけ周方向にずらす。"""
+    h, w = image.shape[:2]
+    dth = front_attitude_trend_dtheta_rad(
+        z_mm, yaw_rad, pitch_rad, yaw_vp_rad, pitch_vp_rad,
+        roll_rad=roll_rad, window_mm=window_mm, max_dtheta_deg=max_dtheta_deg,
+    )
+    if dth.size == 0 or not np.any(np.abs(dth) > 1e-9):
+        return image
+    z_src = np.asarray(z_axis_mm if z_axis_mm is not None else z_mm, dtype=float).reshape(-1)
+    n = min(z_src.size, dth.size)
+    z_src, dth = z_src[:n], dth[:n]
+    finite = np.isfinite(z_src) & np.isfinite(dth)
+    z_src, dth = z_src[finite], dth[finite]
+    if z_src.size < 2:
+        return image
+    order = np.argsort(z_src)
+    z_s, d_s = z_src[order], dth[order]
+    col_z = np.arange(w, dtype=float) / max(float(pixels_per_mm), 1e-6)
+    dth_col = np.interp(col_z, z_s, d_s, left=float(d_s[0]), right=float(d_s[-1]))
+    d_rows = dth_col / (2.0 * np.pi) * h
+    map_x = np.repeat(np.arange(w, dtype=np.float32).reshape(1, -1), h, axis=0)
+    map_y = (
+        np.arange(h, dtype=np.float32).reshape(-1, 1) - d_rows.reshape(1, -1).astype(np.float32)
+    )
+    return cv2.remap(
+        image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP
+    )

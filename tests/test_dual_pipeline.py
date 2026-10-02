@@ -141,6 +141,8 @@ def test_apply_front_profile_restores_vp_bounds():
     assert config.estimation.use_vanishing_point_constraints is True
     assert config.estimation.motion.max_yaw == pytest.approx(15.0)
     assert config.estimation.motion.use_vanishing_point_yaw is True
+    assert config.estimation.feature_matching.cylindrical.z_axis == "physical"
+    assert config.estimation.motion.estimate_droll is False
 
 
 def test_sideview_alias_json_merges_into_two_direction():

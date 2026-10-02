@@ -226,6 +226,25 @@ def apply_front_profile(config: Config) -> None:
     motion.use_vanishing_point_pitch = bool(front.use_vanishing_point_pitch)
     if front.auto_tune_enabled is not None:
         config.auto_tune_enabled = bool(front.auto_tune_enabled)
+    if bool(getattr(front, "physical_z_matching", True)):
+        fm = config.estimation.feature_matching
+        fm.use_cylindrical_matching = True
+        cyl = fm.cylindrical
+        if cyl is None:
+            from src.feature_matching_cylindrical import CylindricalMatchingConfig
+            cyl = CylindricalMatchingConfig()
+            fm.cylindrical = cyl
+        cyl.z_axis = "physical"
+        cyl.spatial_filter_enabled = False
+        cyl.physical_vector_filter_enabled = True
+        filt = config.estimation.feature_filtering
+        filt.magnitude_filter_enabled = False
+        filt.direction_filter_enabled = False
+        filt.vp_circle_filter_enabled = False
+        motion.estimate_dx = False
+        motion.estimate_droll = False
+        motion.hybrid_two_stage_enabled = False
+        # 展開は前フレーム姿勢。マッチは dz と Δyaw/Δpitch。画素 LS は使わない。
 
 
 def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:
@@ -597,9 +616,11 @@ def save_ocr_metadata_file(
 ) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    z_list = np.asarray(z_mm, dtype=float).reshape(-1).tolist()
     payload: Dict[str, Any] = {
-        "z_ocr_mm": np.asarray(z_mm, dtype=float).reshape(-1).tolist(),
-        "n": int(np.asarray(z_mm).reshape(-1).size),
+        "z_ocr_mm": z_list,
+        "ocr_z_mm": z_list,
+        "n": int(len(z_list)),
     }
     if extra:
         payload.update(extra)

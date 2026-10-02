@@ -25,7 +25,7 @@ from typing import Tuple, Optional, List, Dict, Any
 import cv2
 import numpy as np
 
-from src.coordinate_transform import CoordinateTransformer
+from src.coordinate_transform import CoordinateTransformer, R_w2c
 
 
 # ============================================================================
@@ -120,6 +120,17 @@ class CylindricalMatchingConfig:
                 - 10点 (推奨): 安定した推定が可能
                 - 20点以上: 厳格、スキップされるフレームが増加
         
+        z_axis: 円筒画像の行方向。tan=R·tan(ζ)（旧）、physical=管軸距離 Z
+        physical_vector_filter_enabled: ΔZ/Δθ の側視型 IQR。physical 軸で使う
+        physical_iqr_multiplier: ΔZ/Δθ IQR 倍率
+        physical_outlier_min_points: IQR を掛ける最小点数
+        physical_max_dz_mm: |ΔZ| 絶対上限
+        physical_max_dtheta_deg: |Δθ| 絶対上限
+        reject_reverse_travel: 後退（ΔZ>0）を除外するか
+        reverse_dz_tolerance_mm: 後退判定の許容 (mm)
+        physical_max_dyaw_deg: マッチ 1 次から取る dyaw のフレーム間上限
+        physical_max_dpitch_deg: マッチ 1 次から取る dpitch のフレーム間上限
+
         # 位相相関パラメータ
         phase_correlation_enabled: 位相相関によるdz/droll推定の有効/無効
             True: 円筒座標画像の位相相関でdz/drollを推定し、特徴点最適化を2DOFに縮小
@@ -171,6 +182,17 @@ class CylindricalMatchingConfig:
     static_frame_detection_enabled: bool = True
     static_frame_movement_threshold: float = 2.0
     static_frame_min_points: int = 10
+
+    z_axis: str = "tan"
+    physical_vector_filter_enabled: bool = False
+    physical_iqr_multiplier: float = 1.5
+    physical_outlier_min_points: int = 4
+    physical_max_dz_mm: float = 20.0
+    physical_max_dtheta_deg: float = 5.0
+    reject_reverse_travel: bool = True
+    reverse_dz_tolerance_mm: float = 0.5
+    physical_max_dyaw_deg: float = 2.0
+    physical_max_dpitch_deg: float = 2.0
 
     # 位相相関パラメータ
     phase_correlation_enabled: bool = False
@@ -225,6 +247,8 @@ class CylindricalFeatureMatcher:
         # R不変な円筒座標画像のため、z_rangeをR/R_defaultでスケーリング
         # _create_cylindrical_grid呼び出し時にcamera_paramsから計算・キャッシュ
         self._effective_z_range_mm = config.z_range_mm
+        self._z_near_mm = 50.0
+        self._z_far_mm = 500.0
 
         # TASK-4.2.11d Phase 2: pixels_per_mmを保存（停止判定のピクセル→mm変換用）
         self.pixels_per_mm = pixels_per_mm
@@ -274,8 +298,28 @@ class CylindricalFeatureMatcher:
             f"orb_features={config.orb_max_features}, "
             f"match_features={config.match_max_features}, "
             f"spatial_filter={config.spatial_filter_enabled}, "
-            f"grid={config.spatial_grid_rows}x{config.spatial_grid_cols}"
+            f"grid={config.spatial_grid_rows}x{config.spatial_grid_cols}, "
+            f"z_axis={config.z_axis}"
         )
+
+    def _use_physical_z(self) -> bool:
+        return str(getattr(self.config, "z_axis", "tan") or "tan").lower() == "physical"
+
+    def _unwrap_pose(
+        self, camera_params: Dict[str, Any]
+    ) -> Optional[Tuple[np.ndarray, float, float, float]]:
+        """前フレーム姿勢。yaw/pitch キーがあるときだけ管 (θ,Z) をその姿勢で投影する。"""
+        if not self._use_physical_z():
+            return None
+        if camera_params.get("yaw") is None and camera_params.get("pitch") is None:
+            return None
+        cam_pos = np.asarray(
+            camera_params.get("cam_pos", (0.0, 0.0, 0.0)), dtype=float
+        ).reshape(3)
+        roll = float(camera_params.get("roll", 0.0) or 0.0)
+        yaw = float(camera_params.get("yaw", 0.0) or 0.0)
+        pitch = float(camera_params.get("pitch", 0.0) or 0.0)
+        return cam_pos, roll, yaw, pitch
     
     def extract_and_match(
         self,
@@ -316,11 +360,12 @@ class CylindricalFeatureMatcher:
             
             # Phase 1: 円筒座標変換(前処理含む)
             self.logger.debug("Phase 1: 円筒座標変換 + 前処理")
+            maps = self._build_remap_maps(prev_frame.shape, camera_params)
             prev_cylindrical, theta_grid, z_grid = self._transform_and_preprocess(
-                prev_frame, camera_params
+                prev_frame, camera_params, maps=maps
             )
             curr_cylindrical, _, _ = self._transform_and_preprocess(
-                curr_frame, camera_params
+                curr_frame, camera_params, maps=maps
             )
             
             # Phase 1.5: 位相相関によるdz/droll推定（有効時のみ）
@@ -411,90 +456,114 @@ class CylindricalFeatureMatcher:
             curr_points_cyl = self._pixel_to_cylindrical(curr_points_pixel)
 
             self.logger.info(f"マッチング成功: {len(prev_points_cyl)}点")
-            # ========================================
-            # Phase 3.5: 静止状態フレームスキップ判定（Task 4.2.9, REFACTOR-002で設定変更）
-            # ========================================
-            if self.static_frame_detection_config.enabled:
-                # 円筒座標をフレーム座標に一時的に逆変換（移動量計算のため）
-                try:
-                    prev_points_frame_temp, curr_points_frame_temp = \
-                        self._invert_paired_to_frame_coordinates(
-                            prev_points_cyl, curr_points_cyl,
-                            theta_grid, z_grid, camera_params
+            if self._use_physical_z():
+                n_before = len(prev_points_cyl)
+                prev_points_cyl, curr_points_cyl = filter_physical_motion_vectors(
+                    prev_points_cyl,
+                    curr_points_cyl,
+                    iqr_multiplier=self.config.physical_iqr_multiplier,
+                    min_points=self.config.physical_outlier_min_points,
+                    max_dz_mm=self.config.physical_max_dz_mm,
+                    max_dtheta_deg=self.config.physical_max_dtheta_deg,
+                    reject_reverse=self.config.reject_reverse_travel,
+                    reverse_tol_mm=self.config.reverse_dz_tolerance_mm,
+                )
+                self.logger.info(
+                    f"物理 (ΔZ, Δθ) フィルタ: {n_before} → {len(prev_points_cyl)} 点"
+                )
+                if len(prev_points_cyl) < 2:
+                    self.logger.warning("物理フィルタ後の点数が不足")
+                    return None, None, "FAILED"
+                if self.static_frame_detection_config.enabled:
+                    dZ = curr_points_cyl[:, 1] - prev_points_cyl[:, 1]
+                    avg_abs = float(np.mean(np.abs(dZ)))
+                    if (
+                        len(prev_points_cyl) >= self.static_frame_detection_config.min_points
+                        and avg_abs <= self.static_frame_detection_config.movement_threshold
+                    ):
+                        self.logger.info(
+                            f"静止状態（物理Z）: mean|ΔZ|={avg_abs:.4f}mm "
+                            f"<= {self.static_frame_detection_config.movement_threshold}"
                         )
-                    
-                    if prev_points_frame_temp is not None and curr_points_frame_temp is not None:
-                        # 静止状態判定（第1段階：ピクセル→mm変換して判定）
-                        should_skip, skip_stats = should_skip_static_frame(
-                            prev_points_frame_temp,
-                            curr_points_frame_temp,
-                            threshold=self.static_frame_detection_config.movement_threshold,
-                            min_points=self.static_frame_detection_config.min_points,
-                            pixels_per_mm=self.pixels_per_mm
-                        )
-                        
-                        if should_skip:
-                            # ログはshould_skip_static_frame内で出力済み
-                            return None, None, "STATIC_FRAME"
-                        
-                        # ログはshould_skip_static_frame内で出力済み
-                    else:
-                        self.logger.warning("フレーム座標への逆変換に失敗、静止状態判定をスキップ")
-                except Exception as e:
-                    self.logger.warning(f"静止状態フレーム判定でエラー: {e}、処理を続行します", exc_info=True)
-            
-            
-            # Phase 4: 空間分散フィルタ(円筒座標グリッド)
-            self.logger.debug("Phase 4: 空間分散フィルタ")
-            prev_points_cyl, curr_points_cyl = self._apply_spatial_filter(
-                prev_points_cyl, curr_points_cyl
-            )
-            
-
-            # Task 4.2.4C Phase 3: フィルタリングパイプライン統合
-            if self.feature_filtering_config is not None:
-                if self.feature_filtering_config.magnitude_filter_enabled or \
-                   self.feature_filtering_config.direction_filter_enabled:
+                        return None, None, "STATIC_FRAME"
+            else:
+                if self.static_frame_detection_config.enabled:
                     try:
-                        matches_list = [(prev_points_cyl, curr_points_cyl)]
-                        filtered_matches, filtering_stats = self._apply_advanced_filtering(
-                            matches_list, self.feature_filtering_config,
-                            theta_grid, z_grid, camera_params
-                        )
-                        
-                        if len(filtered_matches) > 0 and len(filtered_matches[0][0]) > 0:
-                            prev_points_cyl, curr_points_cyl = filtered_matches[0]
-                            self.logger.info(
-                                f"フィルタリングパイプライン適用: "
-                                f"{filtering_stats['original_count']} → {filtering_stats['final_count']} 点 "
-                                f"({filtering_stats['total_removal_rate']:.1f}%除去)"
+                        prev_points_frame_temp, curr_points_frame_temp = \
+                            self._invert_paired_to_frame_coordinates(
+                                prev_points_cyl, curr_points_cyl,
+                                theta_grid, z_grid, camera_params
                             )
+                        if prev_points_frame_temp is not None and curr_points_frame_temp is not None:
+                            should_skip, _skip_stats = should_skip_static_frame(
+                                prev_points_frame_temp,
+                                curr_points_frame_temp,
+                                threshold=self.static_frame_detection_config.movement_threshold,
+                                min_points=self.static_frame_detection_config.min_points,
+                                pixels_per_mm=self.pixels_per_mm
+                            )
+                            if should_skip:
+                                return None, None, "STATIC_FRAME"
                         else:
-                            self.logger.warning("フィルタリング後に点が0になりました。元の点を使用します。")
+                            self.logger.warning("フレーム座標への逆変換に失敗、静止状態判定をスキップ")
                     except Exception as e:
-                        self.logger.warning(f"フィルタリングパイプライン適用でエラー: {e}", exc_info=True)
-            
-            # Phase 5: フレーム座標に逆変換（ペアリング維持）
+                        self.logger.warning(
+                            f"静止状態フレーム判定でエラー: {e}、処理を続行します",
+                            exc_info=True,
+                        )
+
+                self.logger.debug("Phase 4: 空間分散フィルタ")
+                prev_points_cyl, curr_points_cyl = self._apply_spatial_filter(
+                    prev_points_cyl, curr_points_cyl
+                )
+
+                if self.feature_filtering_config is not None:
+                    if self.feature_filtering_config.magnitude_filter_enabled or \
+                       self.feature_filtering_config.direction_filter_enabled:
+                        try:
+                            matches_list = [(prev_points_cyl, curr_points_cyl)]
+                            filtered_matches, filtering_stats = self._apply_advanced_filtering(
+                                matches_list, self.feature_filtering_config,
+                                theta_grid, z_grid, camera_params
+                            )
+                            if len(filtered_matches) > 0 and len(filtered_matches[0][0]) > 0:
+                                prev_points_cyl, curr_points_cyl = filtered_matches[0]
+                                self.logger.info(
+                                    f"フィルタリングパイプライン適用: "
+                                    f"{filtering_stats['original_count']} → {filtering_stats['final_count']} 点 "
+                                    f"({filtering_stats['total_removal_rate']:.1f}%除去)"
+                                )
+                            else:
+                                self.logger.warning("フィルタリング後に点が0になりました。元の点を使用します。")
+                        except Exception as e:
+                            self.logger.warning(
+                                f"フィルタリングパイプライン適用でエラー: {e}",
+                                exc_info=True,
+                            )
+
             self.logger.debug("Phase 5: フレーム座標に逆変換")
             prev_points_frame, curr_points_frame = \
                 self._invert_paired_to_frame_coordinates(
                     prev_points_cyl, curr_points_cyl,
                     theta_grid, z_grid, camera_params
                 )
-            
+
+            self._last_prev_points_cyl = prev_points_cyl
+            self._last_curr_points_cyl = curr_points_cyl
+
             if prev_points_frame is None or curr_points_frame is None:
+                if self._use_physical_z() and len(prev_points_cyl) >= 2:
+                    self.logger.warning(
+                        "フレーム座標への逆変換に失敗。物理 (θ, Z) 点は保持して続行"
+                    )
+                    return prev_points_cyl, curr_points_cyl, "SUCCESS"
                 self.logger.warning("フレーム座標への逆変換に失敗")
                 return None, None, "FAILED"
-            
+
             self.logger.info(
                 f"=== 円筒座標系特徴点マッチング完了: "
                 f"prev={len(prev_points_frame)}点, curr={len(curr_points_frame)}点 ==="
             )
-
-            # 検証用: 最終的な円筒座標を保存（dz初期値計算に使用可能）
-            self._last_prev_points_cyl = prev_points_cyl
-            self._last_curr_points_cyl = curr_points_cyl
-
             return prev_points_frame, curr_points_frame, "SUCCESS"
         
         except Exception as e:
@@ -504,25 +573,14 @@ class CylindricalFeatureMatcher:
     def _transform_and_preprocess(
         self,
         frame: np.ndarray,
-        camera_params: Dict[str, Any]
+        camera_params: Dict[str, Any],
+        maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """円筒座標変換と前処理を実行
-        
-        Args:
-            frame: 入力フレーム (H, W, 3) BGR
-            camera_params: カメラパラメータ
-        
-        Returns:
-            cylindrical_image: 前処理済み円筒座標画像 (H', W') uint8
-            theta_grid: theta座標2Dメッシュ (H', W')
-            z_grid: z座標2Dメッシュ (H', W')
-        """
-        # 円筒座標変換
-        cyl_image, theta_grid, z_grid = self._to_cylindrical(frame, camera_params)
-        
-        # 前処理
+        """円筒座標変換と前処理を実行"""
+        cyl_image, theta_grid, z_grid = self._to_cylindrical(
+            frame, camera_params, maps=maps
+        )
         cyl_image_processed = self._preprocess(cyl_image)
-        
         return cyl_image_processed, theta_grid, z_grid
     
     def _extract_features_full(
@@ -618,13 +676,15 @@ class CylindricalFeatureMatcher:
         """
         x = points_pixel[:, 0]
         y = points_pixel[:, 1]
-        
-        # x → theta (度)
+
         theta_deg = (x / self.config.theta_resolution) * 360.0
-        
-        # y → z (mm) — R不変スケーリング済みのeffective z_rangeを使用
-        z_mm = (y / self.config.z_resolution) * self._effective_z_range_mm
-        
+        z_denom = max(self.config.z_resolution - 1, 1)
+        t = np.clip(y / z_denom, 0.0, 1.0)
+        if self._use_physical_z():
+            z_mm = self._z_far_mm + t * (self._z_near_mm - self._z_far_mm)
+        else:
+            z_mm = t * self._effective_z_range_mm
+
         return np.column_stack([theta_deg, z_mm])
     
     def _apply_spatial_filter(
@@ -739,22 +799,36 @@ class CylindricalFeatureMatcher:
         z_mm = points_cylindrical[:, 1]
         
         theta_rad = np.deg2rad(theta_deg)
-        zeta = np.arctan2(z_mm, R)
+        pose = self._unwrap_pose(camera_params)
+        if pose is not None:
+            cam_pos, roll, yaw, pitch = pose
+            X = R * np.cos(theta_rad)
+            Y = R * np.sin(theta_rad)
+            Z = cam_pos[2] + z_mm
+            pts = np.column_stack([X, Y, Z])
+            pix = self.transformer.world_to_pixel(
+                pts, cam_pos, roll, yaw, pitch, apply_distortion=True
+            )
+            u, v = pix[:, 0], pix[:, 1]
+        else:
+            if self._use_physical_z():
+                z_safe = np.maximum(z_mm, 1e-3)
+                zeta = np.arctan2(R, z_safe)
+            else:
+                zeta = np.arctan2(z_mm, R)
 
-        # カメラモデルに応じた正確な投影を使用
-        x_cam = np.sin(zeta) * np.cos(theta_rad)
-        y_cam = -np.sin(zeta) * np.sin(theta_rad)  # y軸反転（cam_to_img整合）
-        z_cam = np.cos(zeta)
-        u, v = self.transformer.camera.cam_to_img(x_cam, y_cam, z_cam)
+            x_cam = np.sin(zeta) * np.cos(theta_rad)
+            y_cam = -np.sin(zeta) * np.sin(theta_rad)
+            z_cam = np.cos(zeta)
+            u, v = self.transformer.camera.cam_to_img(x_cam, y_cam, z_cam)
 
-        # 順歪み補正（calibration有効時）
-        calibration = self.transformer.calibration
-        if calibration is not None:
-            dist_coeffs = self.transformer._get_dist_coeffs(calibration)
-            if not np.allclose(dist_coeffs, 0.0):
-                pts = np.column_stack([u, v])
-                pts_d = self.transformer.camera.distort_points(pts, dist_coeffs)
-                u, v = pts_d[:, 0], pts_d[:, 1]
+            calibration = self.transformer.calibration
+            if calibration is not None:
+                dist_coeffs = self.transformer._get_dist_coeffs(calibration)
+                if not np.allclose(dist_coeffs, 0.0):
+                    pts = np.column_stack([u, v])
+                    pts_d = self.transformer.camera.distort_points(pts, dist_coeffs)
+                    u, v = pts_d[:, 0], pts_d[:, 1]
         
         # 範囲内チェック（マスクとして返す）
         valid_mask = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
@@ -824,131 +898,91 @@ class CylindricalFeatureMatcher:
         
         return prev_frame[combined_mask], curr_frame[combined_mask]
     
-    def _to_cylindrical(
+    def _build_remap_maps(
         self,
-        frame: np.ndarray,
-        camera_params: Dict[str, Any]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """フレーム画像を円筒座標系に変換
-        
-        Args:
-            frame: 入力画像(BGR)
-            camera_params: カメラパラメータ辞書
-        
-        Returns:
-            cyl_image: 円筒座標系画像(BGR、(z_res, theta_res, 3))
-            theta_grid: theta座標2Dメッシュ(ラジアン、(z_res, theta_res))
-            z_grid: z座標2Dメッシュ(mm、(z_res, theta_res))
-        """
-        # 画像サイズ
-        img_h, img_w = frame.shape[:2]
-        
-        # カメラパラメータ取得
-        f = camera_params.get('f', 300.0)
-        center = camera_params.get('center', (img_w / 2.0, img_h / 2.0))
+        frame_shape: Tuple[int, ...],
+        camera_params: Dict[str, Any],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """円筒 (θ,Z) → 魚眼画素の remap。両フレームで同じ地図を使う。"""
+        img_h, img_w = frame_shape[:2]
+        center = camera_params.get("center", (img_w / 2.0, img_h / 2.0))
         center_x, center_y = center
-        
-        # 円筒座標グリッド生成
         theta_grid, z_grid, eta_grid, zeta_grid = self._create_cylindrical_grid(camera_params)
-        
-        # (η, ζ) → カメラ3D方向ベクトル → フレーム座標(u, v)
-        # カメラモデルに応じた正確な投影を使用
-        x_cam = np.sin(zeta_grid) * np.cos(eta_grid)
-        y_cam = -np.sin(zeta_grid) * np.sin(eta_grid)  # y軸反転（cam_to_img整合）
-        z_cam = np.cos(zeta_grid)
+        pose = self._unwrap_pose(camera_params)
+        invalid_behind = None
+        if pose is not None:
+            cam_pos, roll, yaw, pitch = pose
+            pipe_diameter = camera_params.get("pipe_diameter", 250.0)
+            radius = float(pipe_diameter) / 2.0
+            world = np.stack(
+                [
+                    radius * np.cos(theta_grid),
+                    radius * np.sin(theta_grid),
+                    cam_pos[2] + z_grid,
+                ],
+                axis=-1,
+            )
+            pix = self.transformer.world_to_pixel(
+                world.reshape(-1, 3),
+                cam_pos,
+                roll,
+                yaw,
+                pitch,
+                apply_distortion=True,
+            )
+            u = pix[:, 0].reshape(theta_grid.shape)
+            v = pix[:, 1].reshape(theta_grid.shape)
+            pts_cam = (world.reshape(-1, 3) - cam_pos) @ R_w2c(roll, pitch, yaw)
+            invalid_behind = pts_cam[:, 2].reshape(theta_grid.shape) <= 1e-6
+        else:
+            x_cam = np.sin(zeta_grid) * np.cos(eta_grid)
+            y_cam = -np.sin(zeta_grid) * np.sin(eta_grid)
+            z_cam = np.cos(zeta_grid)
+            camera = self.transformer.camera
+            u_flat, v_flat = camera.cam_to_img(
+                x_cam.ravel(), y_cam.ravel(), z_cam.ravel()
+            )
+            u = u_flat.reshape(zeta_grid.shape)
+            v = v_flat.reshape(zeta_grid.shape)
+            calibration = self.transformer.calibration
+            if calibration is not None:
+                dist_coeffs = self.transformer._get_dist_coeffs(calibration)
+                if not np.allclose(dist_coeffs, 0.0):
+                    pts_ideal = np.column_stack([u.ravel(), v.ravel()])
+                    pts_distorted = camera.distort_points(pts_ideal, dist_coeffs)
+                    u = pts_distorted[:, 0].reshape(zeta_grid.shape)
+                    v = pts_distorted[:, 1].reshape(zeta_grid.shape)
 
-        camera = self.transformer.camera
-        u_flat, v_flat = camera.cam_to_img(
-            x_cam.ravel(), y_cam.ravel(), z_cam.ravel()
-        )
-        u = u_flat.reshape(zeta_grid.shape)
-        v = v_flat.reshape(zeta_grid.shape)
-
-        # 順歪み補正（calibration有効時）
-        calibration = self.transformer.calibration
-        if calibration is not None:
-            dist_coeffs = self.transformer._get_dist_coeffs(calibration)
-            if not np.allclose(dist_coeffs, 0.0):
-                pts_ideal = np.column_stack([u.ravel(), v.ravel()])
-                pts_distorted = camera.distort_points(pts_ideal, dist_coeffs)
-                u = pts_distorted[:, 0].reshape(zeta_grid.shape)
-                v = pts_distorted[:, 1].reshape(zeta_grid.shape)
-
-        # 後方互換：ドーナツフィルタ用にrを計算
-        r = np.hypot(u - center_x, v - center_y)
-        
-        # デバッグ: 座標変換の範囲を出力
-        self.logger.debug(
-            f"座標変換範囲: "
-            f"zeta=[{zeta_grid.min():.3f}, {zeta_grid.max():.3f}] rad, "
-            f"r=[{r.min():.1f}, {r.max():.1f}] px, "
-            f"u=[{u.min():.1f}, {u.max():.1f}], "
-            f"v=[{v.min():.1f}, {v.max():.1f}]"
-        )
-        
-        # ドーナツ状エリアのフィルタリング
-        # (u, v)からの中心までの距離でフィルタリング
         dist_from_center = np.hypot(u - center_x, v - center_y)
-        
         max_radius = min(img_h, img_w) / 2.0
         inner_radius = max_radius * self.config.inner_radius_ratio
         outer_radius = max_radius * self.config.outer_radius_ratio
-        
-        # デバッグ: フィルタリング範囲を出力
-        self.logger.debug(
-            f"ドーナツ状フィルタ: "
-            f"max_radius={max_radius:.1f}px, "
-            f"inner={inner_radius:.1f}px, "
-            f"outer={outer_radius:.1f}px, "
-            f"dist_from_center=[{dist_from_center.min():.1f}, {dist_from_center.max():.1f}] px"
-        )
-        
-        # 無効マスク(dist < inner または dist > outer)
         invalid_mask = (dist_from_center < inner_radius) | (dist_from_center > outer_radius)
-        
-        # 境界チェック
         invalid_mask |= (u < 0) | (u >= img_w) | (v < 0) | (v >= img_h)
-        
-        # デバッグ: フィルタリング統計
-        n_total = invalid_mask.size
-        n_invalid = np.sum(invalid_mask)
-        n_valid = n_total - n_invalid
-        self.logger.debug(
-            f"フィルタリング統計: "
-            f"total={n_total}, valid={n_valid} ({100*n_valid/n_total:.1f}%), "
-            f"invalid={n_invalid} ({100*n_invalid/n_total:.1f}%)"
-        )
-        
-        # 無効領域を-1でマーク(cv2.remapで境界外扱い)
+        if invalid_behind is not None:
+            invalid_mask |= invalid_behind
         u = np.where(invalid_mask, -1, u)
         v = np.where(invalid_mask, -1, v)
-        
-        # cv2.remap用にfloat32に変換
-        map_u = u.astype(np.float32)
-        map_v = v.astype(np.float32)
-        
-        # リマッピング(補間: INTER_LINEAR)
+        return u.astype(np.float32), v.astype(np.float32), theta_grid, z_grid
+
+    def _to_cylindrical(
+        self,
+        frame: np.ndarray,
+        camera_params: Dict[str, Any],
+        maps: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """フレーム画像を円筒座標系に変換"""
+        if maps is None:
+            maps = self._build_remap_maps(frame.shape, camera_params)
+        map_u, map_v, theta_grid, z_grid = maps
         cyl_image = cv2.remap(
             frame,
             map_u,
             map_v,
             interpolation=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0)
+            borderValue=(0, 0, 0),
         )
-        
-        # デバッグ: 出力画像の統計
-        if len(cyl_image.shape) == 3:
-            gray_for_stats = cv2.cvtColor(cyl_image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray_for_stats = cyl_image
-        n_nonzero = np.count_nonzero(gray_for_stats)
-        self.logger.debug(
-            f"円筒座標画像統計: shape={cyl_image.shape}, "
-            f"nonzero_pixels={n_nonzero}/{gray_for_stats.size} ({100*n_nonzero/gray_for_stats.size:.1f}%), "
-            f"min={cyl_image.min()}, max={cyl_image.max()}, mean={cyl_image.mean():.2f}"
-        )
-        
         return cyl_image, theta_grid, z_grid
 
 
@@ -1096,7 +1130,10 @@ class CylindricalFeatureMatcher:
         z_resolution = self.config.z_resolution
         theta_resolution = self.config.theta_resolution
 
-        dz_mm = shift_y * (z_range_mm / z_resolution)
+        if self._use_physical_z():
+            dz_mm = shift_y * ((self._z_far_mm - self._z_near_mm) / max(z_resolution, 1))
+        else:
+            dz_mm = shift_y * (z_range_mm / z_resolution)
         droll_deg = shift_x * (360.0 / theta_resolution)
 
         self.logger.debug(
@@ -1296,27 +1333,34 @@ class CylindricalFeatureMatcher:
         pipe_diameter = camera_params.get('pipe_diameter', 250.0)
         R = pipe_diameter / 2.0
 
-        # R不変グリッド: z_rangeをR/R_defaultでスケーリング
-        # これにより同一ピクセル行が同一ζ角に対応し、円筒座標画像がR不変になる
-        # R_default = pipe_diameter_default / 2 = 250 / 2 = 125
+        theta_1d = np.linspace(0, 2 * np.pi, self.config.theta_resolution, endpoint=False)
+
+        if self._use_physical_z():
+            z_near, z_far = self._physical_z_limits(camera_params, R)
+            self._z_near_mm = z_near
+            self._z_far_mm = z_far
+            self._effective_z_range_mm = z_far - z_near
+            z_1d = np.linspace(z_far, z_near, self.config.z_resolution, endpoint=True)
+            theta_grid, z_grid = np.meshgrid(theta_1d, z_1d, indexing='xy')
+            eta_grid = theta_grid.copy()
+            z_safe = np.maximum(z_grid, 1e-3)
+            zeta_grid = np.arctan2(R, z_safe)
+            self.logger.debug(
+                f"円筒座標グリッド生成(physical): theta_res={self.config.theta_resolution}, "
+                f"z_res={self.config.z_resolution}, R={R:.1f}mm, "
+                f"Z=[{z_near:.1f}, {z_far:.1f}]mm"
+            )
+            return theta_grid, z_grid, eta_grid, zeta_grid
+
         R_DEFAULT = 125.0
         effective_z_range = self.config.z_range_mm * R / R_DEFAULT
         self._effective_z_range_mm = effective_z_range
 
-        # theta方向の1D配列(0〜2π、周期的)
-        theta_1d = np.linspace(0, 2 * np.pi, self.config.theta_resolution, endpoint=False)
-
-        # z方向の1D配列(0〜effective_z_range、非周期)
         z_1d = np.linspace(0, effective_z_range, self.config.z_resolution, endpoint=True)
 
-        # 2Dメッシュグリッド生成(theta が列方向、z が行方向)
         theta_grid, z_grid = np.meshgrid(theta_1d, z_1d, indexing='xy')
 
-        # カメラ座標系の方向角を計算
-        # カメラ姿勢が x=y=yaw=pitch=0 のため、η = θ
         eta_grid = theta_grid.copy()
-
-        # ζ = arctan2(z, R) — z_rangeとRが同比例でスケールするためζはR不変
         zeta_grid = np.arctan2(z_grid, R)
 
         self.logger.debug(
@@ -1324,8 +1368,31 @@ class CylindricalFeatureMatcher:
             f"z_res={self.config.z_resolution}, R={R:.1f}mm, "
             f"z_range={effective_z_range:.1f}mm (config={self.config.z_range_mm:.1f}mm)"
         )
-        
+
         return theta_grid, z_grid, eta_grid, zeta_grid
+
+    def _physical_z_limits(
+        self,
+        camera_params: Dict[str, Any],
+        pipe_radius: float,
+    ) -> Tuple[float, float]:
+        """inner/outer_radius_ratio を管軸距離 Z の遠/近に読み替える。"""
+        img_h = camera_params.get('image_height', 1080)
+        img_w = camera_params.get('image_width', 1920)
+        f = float(camera_params.get('f', 300.0))
+        max_radius = min(img_h, img_w) / 2.0
+        inner_r = max(1.0, max_radius * float(self.config.inner_radius_ratio))
+        outer_r = max(inner_r + 1.0, max_radius * float(self.config.outer_radius_ratio))
+        f = max(f, 1.0)
+        zeta_near = float(np.clip(outer_r / f, 1e-3, np.pi / 2.0 - 1e-3))
+        zeta_far = float(np.clip(inner_r / f, 1e-3, np.pi / 2.0 - 1e-3))
+        z_near = float(pipe_radius / np.tan(zeta_near))
+        z_far = float(pipe_radius / np.tan(zeta_far))
+        if z_far <= z_near:
+            z_far = z_near * 4.0
+        z_near = float(np.clip(z_near, 10.0, 5000.0))
+        z_far = float(np.clip(z_far, z_near + 20.0, 10000.0))
+        return z_near, z_far
 
 
 
@@ -1407,6 +1474,172 @@ class CylindricalFeatureMatcher:
 # ============================================================================
 # フィルタリング関数
 # ============================================================================
+
+def _wrap_deg(delta: np.ndarray) -> np.ndarray:
+    """角度差を (-180, 180] に折り返す。"""
+    return (np.asarray(delta, dtype=float) + 180.0) % 360.0 - 180.0
+
+
+def _iqr_keep(values: np.ndarray, multiplier: float, min_points: int, floor: float) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    n = values.size
+    if n < min_points:
+        return np.ones(n, dtype=bool)
+    q1, q3 = np.percentile(values, [25.0, 75.0])
+    iqr = max(float(q3 - q1), float(floor))
+    lo, hi = q1 - multiplier * iqr, q3 + multiplier * iqr
+    return (values >= lo) & (values <= hi)
+
+
+def fit_dc_first_harmonic(
+    theta_deg: np.ndarray,
+    values: np.ndarray,
+) -> Dict[str, Any]:
+    """値 ≈ dc + a cosθ + b sinθ。yaw/pitch は 1 次、roll は DC。"""
+    theta = np.deg2rad(np.asarray(theta_deg, dtype=float))
+    y = np.asarray(values, dtype=float).reshape(-1)
+    n = int(y.size)
+    if n < 3:
+        dc = float(np.median(y)) if n else 0.0
+        return {
+            "dc": dc,
+            "cos": 0.0,
+            "sin": 0.0,
+            "residual": y - dc,
+            "model": np.full(n, dc, dtype=float),
+        }
+    A = np.column_stack([np.ones(n), np.cos(theta), np.sin(theta)])
+    coeff, *_ = np.linalg.lstsq(A, y, rcond=None)
+    model = A @ coeff
+    return {
+        "dc": float(coeff[0]),
+        "cos": float(coeff[1]),
+        "sin": float(coeff[2]),
+        "residual": y - model,
+        "model": model,
+    }
+
+
+def filter_physical_motion_vectors(
+    prev_cyl: np.ndarray,
+    curr_cyl: np.ndarray,
+    *,
+    iqr_multiplier: float = 1.5,
+    min_points: int = 4,
+    max_dz_mm: float = 20.0,
+    max_dtheta_deg: float = 5.0,
+    reject_reverse: bool = True,
+    reverse_tol_mm: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """物理 (θ, Z) 上で、DC+1次の残差に IQR する。
+
+    真マッチの Δθ は一様とは限らない（yaw/pitch で 1 次）。
+    点ごとの後退除外は片側の ΔZ 符号を落とすので使わず、DC_ΔZ だけ見る。
+    """
+    if prev_cyl is None or curr_cyl is None or len(prev_cyl) == 0:
+        return prev_cyl, curr_cyl
+    prev_cyl = np.asarray(prev_cyl, dtype=float)
+    curr_cyl = np.asarray(curr_cyl, dtype=float)
+    dtheta = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
+    dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
+    keep = (np.abs(dZ) <= float(max_dz_mm)) & (np.abs(dtheta) <= float(max_dtheta_deg))
+    prev_cyl, curr_cyl = prev_cyl[keep], curr_cyl[keep]
+    if len(prev_cyl) < min_points:
+        return prev_cyl, curr_cyl
+    theta = prev_cyl[:, 0]
+    dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
+    dtheta = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
+    fit_z = fit_dc_first_harmonic(theta, dZ)
+    if reject_reverse and fit_z["dc"] > float(reverse_tol_mm):
+        return prev_cyl[:0], curr_cyl[:0]
+    z_keep = _iqr_keep(fit_z["residual"], iqr_multiplier, min_points, floor=0.2)
+    if int(np.sum(z_keep)) >= 2:
+        prev_cyl, curr_cyl = prev_cyl[z_keep], curr_cyl[z_keep]
+    if len(prev_cyl) < min_points:
+        return prev_cyl, curr_cyl
+    dtheta = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
+    fit_th = fit_dc_first_harmonic(prev_cyl[:, 0], dtheta)
+    th_keep = _iqr_keep(fit_th["residual"], iqr_multiplier, min_points, floor=0.2)
+    if int(np.sum(th_keep)) >= 2:
+        prev_cyl, curr_cyl = prev_cyl[th_keep], curr_cyl[th_keep]
+    return prev_cyl, curr_cyl
+
+
+def estimate_front_physical_option2(
+    prev_cyl: np.ndarray,
+    curr_cyl: np.ndarray,
+    pipe_radius_mm: float = 125.0,
+) -> Dict[str, Any]:
+    """管 (θ, Z) から dz とフレーム間 Δyaw/Δpitch。droll は 0。
+
+    ΔZ の DC が dz。1 次は dyaw/dpitch。Δθ の DC は roll に積まない。
+    """
+    prev_cyl = np.asarray(prev_cyl, dtype=float)
+    curr_cyl = np.asarray(curr_cyl, dtype=float)
+    n = int(len(prev_cyl))
+    fail = {
+        "dz": 0.0,
+        "droll": 0.0,
+        "droll_deg": 0.0,
+        "dyaw": 0.0,
+        "dpitch": 0.0,
+        "n_points": n,
+        "success": False,
+    }
+    if n < 3:
+        return fail
+    dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
+    dtheta_deg = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
+    fit_z = fit_dc_first_harmonic(prev_cyl[:, 0], dZ)
+    fit_th = fit_dc_first_harmonic(prev_cyl[:, 0], dtheta_deg)
+    theta = np.deg2rad(prev_cyl[:, 0])
+    Zs = np.maximum(prev_cyl[:, 1], 1e-3)
+    radius = max(float(pipe_radius_mm), 1e-3)
+    c = np.cos(theta)
+    s = np.sin(theta)
+    kZ = radius + (Zs * Zs) / radius
+    kth = Zs / radius
+    dth = np.deg2rad(dtheta_deg)
+    A = np.zeros((2 * n, 3), dtype=float)
+    b = np.zeros(2 * n, dtype=float)
+    A[:n, 0] = -1.0
+    A[:n, 1] = -kZ * c
+    A[:n, 2] = -kZ * s
+    b[:n] = dZ
+    A[n:, 1] = -kth * s * radius
+    A[n:, 2] = kth * c * radius
+    b[n:] = dth * radius
+    coeff, *_ = np.linalg.lstsq(A, b, rcond=None)
+    dz = float(coeff[0])
+    dyaw = float(coeff[1])
+    dpitch = float(coeff[2])
+    if not np.isfinite(dz):
+        return fail
+    return {
+        "dz": dz,
+        "droll": 0.0,
+        "droll_deg": 0.0,
+        "dyaw": dyaw,
+        "dpitch": dpitch,
+        "n_points": n,
+        "success": True,
+        "dZ_dc": float(fit_z["dc"]),
+        "dZ_std": float(np.std(fit_z["residual"])),
+        "dtheta_dc": float(fit_th["dc"]),
+        "dtheta_cos": float(fit_th["cos"]),
+        "dtheta_sin": float(fit_th["sin"]),
+        "dtheta_std": float(np.std(fit_th["residual"])),
+    }
+
+
+def estimate_dz_droll_from_physical(
+    prev_cyl: np.ndarray,
+    curr_cyl: np.ndarray,
+) -> Dict[str, Any]:
+    """後方互換。中身は案②（droll は常に 0）。"""
+    return estimate_front_physical_option2(prev_cyl, curr_cyl)
+
+
 def should_skip_static_frame(
     prev_points: np.ndarray,
     curr_points: np.ndarray,

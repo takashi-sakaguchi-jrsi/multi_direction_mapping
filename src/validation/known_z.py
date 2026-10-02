@@ -72,7 +72,7 @@ def load_generation_metadata(metadata_path: Union[str, Path]) -> Dict[str, Any]:
 
 
 def known_z_mm_from_metadata(meta: Dict[str, Any]) -> np.ndarray:
-    """OCR 代用値。ocr_z_mm（10mm遅れ）があればそれを使い、なければ真値 z。"""
+    """OCR 代用値。ocr_z_mm / z_ocr_mm があればそれを使い、なければ真値 z。"""
     z = ocr_z_from_metadata(meta, fallback_true_z=True)
     if z.size == 0:
         raise ValueError("OCR/z 列が空です")
@@ -92,12 +92,28 @@ def load_known_z_mm(metadata_path: Union[str, Path]) -> np.ndarray:
     return known_z_mm_from_metadata(load_generation_metadata(metadata_path))
 
 
+def is_generation_camera_metadata(meta: Dict[str, Any]) -> bool:
+    """仮想動画の生成 metadata か。製品 OCR 保存 JSON は距離列だけなので False。"""
+    if meta.get("lens_calibration_file"):
+        return True
+    if meta.get("f_px") or meta.get("fov_deg") or meta.get("camera_model"):
+        return True
+    if meta.get("width") and meta.get("height"):
+        return True
+    if meta.get("pipe_diameter_mm") or meta.get("radius_mm"):
+        return True
+    return False
+
+
 def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
     """生成時の fx / 画角 / 管径を Config に反映する。
 
     無歪み等距離で作った仮想動画は本番校正を外す。
     校正レンズで生成した動画は metadata の lens_calibration_file を残す。
+    OCR 保存 JSON（距離列のみ）ではカメラ設定を触らない。
     """
+    if not is_generation_camera_metadata(meta):
+        return
     calib_path = meta.get("lens_calibration_file")
     if calib_path:
         config.camera.lens_calibration_file = str(calib_path)

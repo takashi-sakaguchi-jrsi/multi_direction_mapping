@@ -1116,6 +1116,46 @@ class CameraEstimator:
                     'residual_mean': float('inf'), 'residual_std': float('inf'),
                     'n_points': n_points, 'success': False}
 
+    def estimate_dz_droll_physical(
+        self,
+        prev_points_cyl: np.ndarray,
+        curr_points_cyl: np.ndarray,
+        dz_bounds: Optional[Tuple[float, float]] = None,
+        pipe_radius_mm: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """管 (θ, Z) から dz と Δyaw/Δpitch。droll は 0。"""
+        from src.feature_matching_cylindrical import estimate_front_physical_option2
+
+        radius = float(
+            pipe_radius_mm
+            if pipe_radius_mm is not None
+            else getattr(self.transformer, "pipe_radius", 125.0)
+        )
+        result = estimate_front_physical_option2(
+            prev_points_cyl, curr_points_cyl, pipe_radius_mm=radius
+        )
+        if not result.get("success"):
+            return result
+        dz = float(result["dz"])
+        if dz_bounds is not None:
+            dz = float(np.clip(dz, dz_bounds[0], dz_bounds[1]))
+            result["dz"] = dz
+        result["droll"] = 0.0
+        result["droll_deg"] = 0.0
+        cyl = getattr(getattr(self, "cylindrical_matcher", None), "config", None)
+        max_yaw = np.radians(float(getattr(cyl, "physical_max_dyaw_deg", 2.0)))
+        max_pitch = np.radians(float(getattr(cyl, "physical_max_dpitch_deg", 2.0)))
+        dyaw = float(np.clip(result.get("dyaw", 0.0), -max_yaw, max_yaw))
+        dpitch = float(np.clip(result.get("dpitch", 0.0), -max_pitch, max_pitch))
+        result["dyaw"] = dyaw
+        result["dpitch"] = dpitch
+        self.logger.info(
+            f"物理 (θ,Z) 局所: dz={dz:.3f}mm, "
+            f"dyaw={np.degrees(dyaw):.4f}°, dpitch={np.degrees(dpitch):.4f}°, "
+            f"droll=0, N={result['n_points']}"
+        )
+        return result
+
     def estimate_motion_with_constraints(
         self,
         prev_points: np.ndarray,

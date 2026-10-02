@@ -7,6 +7,7 @@ from src.validation.ocr_simulation import (
     DEFAULT_Z_STEP_MM,
     OCR_STEP_MM,
     ocr_metadata_fields,
+    ocr_z_from_metadata,
     simulate_ocr_distance_mm,
 )
 
@@ -49,3 +50,15 @@ def test_ocr_metadata_fields_include_true_and_ocr():
     assert meta["z_values_mm"][0] == pytest.approx(10.0)
     assert meta["ocr_z_mm"][0] == pytest.approx(10.0)
     assert all(v % 10 == 0 for v in meta["ocr_z_mm"])
+
+
+def test_ocr_z_from_product_save_key():
+    z = ocr_z_from_metadata({"z_ocr_mm": [0.0, 10.0, 20.0], "n": 3})
+    np.testing.assert_allclose(z, [0.0, 10.0, 20.0])
+
+
+def test_ocr_z_prefers_generation_key_over_product_save():
+    z = ocr_z_from_metadata(
+        {"ocr_z_mm": [10.0, 10.0], "z_ocr_mm": [99.0, 99.0], "z_values_mm": [1.0, 2.0]}
+    )
+    np.testing.assert_allclose(z, [10.0, 10.0])
