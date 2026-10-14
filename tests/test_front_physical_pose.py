@@ -5,6 +5,7 @@ import pytest
 
 from src.colormap_correction import (
     apply_front_attitude_trend_warp,
+    blend_orientation_toward_vp,
     front_attitude_trend_dtheta_rad,
 )
 from src.feature_matching_cylindrical import (
@@ -58,6 +59,17 @@ def test_iqr_keeps_first_harmonic_dz():
     assert float(np.max(np.abs(fcurr[:, 1] - fprev[:, 1]))) < 10.0
 
 
+def test_blend_orientation_moves_toward_vp():
+    yaw, pitch = np.radians(12.89), np.radians(-4.57)
+    yaw_vp, pitch_vp = np.radians(8.0), np.radians(-2.0)
+    yaw2, pitch2 = blend_orientation_toward_vp(yaw, pitch, yaw_vp, pitch_vp, 0.2)
+    assert abs(yaw2 - yaw_vp) < abs(yaw - yaw_vp)
+    assert abs(pitch2 - pitch_vp) < abs(pitch - pitch_vp)
+    yaw0, pitch0 = blend_orientation_toward_vp(yaw, pitch, yaw_vp, pitch_vp, 0.0)
+    assert yaw0 == pytest.approx(yaw)
+    assert pitch0 == pytest.approx(pitch)
+
+
 def test_attitude_trend_undoes_slow_yaw_ramp():
     z = np.linspace(0.0, 4000.0, 200)
     yaw_vp = np.full(z.shape, np.radians(12.89))
@@ -67,8 +79,25 @@ def test_attitude_trend_undoes_slow_yaw_ramp():
     dth = front_attitude_trend_dtheta_rad(
         z, yaw, pitch, yaw_vp, pitch_vp, window_mm=800.0
     )
-    assert float(np.max(np.abs(dth))) > 0.02
+    assert float(np.nanmax(np.abs(dth))) > 0.02
     assert abs(dth[-1]) > abs(dth[0])
+
+
+def test_attitude_trend_skips_missing_vp_without_zero_spike():
+    z = np.linspace(0.0, 1000.0, 51)
+    yaw_vp = np.full(z.shape, np.radians(12.89))
+    pitch_vp = np.full(z.shape, np.radians(-4.57))
+    yaw = yaw_vp + np.radians(3.0)
+    pitch = pitch_vp.copy()
+    yaw_vp[20:24] = np.nan
+    dth = front_attitude_trend_dtheta_rad(
+        z, yaw, pitch, yaw_vp, pitch_vp, window_mm=200.0
+    )
+    assert np.all(np.isnan(dth[20:24]))
+    good = dth[np.isfinite(dth)]
+    assert good.size >= 20
+    assert float(np.min(np.abs(good))) > 0.01
+    assert float(np.max(np.abs(good)) - np.min(np.abs(good))) < 0.05
 
 
 def test_attitude_warp_shifts_horizontal_band():

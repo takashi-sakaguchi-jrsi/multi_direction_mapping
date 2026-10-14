@@ -194,6 +194,9 @@ class FrameAnalyzer:
             ocr_tesseract_config=self.config.ocr.tesseract_config,
             ocr_preprocessing_enabled=self.config.ocr.preprocessing_enabled,
             max_distance_increment_mm=float(self.config.ocr.max_distance_increment_mm),
+            enforce_ocr_increment_upper_bound=bool(
+                self.config.ocr.enforce_ocr_increment_upper_bound
+            ),
             known_z_mm=known_z_mm,
             progress_callback=_ocr_progress if progress_callback is not None else None,
         )

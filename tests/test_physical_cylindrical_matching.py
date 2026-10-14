@@ -8,6 +8,7 @@ from src.coordinate_transform import CoordinateTransformer, FisheyeCamera
 from src.feature_matching_cylindrical import (
     CylindricalFeatureMatcher,
     CylindricalMatchingConfig,
+    clip_front_physical_estimate,
     estimate_front_physical_option2,
     filter_physical_motion_vectors,
 )
@@ -66,6 +67,136 @@ def test_yaw_like_harmonic_does_not_go_to_droll_or_dz():
     assert abs(est["dtheta_cos"]) > 0.5
 
 
+def test_reverse_dc_does_not_drop_all_points():
+    theta = np.linspace(0.0, 360.0, 24, endpoint=False)
+    z = np.full(theta.shape, 140.0)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta, z + 2.0])
+    filt_p, filt_c = filter_physical_motion_vectors(prev, curr)
+    assert len(filt_p) == len(prev)
+    assert len(filt_c) == len(curr)
+
+
+def test_small_harmonic_dtheta_is_kept():
+    theta = np.linspace(0.0, 360.0, 36, endpoint=False)
+    z = np.full(theta.shape, 150.0)
+    dth = 4.0 * np.cos(np.deg2rad(theta))
+    dZ = -4.0 + 2.0 * np.sin(np.deg2rad(theta))
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta + dth, z + dZ])
+    filt_p, filt_c = filter_physical_motion_vectors(prev, curr)
+    assert len(filt_p) == len(prev)
+
+
+def test_implausible_dtheta_is_dropped_before_iqr():
+    theta = np.linspace(0.0, 360.0, 36, endpoint=False)
+    z = np.full(theta.shape, 150.0)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta, z - 4.0])
+    curr[0, 0] += 25.0
+    filt_p, filt_c = filter_physical_motion_vectors(prev, curr)
+    assert len(filt_p) == len(prev) - 1
+
+
+def test_implausible_dz_is_dropped_before_iqr():
+    theta = np.linspace(0.0, 360.0, 36, endpoint=False)
+    z = np.full(theta.shape, 150.0)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta, z - 4.0])
+    curr[0, 1] -= 30.0
+    filt_p, filt_c = filter_physical_motion_vectors(prev, curr)
+    assert len(filt_p) == len(prev) - 1
+
+
+def test_clip_physical_estimate_rejects_beyond_limits():
+    over_dz = clip_front_physical_estimate(
+        {"success": True, "dz": 50.0, "dyaw": 0.0, "dpitch": 0.0, "n_points": 20},
+        max_dz_mm=20.0,
+    )
+    assert over_dz["success"] is False
+    assert over_dz["failure_reason"] == "dz_exceeded_clip"
+
+    over_yaw = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": np.radians(10.0), "dpitch": 0.0, "n_points": 20},
+        max_dyaw_deg=2.0,
+        max_dpitch_deg=2.0,
+    )
+    assert over_yaw["success"] is False
+    assert over_yaw["failure_reason"] == "attitude_exceeded_clip"
+
+    reverse = clip_front_physical_estimate(
+        {"success": True, "dz": -3.0, "dyaw": 0.0, "dpitch": 0.0, "n_points": 20},
+        reject_reverse=True,
+        reverse_tol_mm=0.5,
+    )
+    assert reverse["success"] is False
+    assert reverse["failure_reason"] == "reverse_travel"
+
+    few = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": 0.0, "dpitch": 0.0, "n_points": 3},
+        min_points=4,
+    )
+    assert few["success"] is False
+    assert few["failure_reason"] == "too_few_points"
+
+    ok = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": np.radians(0.4), "dpitch": np.radians(-0.2), "n_points": 20},
+        max_dz_mm=20.0,
+        max_dyaw_deg=2.0,
+        max_dpitch_deg=2.0,
+        reject_reverse=True,
+        reverse_tol_mm=0.5,
+    )
+    assert ok["success"] is True
+    assert ok["dz"] == pytest.approx(4.0)
+    assert np.degrees(ok["dyaw"]) == pytest.approx(0.4)
+
+    small_reverse = clip_front_physical_estimate(
+        {"success": True, "dz": -0.3, "dyaw": 0.0, "dpitch": 0.0, "n_points": 20},
+        reject_reverse=True,
+        reverse_tol_mm=0.5,
+    )
+    assert small_reverse["success"] is True
+    assert small_reverse["dz"] == pytest.approx(-0.3)
+
+
+def test_clip_suppresses_large_attitude_keeps_dz():
+    low_n = clip_front_physical_estimate(
+        {"success": True, "dz": 5.0, "dyaw": np.radians(1.5), "dpitch": np.radians(-1.6), "n_points": 9},
+        max_dyaw_deg=2.0,
+        max_dpitch_deg=2.0,
+        min_points_for_attitude=20,
+        untrusted_attitude_deg=0.8,
+        max_applied_attitude_deg=1.2,
+    )
+    assert low_n["success"] is True
+    assert low_n["dz"] == pytest.approx(5.0)
+    assert low_n["dyaw"] == pytest.approx(0.0)
+    assert low_n["dpitch"] == pytest.approx(0.0)
+    assert low_n["attitude_suppressed"] is True
+    assert low_n["attitude_suppress_reason"] == "attitude_too_large"
+
+    low_n_mid = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": np.radians(0.95), "dpitch": 0.0, "n_points": 12},
+        min_points_for_attitude=20,
+        untrusted_attitude_deg=0.8,
+        max_applied_attitude_deg=1.2,
+    )
+    assert low_n_mid["success"] is True
+    assert low_n_mid["dyaw"] == pytest.approx(0.0)
+    assert low_n_mid["attitude_suppress_reason"] == "low_n_large_attitude"
+
+    tiny = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": np.radians(0.3), "dpitch": np.radians(-0.2), "n_points": 9},
+        min_points_for_attitude=20,
+        untrusted_attitude_deg=0.8,
+        max_applied_attitude_deg=1.2,
+    )
+    assert tiny["success"] is True
+    assert tiny.get("attitude_suppressed") is False
+    assert np.degrees(tiny["dyaw"]) == pytest.approx(0.3)
+
+
 def test_harmonic_residual_iqr_drops_false_match():
     theta = np.linspace(0.0, 360.0, 20, endpoint=False)
     z = np.full(theta.shape, 140.0)
@@ -74,7 +205,7 @@ def test_harmonic_residual_iqr_drops_false_match():
     curr[0, 0] += 40.0
     curr[0, 1] -= 30.0
     filt_p, filt_c = filter_physical_motion_vectors(
-        prev, curr, min_points=4, max_dtheta_deg=50.0, max_dz_mm=40.0
+        prev, curr, min_points=4
     )
     assert len(filt_p) < len(prev)
     assert len(filt_p) >= 8

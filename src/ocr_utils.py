@@ -65,8 +65,8 @@ class OCRConfig:
         threshold: int = 100,
         psm_mode: int = 6,
         retry_thresholds: Optional[List[int]] = None,
-        distance_pattern_decimal: str = r"(\d+\.\d{1,2})m",
-        distance_pattern_integer: str = r"(\d{3,5})m",
+        distance_pattern_decimal: str = r"(\d+\.\d{1,2})m?",
+        distance_pattern_integer: str = r"(\d{3,5})m?",
         preprocessing_enabled: bool = False,
         preprocessing_method: str = "enhanced"
     ):
@@ -263,9 +263,14 @@ def _extract_with_threshold(
     text = pytesseract.image_to_string(thresh, config=config)
 
     # 正規化（スペース除去、小文字化）
-    text_normalized = text.replace(" ", "").lower()
+    text_normalized = "".join(text.split()).lower()
 
     return text_normalized
+
+
+def _normalize_ocr_text(text: str) -> str:
+    """空白・改行を除き小文字にする。"""
+    return "".join((text or "").split()).lower()
 
 
 def _parse_distance_text(
@@ -274,47 +279,50 @@ def _parse_distance_text(
     pattern_integer: str
 ) -> float:
     """OCRテキストから距離を抽出・解析
-    
-    Args:
-        text: OCRで読み取られたテキスト
-        pattern_decimal: 小数点付きパターン（例: "4.10m"）
-        pattern_integer: 整数パターン（例: "410m"）
-        
-    Returns:
-        距離（mm単位）
-        
-    Raises:
-        OCRTextNotFoundError: 距離が検出できなかった場合
+
+    表示に単位 m が無い場合や、末尾の '.' が残る誤読にも対応する。
     """
-    # パターン1: 小数点あり（例: "4.10m", "12.34m"）
-    match_decimal = re.search(pattern_decimal, text)
-    if match_decimal:
-        distance_m = float(match_decimal.group(1))
-        logger.debug(f"Decimal distance found: {distance_m}m")
-        return distance_m * 1000  # mm変換
-    
-    # パターン2: ピリオド欠落（3〜5桁、例: "410m" → "4.10m"）
-    match_integer = re.search(pattern_integer, text)
-    if match_integer:
-        raw_digits = match_integer.group(1)
-        if len(raw_digits) >= 3:
-            # 下2桁を小数部として補完
-            distance_str = raw_digits[:-2] + "." + raw_digits[-2:]
-            try:
-                distance_m = float(distance_str)
-                logger.debug(
-                    f"Integer distance found and converted: "
-                    f"{raw_digits}m → {distance_m}m"
-                )
-                return distance_m * 1000  # mm変換
-            except ValueError as e:
-                logger.error(
-                    f"Failed to convert fallback format: "
-                    f"{raw_digits} → {distance_str}"
-                )
-                raise OCRTextNotFoundError(text) from e
-    
-    # どちらのパターンにも一致しない
+    raw = _normalize_ocr_text(text)
+    stripped = raw.rstrip(".")
+    candidates = []
+    for item in (raw, stripped):
+        if item and item not in candidates:
+            candidates.append(item)
+    if stripped and "m" not in stripped:
+        candidates.append(stripped + "m")
+
+    for candidate in candidates:
+        match_decimal = re.search(pattern_decimal, candidate)
+        if match_decimal:
+            distance_m = float(match_decimal.group(1))
+            logger.debug(f"Decimal distance found: {distance_m}m")
+            return distance_m * 1000
+
+        match_integer = re.search(pattern_integer, candidate)
+        if match_integer:
+            raw_digits = match_integer.group(1)
+            if len(raw_digits) >= 3:
+                distance_str = raw_digits[:-2] + "." + raw_digits[-2:]
+                try:
+                    distance_m = float(distance_str)
+                    logger.debug(
+                        f"Integer distance found and converted: "
+                        f"{raw_digits}m → {distance_m}m"
+                    )
+                    return distance_m * 1000
+                except ValueError as e:
+                    logger.error(
+                        f"Failed to convert fallback format: "
+                        f"{raw_digits} → {distance_str}"
+                    )
+                    raise OCRTextNotFoundError(text) from e
+
+    match_bare = re.search(r"(\d+\.\d{1,2})", raw)
+    if match_bare:
+        distance_m = float(match_bare.group(1))
+        logger.debug(f"Unitless decimal distance found: {distance_m}m")
+        return distance_m * 1000
+
     raise OCRTextNotFoundError(text)
 
 
@@ -470,7 +478,8 @@ def extract_distance_from_frame(
     roi_ratio: Tuple[float, float, float, float],
     config: Optional[OCRConfig] = None,
     expected_range_mm: Optional[Tuple[float, float]] = None,
-    preferred_threshold: Optional[int] = None
+    preferred_threshold: Optional[int] = None,
+    log_failures: bool = True,
 ) -> Tuple[float, Optional[int]]:
     """フレーム画像から距離表示を読み取る（検証リトライ対応）
 
@@ -491,7 +500,8 @@ def extract_distance_from_frame(
         frame: 入力フレーム画像（OpenCVで取得したBGR形式）
         roi_ratio: ROI領域の割合 (top, bottom, left, right), 各値は0.0〜1.0
         config: OCR設定パラメータ（Noneの場合はデフォルト設定を使用）
-        expected_range_mm: 期待距離範囲 (min_mm, max_mm)（Noneの場合は範囲チェックなし）
+        expected_range_mm: 期待距離範囲 (min_mm, max_mm)。max が inf なら下限のみ。
+            None の場合は範囲チェックなし。
         preferred_threshold: 前回成功した閾値（優先的に試行）
 
     Returns:
@@ -506,7 +516,7 @@ def extract_distance_from_frame(
         >>> frame = cv2.imread("test.jpg")
         >>> distance_mm, thresh = extract_distance_from_frame(
         ...     frame,
-        ...     roi_ratio=(0.0, 0.05, 0.0, 0.2)
+        ...     roi_ratio=(0.0, 0.12, 0.0, 0.32)
         ... )
         >>> print(f"Distance: {distance_mm}mm (threshold={thresh})")
     """
@@ -559,10 +569,12 @@ def extract_distance_from_frame(
                 first_parsed_result = distance_mm
                 first_parsed_threshold = threshold
 
-            # 範囲チェック
+            # 範囲チェック（max が非有限ならプラス側上限なし）
             if expected_range_mm is not None:
                 min_mm, max_mm = expected_range_mm
-                if not (min_mm <= distance_mm <= max_mm):
+                too_low = distance_mm < min_mm
+                too_high = np.isfinite(max_mm) and distance_mm > max_mm
+                if too_low or too_high:
                     logger.debug(
                         f"OCR result {distance_mm}mm outside expected range "
                         f"[{min_mm:.0f}, {max_mm:.0f}]mm (threshold={threshold}), "
@@ -578,7 +590,8 @@ def extract_distance_from_frame(
 
         except OCRTextNotFoundError as e:
             last_error = e
-            logger.warning(
+            log_fn = logger.warning if log_failures else logger.debug
+            log_fn(
                 f"OCR attempt {attempt} failed with threshold={threshold}: "
                 f"text='{e.ocr_text}'"
             )
@@ -589,14 +602,16 @@ def extract_distance_from_frame(
         # 解析はできたが全て範囲外 → 読み取り失敗
         logger.warning(
             f"All OCR results out of expected range "
-            f"[{expected_range_mm[0]:.0f}, {expected_range_mm[1]:.0f}]mm. "
+            f"[{expected_range_mm[0]:.0f}, "
+            f"{'inf' if not np.isfinite(expected_range_mm[1]) else f'{expected_range_mm[1]:.0f}'}]mm. "
             f"First parsed: {first_parsed_result}mm (threshold={first_parsed_threshold})"
         )
         raise OCRTextNotFoundError(
             f"out_of_range:{first_parsed_result}mm"
         )
 
-    logger.error(
+    log_fn = logger.error if log_failures else logger.debug
+    log_fn(
         f"All OCR attempts failed. Last error: {last_error}"
     )
     if last_error:
@@ -642,7 +657,7 @@ def correct_camera_position_single_frame(
         
     Examples:
         >>> z_star, z2 = correct_camera_position_single_frame(
-        ...     frame, z1=4150.0, roi_ratio=(0, 0.05, 0, 0.2),
+        ...     frame, z1=4150.0, roi_ratio=(0, 0.12, 0, 0.32),
         ...     z_prev_corrected=4100.0, prev_z2=4100.0
         ... )
     """
@@ -705,7 +720,7 @@ def collect_ocr_distances(
     Args:
         frames: 全フレーム画像のリスト（BGR画像）
         roi_ratio: ROI領域比率 [top, bottom, left, right]
-            Noneの場合はデフォルト値 (0.0, 0.05, 0.0, 0.2) を使用
+            Noneの場合はデフォルト値 (0.0, 0.12, 0.0, 0.32) を使用
         tesseract_config: Tesseract設定オブジェクト
             Noneの場合はデフォルト設定を使用
     
@@ -732,7 +747,7 @@ def collect_ocr_distances(
         - ログ出力: 成功率、平均距離、距離範囲
     """
     if roi_ratio is None:
-        roi_ratio = (0.0, 0.05, 0.0, 0.2)
+        roi_ratio = (0.0, 0.12, 0.0, 0.32)
     
     if tesseract_config is None:
         tesseract_config = OCRConfig()

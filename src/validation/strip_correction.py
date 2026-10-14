@@ -29,6 +29,105 @@ class StripCorrectionResult:
     pitch_dtheta_rad: Optional[np.ndarray] = None
 
 
+def dz_from_z_est(z_est_mm: np.ndarray) -> np.ndarray:
+    """フレーム間の推定移動量 dz[i] = z[i] - z[i-1]。先頭は 0。"""
+    z = np.asarray(z_est_mm, dtype=float).reshape(-1)
+    dz = np.zeros(z.size, dtype=float)
+    if z.size >= 2:
+        d = np.diff(z)
+        d[~np.isfinite(d)] = 0.0
+        dz[1:] = d
+    return dz
+
+
+def dz_from_motion_records(records) -> Optional[np.ndarray]:
+    """解析レコードの motion_final[2]（フレーム間 dz）を返す。"""
+    if not records:
+        return None
+    dz = np.zeros(len(records), dtype=float)
+    ok = False
+    for i, rec in enumerate(records):
+        mf = np.asarray(getattr(rec, "motion_final", None), dtype=float).reshape(-1)
+        if mf.size >= 3 and np.isfinite(mf[2]):
+            dz[i] = float(mf[2])
+            ok = True
+    return dz if ok else None
+
+
+def moving_segment_bounds(
+    dz_mm: np.ndarray,
+    threshold_mm: float = 1.0,
+    min_run: int = 3,
+) -> Tuple[int, int]:
+    """距離補正に使うフレーム範囲 [start, end)。
+
+    |dz| が threshold を超える連続区間のうち、先頭の停止（開始〜動き出す直前）
+    と末尾の停止（最終停止〜終了）を除く。十分な連続移動が無いときは全範囲。
+    """
+    dz = np.asarray(dz_mm, dtype=float).reshape(-1)
+    n = int(dz.size)
+    if n <= 0:
+        return 0, 0
+    moving = np.isfinite(dz) & (np.abs(dz) > float(threshold_mm))
+
+    def _run_mask(run_len: int) -> np.ndarray:
+        mask = np.zeros(n, dtype=bool)
+        run = 0
+        need = max(int(run_len), 1)
+        for i in range(n):
+            if moving[i]:
+                run += 1
+                if run >= need:
+                    mask[i - need + 1:i + 1] = True
+            else:
+                run = 0
+        return mask
+
+    mask = _run_mask(min_run)
+    if not np.any(mask) and int(min_run) > 1:
+        mask = _run_mask(1)
+    if not np.any(mask):
+        return 0, n
+    idx = np.flatnonzero(mask)
+    return int(idx[0]), int(idx[-1]) + 1
+
+
+def select_z_correction_series(
+    z_est_mm: np.ndarray,
+    z_ocr_mm: np.ndarray,
+    dz_mm: Optional[np.ndarray] = None,
+    *,
+    exclude_stationary_ends: bool = True,
+    threshold_mm: float = 1.0,
+    min_run: int = 3,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """距離補正用の (z_est, z_ocr) を停止先頭・末尾を除いて返す。"""
+    z_est = np.asarray(z_est_mm, dtype=float).reshape(-1)
+    z_ocr = np.asarray(z_ocr_mm, dtype=float).reshape(-1)
+    n = min(int(z_est.size), int(z_ocr.size))
+    z_est, z_ocr = z_est[:n], z_ocr[:n]
+    if (not exclude_stationary_ends) or n < 2:
+        return z_est, z_ocr, 0, n
+    if dz_mm is None:
+        dz = dz_from_z_est(z_est)
+    else:
+        dz = np.asarray(dz_mm, dtype=float).reshape(-1)
+        if dz.size >= n:
+            dz = dz[:n]
+        else:
+            pad = np.zeros(n, dtype=float)
+            pad[: dz.size] = dz
+            dz = pad
+    i0, i1 = moving_segment_bounds(
+        dz, threshold_mm=float(threshold_mm), min_run=int(min_run)
+    )
+    i0 = max(0, min(int(i0), n))
+    i1 = max(i0, min(int(i1), n))
+    if (i1 - i0) < 2:
+        return z_est, z_ocr, 0, n
+    return z_est[i0:i1], z_ocr[i0:i1], i0, i1
+
+
 def correct_strip(
     rgb: np.ndarray,
     filled: np.ndarray,
@@ -42,10 +141,18 @@ def correct_strip(
     theta_max: float = 2.0 * np.pi,
     control_spacing_mm: float = 50.0,
     warp_theta: bool = True,
+    dz_mm: Optional[np.ndarray] = None,
+    exclude_stationary_ends: bool = True,
+    stationary_dz_threshold_mm: float = 1.0,
+    stationary_min_run_frames: int = 3,
 ) -> StripCorrectionResult:
     """z を OCR に合わせる。warp_theta ならエッジ中心へ一様シフトする。"""
     warped_z, z_min_out, z_max_out, z_ctrl, msg_z = warp_z_to_ocr(
-        rgb, filled, z_min, pixels_per_mm, z_est_mm, z_ocr_mm, control_spacing_mm
+        rgb, filled, z_min, pixels_per_mm, z_est_mm, z_ocr_mm, control_spacing_mm,
+        dz_mm=dz_mm,
+        exclude_stationary_ends=exclude_stationary_ends,
+        stationary_dz_threshold_mm=stationary_dz_threshold_mm,
+        stationary_min_run_frames=stationary_min_run_frames,
     )
     if not warp_theta:
         return StripCorrectionResult(
@@ -299,6 +406,10 @@ def warp_z_to_ocr(
     z_est_mm: np.ndarray,
     z_ocr_mm: np.ndarray,
     control_spacing_mm: float = 50.0,
+    dz_mm: Optional[np.ndarray] = None,
+    exclude_stationary_ends: bool = True,
+    stationary_dz_threshold_mm: float = 1.0,
+    stationary_min_run_frames: int = 3,
 ) -> Tuple[dict, float, float, Optional[np.ndarray], str]:
     """オリジナル ColormapCorrector と同じ z 補正。
 
@@ -312,10 +423,23 @@ def warp_z_to_ocr(
     z_est, z_ocr = z_est[:n], z_ocr[:n]
     valid = np.isfinite(z_est) & np.isfinite(z_ocr)
     z_est, z_ocr = z_est[valid], z_ocr[valid]
+    dz_sel = None
+    if dz_mm is not None:
+        dz_all = np.asarray(dz_mm, dtype=float).reshape(-1)[:n]
+        if dz_all.size == n:
+            dz_sel = dz_all[valid]
+    z_est, z_ocr, i0, i1 = select_z_correction_series(
+        z_est, z_ocr, dz_sel,
+        exclude_stationary_ends=exclude_stationary_ends,
+        threshold_mm=stationary_dz_threshold_mm,
+        min_run=stationary_min_run_frames,
+    )
     h, w = rgb.shape[:2]
     ppm = max(float(pixels_per_mm), 1e-9)
     src_z_min = float(z_min)
     src_z_max = float(z_min) + w / ppm
+    n_full = int(np.sum(valid))
+    dropped = (i0 > 0) or (i1 < n_full)
     if z_est.size < 2:
         return (
             {"rgb": rgb, "filled": filled},
@@ -358,7 +482,8 @@ def warp_z_to_ocr(
         z_dst_min,
         z_dst_max,
         zs,
-        f"z補正 ctrl={zs.size} OCR[0,{za_max:.1f}] tail={tail_mm:.1f}mm",
+        f"z補正 ctrl={zs.size} OCR[0,{za_max:.1f}] tail={tail_mm:.1f}mm"
+        + (f" drop=[{i0},{i1})/{n_full}" if dropped else ""),
     )
 
 

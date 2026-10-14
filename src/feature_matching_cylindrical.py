@@ -124,12 +124,15 @@ class CylindricalMatchingConfig:
         physical_vector_filter_enabled: ΔZ/Δθ の側視型 IQR。physical 軸で使う
         physical_iqr_multiplier: ΔZ/Δθ IQR 倍率
         physical_outlier_min_points: IQR を掛ける最小点数
-        physical_max_dz_mm: |ΔZ| 絶対上限
-        physical_max_dtheta_deg: |Δθ| 絶対上限
-        reject_reverse_travel: 後退（ΔZ>0）を除外するか
+        physical_max_dz_mm: 点の |ΔZ| 上限、かつ推定 dz の上限（既定 20 mm）
+        physical_max_dtheta_deg: 点の |Δθ| 上限（既定 5°）。解析クリップではない
+        reject_reverse_travel: 推定 dz が後退なら失敗（点は捨てない）
         reverse_dz_tolerance_mm: 後退判定の許容 (mm)
-        physical_max_dyaw_deg: マッチ 1 次から取る dyaw のフレーム間上限
+        physical_max_dyaw_deg: マッチ 1 次から取る dyaw のフレーム間上限（超過は推定失敗）
         physical_max_dpitch_deg: マッチ 1 次から取る dpitch のフレーム間上限
+        physical_min_points_for_attitude: これ未満で大きな Δyaw/Δpitch は積まない（dz は積む）
+        physical_untrusted_attitude_deg: 低点数のとき姿勢を捨てる閾値（度）
+        physical_max_applied_attitude_deg: 点数に関係なく姿勢を捨てる上限（度）。微小振動は残す
 
         # 位相相関パラメータ
         phase_correlation_enabled: 位相相関によるdz/droll推定の有効/無効
@@ -193,6 +196,9 @@ class CylindricalMatchingConfig:
     reverse_dz_tolerance_mm: float = 0.5
     physical_max_dyaw_deg: float = 2.0
     physical_max_dpitch_deg: float = 2.0
+    physical_min_points_for_attitude: int = 20
+    physical_untrusted_attitude_deg: float = 0.8
+    physical_max_applied_attitude_deg: float = 1.2
 
     # 位相相関パラメータ
     phase_correlation_enabled: bool = False
@@ -465,8 +471,6 @@ class CylindricalFeatureMatcher:
                     min_points=self.config.physical_outlier_min_points,
                     max_dz_mm=self.config.physical_max_dz_mm,
                     max_dtheta_deg=self.config.physical_max_dtheta_deg,
-                    reject_reverse=self.config.reject_reverse_travel,
-                    reverse_tol_mm=self.config.reverse_dz_tolerance_mm,
                 )
                 self.logger.info(
                     f"物理 (ΔZ, Δθ) フィルタ: {n_before} → {len(prev_points_cyl)} 点"
@@ -1528,13 +1532,11 @@ def filter_physical_motion_vectors(
     min_points: int = 4,
     max_dz_mm: float = 20.0,
     max_dtheta_deg: float = 5.0,
-    reject_reverse: bool = True,
-    reverse_tol_mm: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """物理 (θ, Z) 上で、DC+1次の残差に IQR する。
+    """物理 (θ, Z) 上の誤マッチを落とす。後退 DC では全点捨てしない。
 
-    真マッチの Δθ は一様とは限らない（yaw/pitch で 1 次）。
-    点ごとの後退除外は片側の ΔZ 符号を落とすので使わず、DC_ΔZ だけ見る。
+    点ごとの |ΔZ|≤max_dz_mm、|Δθ|≤max_dtheta_deg のあと、残差 IQR。
+    マッチ失敗対応でこの点ゲートを外すと、IQR が誤マッチの 1 次を残して蛇腹になる。
     """
     if prev_cyl is None or curr_cyl is None or len(prev_cyl) == 0:
         return prev_cyl, curr_cyl
@@ -1542,16 +1544,15 @@ def filter_physical_motion_vectors(
     curr_cyl = np.asarray(curr_cyl, dtype=float)
     dtheta = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
     dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
-    keep = (np.abs(dZ) <= float(max_dz_mm)) & (np.abs(dtheta) <= float(max_dtheta_deg))
+    keep = (
+        (np.abs(dZ) <= abs(float(max_dz_mm)))
+        & (np.abs(dtheta) <= abs(float(max_dtheta_deg)))
+    )
     prev_cyl, curr_cyl = prev_cyl[keep], curr_cyl[keep]
     if len(prev_cyl) < min_points:
         return prev_cyl, curr_cyl
-    theta = prev_cyl[:, 0]
     dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
-    dtheta = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
-    fit_z = fit_dc_first_harmonic(theta, dZ)
-    if reject_reverse and fit_z["dc"] > float(reverse_tol_mm):
-        return prev_cyl[:0], curr_cyl[:0]
+    fit_z = fit_dc_first_harmonic(prev_cyl[:, 0], dZ)
     z_keep = _iqr_keep(fit_z["residual"], iqr_multiplier, min_points, floor=0.2)
     if int(np.sum(z_keep)) >= 2:
         prev_cyl, curr_cyl = prev_cyl[z_keep], curr_cyl[z_keep]
@@ -1563,6 +1564,86 @@ def filter_physical_motion_vectors(
     if int(np.sum(th_keep)) >= 2:
         prev_cyl, curr_cyl = prev_cyl[th_keep], curr_cyl[th_keep]
     return prev_cyl, curr_cyl
+
+
+def clip_front_physical_estimate(
+    result: Dict[str, Any],
+    *,
+    max_dz_mm: float = 20.0,
+    max_dyaw_deg: float = 2.0,
+    max_dpitch_deg: float = 2.0,
+    reject_reverse: bool = True,
+    reverse_tol_mm: float = 0.5,
+    dz_bounds: Optional[Tuple[float, float]] = None,
+    min_points: int = 4,
+    min_points_for_attitude: int = 20,
+    untrusted_attitude_deg: float = 0.8,
+    max_applied_attitude_deg: float = 1.2,
+) -> Dict[str, Any]:
+    """解析結果が物理上限を超えたら無効にする。飽和値は積まない。
+
+    点は捨てない。カメラ前進が dz>0。上限超過・後退・点数不足は success=False。
+    低点数の大きな Δyaw/Δpitch は 0 にする（dz は残す。スキップしない）。
+    """
+    out = dict(result)
+    if not out.get("success"):
+        return out
+    dz = float(out.get("dz", 0.0))
+    dyaw = float(out.get("dyaw", 0.0))
+    dpitch = float(out.get("dpitch", 0.0))
+    out["dz_raw"] = dz
+    out["dyaw_raw"] = dyaw
+    out["dpitch_raw"] = dpitch
+    n = int(out.get("n_points", 0))
+    max_dz = abs(float(max_dz_mm))
+    max_yaw = np.radians(float(max_dyaw_deg))
+    max_pitch = np.radians(float(max_dpitch_deg))
+    eps = 1e-9
+    if n < int(min_points):
+        out["success"] = False
+        out["failure_reason"] = "too_few_points"
+        return out
+    if abs(dz) > max_dz + eps:
+        out["success"] = False
+        out["failure_reason"] = "dz_exceeded_clip"
+        return out
+    if abs(dyaw) > max_yaw + eps or abs(dpitch) > max_pitch + eps:
+        out["success"] = False
+        out["failure_reason"] = "attitude_exceeded_clip"
+        return out
+    if reject_reverse and dz < -abs(float(reverse_tol_mm)):
+        out["success"] = False
+        out["failure_reason"] = "reverse_travel"
+        return out
+    if dz_bounds is not None:
+        dz = float(np.clip(dz, float(dz_bounds[0]), float(dz_bounds[1])))
+    dyaw_deg = abs(np.degrees(dyaw))
+    dpitch_deg = abs(np.degrees(dpitch))
+    att_deg = max(dyaw_deg, dpitch_deg)
+    drop_att = False
+    drop_reason = None
+    max_applied = abs(float(max_applied_attitude_deg))
+    untrusted = abs(float(untrusted_attitude_deg))
+    n_att = int(min_points_for_attitude)
+    if att_deg > max_applied + eps:
+        drop_att = True
+        drop_reason = "attitude_too_large"
+    elif n < n_att and att_deg > untrusted + eps:
+        drop_att = True
+        drop_reason = "low_n_large_attitude"
+    if drop_att:
+        dyaw = 0.0
+        dpitch = 0.0
+        out["attitude_suppressed"] = True
+        out["attitude_suppress_reason"] = drop_reason
+    else:
+        out["attitude_suppressed"] = False
+    out["dz"] = dz
+    out["droll"] = 0.0
+    out["droll_deg"] = 0.0
+    out["dyaw"] = dyaw
+    out["dpitch"] = dpitch
+    return out
 
 
 def estimate_front_physical_option2(

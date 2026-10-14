@@ -36,7 +36,9 @@ def test_ocr_only_z_matches_high_precision_helper(transformer):
     assert "dz" in constraints[1]
 
 
-def _run_ocr_only_with_distances(transformer, distances, max_increment=10.0):
+def _run_ocr_only_with_distances(
+    transformer, distances, max_increment=10.0, enforce_upper=True,
+):
     cfg = Config.from_defaults()
     cfg.estimation.use_offset_moving_average = False
     estimator = CameraEstimator(cfg.estimation, transformer)
@@ -52,6 +54,7 @@ def _run_ocr_only_with_distances(transformer, distances, max_increment=10.0):
             estimator=estimator,
             config=cfg.estimation,
             max_distance_increment_mm=max_increment,
+            enforce_ocr_increment_upper_bound=enforce_upper,
         )
 
 
@@ -91,3 +94,43 @@ def test_ocr_only_passes_expected_range_to_extract(transformer):
         )
     assert seen[0] is None
     assert seen[1] == (100.0, 110.0)
+
+
+def test_ocr_only_accepts_fast_jumps_without_upper_bound(transformer):
+    _, _, ocr_dist, success = _run_ocr_only_with_distances(
+        transformer, [100.0, 120.0, 150.0], max_increment=10.0, enforce_upper=False,
+    )
+    assert list(success) == [True, True, True]
+    np.testing.assert_allclose(ocr_dist, [100.0, 120.0, 150.0])
+
+
+def test_ocr_only_still_rejects_reverse_without_upper_bound(transformer):
+    _, _, ocr_dist, success = _run_ocr_only_with_distances(
+        transformer, [100.0, 120.0, 90.0], max_increment=10.0, enforce_upper=False,
+    )
+    assert list(success) == [True, True, False]
+    np.testing.assert_allclose(ocr_dist[success], [100.0, 120.0])
+
+
+def test_ocr_only_expected_range_has_no_plus_cap_when_disabled(transformer):
+    cfg = Config.from_defaults()
+    estimator = CameraEstimator(cfg.estimation, transformer)
+    frames = [np.zeros((12, 12, 3), dtype=np.uint8) for _ in range(2)]
+    seen = []
+
+    def fake_extract(frame, roi, ocr_cfg, expected_range_mm=None, **kwargs):
+        seen.append(expected_range_mm)
+        idx = next(i for i, f in enumerate(frames) if f is frame)
+        return [100.0, 130.0][idx], 90
+
+    with patch("src.ocr_utils.extract_distance_from_frame", side_effect=fake_extract):
+        compute_distance_constraints_only(
+            frames=frames,
+            estimator=estimator,
+            config=cfg.estimation,
+            max_distance_increment_mm=10.0,
+            enforce_ocr_increment_upper_bound=False,
+        )
+    assert seen[0] is None
+    assert seen[1][0] == 100.0
+    assert seen[1][1] == float("inf")

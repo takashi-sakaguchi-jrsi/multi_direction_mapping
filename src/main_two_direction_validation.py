@@ -59,7 +59,11 @@ from src.validation.report import (
 from src.validation.seam_join import join_at_overlap_centers
 from src.validation.seam_warp import normalize_run_id, warp_strips_to_seams
 from src.validation.sideview_projection_mapper import SideviewProjectionMapper
-from src.validation.strip_correction import correct_strip, apply_pitch_trend_warp
+from src.validation.strip_correction import (
+    apply_pitch_trend_warp,
+    correct_strip,
+    dz_from_motion_records,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -342,6 +346,7 @@ def run_two_direction_validation(
                 pitch_trend=getattr(td, "pitch_trend_warp", None),
                 theta_min=item["acc"].theta_min,
                 theta_max=item["acc"].theta_max,
+                correction=getattr(config, "correction", None),
             )
             item["acc"] = None
             gc.collect()
@@ -646,6 +651,7 @@ def _run_id(records, fallback: str) -> str:
 def _correct_accumulated(
     acc, records, extra, ppm, half_fov_rad, spacing_mm, warp_theta=True,
     pitch_trend=None, theta_min=0.0, theta_max=2.0 * np.pi,
+    correction=None,
 ):
     z_est = np.array([r.position[2] for r in records], dtype=float)
     z_ocr = np.asarray(extra.get("ocr_dist"), dtype=float)
@@ -659,13 +665,27 @@ def _correct_accumulated(
     ori = np.array([
         ref["roll_ref_rad"], ref["yaw_ref_rad"], ref["pitch_ref_rad"]
     ], dtype=float)
+    exclude = True
+    th = 1.0
+    min_run = 3
+    if correction is not None:
+        exclude = bool(getattr(correction, "exclude_stationary_ends", True))
+        th = float(getattr(correction, "stationary_dz_threshold_mm", 1.0))
+        min_run = int(getattr(correction, "stationary_min_run_frames", 3))
+    dz = dz_from_motion_records(records)
     result = correct_strip(
         acc.colormap_rgb(), acc.buf.filled, acc.buf.z_min, ppm,
         z_est, z_ocr, ori, half_fov_rad,
         theta_min=acc.theta_min, theta_max=acc.theta_max,
         control_spacing_mm=spacing_mm,
         warp_theta=warp_theta,
+        dz_mm=dz,
+        exclude_stationary_ends=exclude,
+        stationary_dz_threshold_mm=th,
+        stationary_min_run_frames=min_run,
     )
+    if "drop=" in str(getattr(result, "message", "")):
+        logger.info(result.message)
     if pitch_trend is not None and bool(getattr(pitch_trend, "enabled", False)):
         z_axis = z_ocr if z_ocr.size == z_est.size else z_est
         pitch = np.array([float(r.orientation[2]) for r in records], dtype=float)

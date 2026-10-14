@@ -79,6 +79,7 @@ from src.colormap_correction import (
     ColormapCorrector,
     ColormapCorrectionError,
     apply_front_attitude_trend_warp,
+    blend_orientation_toward_vp,
 )
 from src.progress_reporter import ProgressReporter
 from src.camera_utils import compute_fisheye_focal_length
@@ -534,7 +535,10 @@ class ColorMapPipelineTwoPass:
                 ocr_preprocessing_enabled=self.config.ocr.preprocessing_enabled,
                 ocr_enabled=self.config.ocr.enabled,
                 progress_callback=progress_callback,
-                max_distance_increment_mm=self.config.ocr.max_distance_increment_mm
+                max_distance_increment_mm=self.config.ocr.max_distance_increment_mm,
+                enforce_ocr_increment_upper_bound=(
+                    self.config.ocr.enforce_ocr_increment_upper_bound
+                ),
             )
 
 
@@ -1129,6 +1133,23 @@ class ColorMapPipelineTwoPass:
                 # TASK-21: 姿勢更新（補正後の値を使用）
                 camera_state.position += movement_constrained[:3]
                 camera_state.orientation += movement_constrained[3:]
+
+                if (
+                    self._use_front_physical_matching()
+                    and yaw_est is not None
+                    and pitch_est is not None
+                ):
+                    blend = float(getattr(self.config.correction, "attitude_vp_blend", 0.2))
+                    if blend > 0.0:
+                        yaw_b, pitch_b = blend_orientation_toward_vp(
+                            float(camera_state.orientation[1]),
+                            float(camera_state.orientation[2]),
+                            float(yaw_est),
+                            float(pitch_est),
+                            blend,
+                        )
+                        camera_state.orientation[1] = yaw_b
+                        camera_state.orientation[2] = pitch_b
 
                 # 更新後のz座標をログ出力
                 z_after = camera_state.position[2]
@@ -2063,7 +2084,14 @@ class ColorMapPipelineTwoPass:
             corrector = ColormapCorrector(
                 logger=self.logger,
                 ocr_interval_mm=self.config.correction.ocr_interval_mm,
-                max_image_size=self.config.correction.max_image_size
+                max_image_size=self.config.correction.max_image_size,
+                exclude_stationary_ends=self.config.correction.exclude_stationary_ends,
+                stationary_dz_threshold_mm=(
+                    self.config.correction.stationary_dz_threshold_mm
+                ),
+                stationary_min_run_frames=(
+                    self.config.correction.stationary_min_run_frames
+                ),
             )
 
             success = corrector.correct_colormap(
@@ -2187,7 +2215,7 @@ class ColorMapPipelineTwoPass:
                 roll_rad = float(np.radians(roll_vals[0]))
         warped = apply_front_attitude_trend_warp(
             image,
-            z_mm=pd.to_numeric(z_est, errors="coerce").to_numpy(),
+            z_mm=pd.to_numeric(z_axis, errors="coerce").to_numpy(),
             yaw_rad=np.radians(pd.to_numeric(yaw, errors="coerce").to_numpy()),
             pitch_rad=np.radians(pd.to_numeric(pitch, errors="coerce").to_numpy()),
             yaw_vp_rad=np.radians(pd.to_numeric(yaw_vp, errors="coerce").to_numpy()),
@@ -2196,7 +2224,6 @@ class ColorMapPipelineTwoPass:
             roll_rad=roll_rad,
             window_mm=float(getattr(corr, "attitude_window_mm", 800.0)),
             max_dtheta_deg=float(getattr(corr, "attitude_max_dtheta_deg", 15.0)),
-            z_axis_mm=pd.to_numeric(z_axis, errors="coerce").to_numpy(),
         )
         plt.imsave(str(path), warped)
         self.logger.info("姿勢トレンド補正（消失点へ低周波合わせ）を適用しました")
@@ -2585,12 +2612,12 @@ def main() -> int:
         # CLI引数で設定を上書き（製品版共通フラグ）
         apply_product_cli(config, args)
 
-        # バリデーション
-        config.validate()
-        
         # ログ設定
         setup_logging(config)
         logger = logging.getLogger(__name__)
+
+        # バリデーション
+        config.validate()
         
         logger.info("=" * 60)
         pipeline = effective_pipeline(config)

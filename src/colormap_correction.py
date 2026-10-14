@@ -21,6 +21,7 @@ from scipy.interpolate import PchipInterpolator
 import matplotlib.pyplot as plt
 
 from src.validation.geometry import optical_axis_eta, wrap_angle_rad
+from src.validation.strip_correction import select_z_correction_series
 
 
 class ColormapCorrectionError(Exception):
@@ -44,7 +45,10 @@ class ColormapCorrector:
         self,
         logger: logging.Logger,
         ocr_interval_mm: float = 100.0,
-        max_image_size: int = 30000
+        max_image_size: int = 30000,
+        exclude_stationary_ends: bool = True,
+        stationary_dz_threshold_mm: float = 1.0,
+        stationary_min_run_frames: int = 3,
     ):
         """初期化
 
@@ -52,10 +56,16 @@ class ColormapCorrector:
             logger: ロガー
             ocr_interval_mm: 補正基準OCR距離間隔 L (mm)
             max_image_size: 最大画像サイズ（OpenCV制限）
+            exclude_stationary_ends: 解析停止の先頭・末尾を制御点から除く
+            stationary_dz_threshold_mm: |dz| がこれ以下なら停止
+            stationary_min_run_frames: 動きとみなす連続フレーム数
         """
         self.logger = logger
         self.ocr_interval_mm = ocr_interval_mm
         self.max_image_size = max_image_size
+        self.exclude_stationary_ends = bool(exclude_stationary_ends)
+        self.stationary_dz_threshold_mm = float(stationary_dz_threshold_mm)
+        self.stationary_min_run_frames = int(stationary_min_run_frames)
 
     def correct_colormap(
         self,
@@ -118,6 +128,19 @@ class ColormapCorrector:
 
             # 4. Excelから補正データを読み込み
             z_mm, z_ocr_mm = self._load_correction_data(excel_path)
+            n_all = int(z_mm.size)
+            z_mm, z_ocr_mm, i0, i1 = select_z_correction_series(
+                z_mm, z_ocr_mm,
+                exclude_stationary_ends=self.exclude_stationary_ends,
+                threshold_mm=self.stationary_dz_threshold_mm,
+                min_run=self.stationary_min_run_frames,
+            )
+            if i0 > 0 or i1 < n_all:
+                self.logger.info(
+                    f"距離補正から先頭停止 {i0} フレーム・"
+                    f"末尾停止 {n_all - i1} フレームを除外 "
+                    f"(残 {z_mm.size}/{n_all})"
+                )
             self.logger.info(f"補正データ読み込み完了: {len(z_mm)}フレーム")
             self.logger.info(f"z範囲: {z_mm.min():.1f} ～ {z_mm.max():.1f} mm")
             self.logger.info(f"z_ocr範囲: {z_ocr_mm.min():.1f} ～ {z_ocr_mm.max():.1f} mm")
@@ -374,6 +397,22 @@ class ColormapCorrector:
         return corrected
 
 
+def blend_orientation_toward_vp(
+    yaw_rad: float,
+    pitch_rad: float,
+    yaw_vp_rad: float,
+    pitch_vp_rad: float,
+    blend: float,
+) -> Tuple[float, float]:
+    """マッチ姿勢を消失点へ complementary に寄せる。blend=0 ならそのまま。"""
+    b = float(np.clip(blend, 0.0, 1.0))
+    if b <= 0.0 or not np.isfinite(yaw_vp_rad) or not np.isfinite(pitch_vp_rad):
+        return float(yaw_rad), float(pitch_rad)
+    dy = wrap_angle_rad(float(yaw_vp_rad) - float(yaw_rad))
+    dp = wrap_angle_rad(float(pitch_vp_rad) - float(pitch_rad))
+    return float(yaw_rad) + b * dy, float(pitch_rad) + b * dp
+
+
 def _moving_average_by_z(values: np.ndarray, z_mm: np.ndarray, window_mm: float) -> np.ndarray:
     z = np.asarray(z_mm, dtype=float).reshape(-1)
     v = np.asarray(values, dtype=float).reshape(-1)
@@ -414,7 +453,7 @@ def front_attitude_trend_dtheta_rad(
         & np.isfinite(yaw_vp[:n])
         & np.isfinite(pitch_vp[:n])
     )
-    dth = np.zeros(n, dtype=float)
+    dth = np.full(n, np.nan, dtype=float)
     if int(np.sum(valid)) < 4:
         return dth
     zv, yawv, pitchv = z[valid], yaw[:n][valid], pitch[:n][valid]
@@ -458,21 +497,28 @@ def apply_front_attitude_trend_warp(
 ) -> np.ndarray:
     """展開図の各 z 列を、消失点との姿勢差だけ周方向にずらす。"""
     h, w = image.shape[:2]
+    z_plot = np.asarray(
+        z_axis_mm if z_axis_mm is not None else z_mm, dtype=float
+    ).reshape(-1)
     dth = front_attitude_trend_dtheta_rad(
-        z_mm, yaw_rad, pitch_rad, yaw_vp_rad, pitch_vp_rad,
+        z_plot, yaw_rad, pitch_rad, yaw_vp_rad, pitch_vp_rad,
         roll_rad=roll_rad, window_mm=window_mm, max_dtheta_deg=max_dtheta_deg,
     )
-    if dth.size == 0 or not np.any(np.abs(dth) > 1e-9):
+    finite_dth = np.isfinite(dth) & np.isfinite(np.abs(dth))
+    if dth.size == 0 or not np.any(finite_dth & (np.abs(dth) > 1e-9)):
         return image
-    z_src = np.asarray(z_axis_mm if z_axis_mm is not None else z_mm, dtype=float).reshape(-1)
-    n = min(z_src.size, dth.size)
-    z_src, dth = z_src[:n], dth[:n]
+    n = min(z_plot.size, dth.size)
+    z_src, dth = z_plot[:n], dth[:n]
     finite = np.isfinite(z_src) & np.isfinite(dth)
     z_src, dth = z_src[finite], dth[finite]
     if z_src.size < 2:
         return image
     order = np.argsort(z_src)
     z_s, d_s = z_src[order], dth[order]
+    uniq = np.concatenate([[True], np.diff(z_s) > 1e-9])
+    z_s, d_s = z_s[uniq], d_s[uniq]
+    if z_s.size < 2:
+        return image
     col_z = np.arange(w, dtype=float) / max(float(pixels_per_mm), 1e-6)
     dth_col = np.interp(col_z, z_s, d_s, left=float(d_s[0]), right=float(d_s[-1]))
     d_rows = dth_col / (2.0 * np.pi) * h

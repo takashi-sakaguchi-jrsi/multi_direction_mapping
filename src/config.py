@@ -130,6 +130,14 @@ class CorrectionConfig:
     """マッチ蓄積 yaw/pitch の z 移動平均を消失点へ合わせる θ ワープ"""
     attitude_window_mm: float = 800.0
     attitude_max_dtheta_deg: float = 15.0
+    attitude_vp_blend: float = 0.0
+    """物理経路: マッチ増分のあと姿勢を消失点へ寄せる割合（0で無効）。蛇腹の原因になるので既定オフ。"""
+    exclude_stationary_ends: bool = True
+    """解析 dz で停止とみなす先頭・末尾を距離補正の制御点から除く。マッチ・展開は全フレームのまま。"""
+    stationary_dz_threshold_mm: float = 1.0
+    """|dz| がこの値以下なら停止。先頭は動き出す直前まで、末尾は最終停止以降を除外する。"""
+    stationary_min_run_frames: int = 3
+    """動き出し／最終停止とみなすのに必要な連続移動フレーム数。"""
 
 
 @dataclass
@@ -141,6 +149,7 @@ class CameraConfig:
             キャリブレーションファイルからfx,fy,cx,cyが有効な場合は無視される。
             fx,fy,cx,cyが未設定の場合のみ、焦点距離fの計算に使用される。
         ocr_roi_ratio: OCR処理対象領域の比率 [top, bottom, left, right]
+            既定は左上の距離 overlay（大きい表示）を覆う。1080p で約 0–130px × 0–614px。
         image_width: カメラ画像の幅（ピクセル）- 動画から自動取得、未使用
         image_height: カメラ画像の高さ（ピクセル）- 動画から自動取得、未使用
         focal_length_mm: 焦点距離（mm）- 未使用（互換性のため残存）
@@ -166,7 +175,7 @@ class CameraConfig:
         キャリブレーションファイルが指定されている場合、camera_modelフィールドが
         キャリブレーション情報から読み込まれるため、この設定は無視されます。
     """
-    ocr_roi_ratio: List[float] = field(default_factory=lambda: [0.0, 0.05, 0.0, 0.2])
+    ocr_roi_ratio: List[float] = field(default_factory=lambda: [0.0, 0.12, 0.0, 0.32])
     image_width: int = 1220
     image_height: int = 1080
     focal_length_mm: float = 2.8
@@ -913,6 +922,9 @@ class OCRConfig:
         preprocessing_enabled: 強化前処理パイプラインの有効/無効
         confidence_threshold: 信頼度閾値（0-100）
         max_distance_increment_mm: OCR距離の1フレームあたり最大増加量(mm)
+        enforce_ocr_increment_upper_bound: Trueなら [前回値, 前回値+増分×gap] で検証。
+            Falseなら下限（逆転・過小）だけ見て、プラス側上限は見ない。
+            高速走行で表示が 20mm 以上飛ぶ場合に使う。
         preprocessing_method: デフォルト前処理方式（"enhanced", "fixed", "otsu"）
         target_roi_height: 動的拡大の目標ROI高さ（ピクセル）
         clahe_clip_limit: CLAHE のclipLimit
@@ -928,6 +940,7 @@ class OCRConfig:
     preprocessing_enabled: bool = True
     confidence_threshold: float = 60.0
     max_distance_increment_mm: float = 10.0
+    enforce_ocr_increment_upper_bound: bool = True
     preprocessing_method: str = "enhanced"
     target_roi_height: int = 200
     clahe_clip_limit: float = 2.0
@@ -2234,6 +2247,16 @@ class ConfigValidator:
         if cfg.max_image_size <= 0:
             raise ConfigValidationError(
                 f"correction.max_image_sizeは正の値である必要があります: {cfg.max_image_size}"
+            )
+        if cfg.stationary_dz_threshold_mm <= 0:
+            raise ConfigValidationError(
+                "correction.stationary_dz_threshold_mmは正の値である必要があります: "
+                f"{cfg.stationary_dz_threshold_mm}"
+            )
+        if cfg.stationary_min_run_frames < 1:
+            raise ConfigValidationError(
+                "correction.stationary_min_run_framesは1以上である必要があります: "
+                f"{cfg.stationary_min_run_frames}"
             )
 
     def validate_debug_config(self) -> None:

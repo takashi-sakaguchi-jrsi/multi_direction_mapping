@@ -14,7 +14,12 @@ from src.validation.seam_join import (
     join_at_overlap_centers,
     unwrap_row_camera_car_deg,
 )
-from src.validation.strip_correction import warp_z_to_ocr, warp_theta_to_edge_center
+from src.validation.strip_correction import (
+    moving_segment_bounds,
+    select_z_correction_series,
+    warp_theta_to_edge_center,
+    warp_z_to_ocr,
+)
 
 
 def test_overlap_centers_map_to_expected_eta():
@@ -319,3 +324,57 @@ def test_z_warp_keeps_source_right_tail():
     xs = np.where(cyan.any(axis=0))[0]
     assert xs.size >= 6
     assert int(xs.max()) >= out["rgb"].shape[1] - 12
+
+
+def test_moving_segment_drops_leading_and_trailing_stop():
+    dz = np.array(
+        [0.0] * 8 + [5.0] * 12 + [0.0] * 6,
+        dtype=float,
+    )
+    i0, i1 = moving_segment_bounds(dz, threshold_mm=1.0, min_run=3)
+    assert i0 == 8
+    assert i1 == 20
+
+
+def test_moving_segment_keeps_all_if_never_stopped():
+    dz = np.array([0.0, 4.0, 4.0, 5.0, 5.0], dtype=float)
+    i0, i1 = moving_segment_bounds(dz, threshold_mm=1.0, min_run=3)
+    assert i0 == 1
+    assert i1 == 5
+
+
+def test_select_z_correction_excludes_stationary_ends():
+    z_est = np.concatenate([
+        np.zeros(5),
+        np.linspace(5.0, 60.0, 12),
+        np.full(4, 60.0),
+    ])
+    z_ocr = np.concatenate([
+        np.zeros(5),
+        np.linspace(0.0, 70.0, 12),
+        np.full(4, 70.0),
+    ])
+    zs, zt, i0, i1 = select_z_correction_series(
+        z_est, z_ocr, threshold_mm=1.0, min_run=3,
+    )
+    assert i0 == 5
+    assert i1 == 17
+    assert zs.size == 12
+    np.testing.assert_allclose(zs[0], 5.0)
+    np.testing.assert_allclose(zs[-1], 60.0)
+    np.testing.assert_allclose(zt[-1], 70.0)
+
+
+def test_z_warp_control_omits_leading_stop():
+    h, w = 6, 80
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    filled = np.ones((h, w), dtype=bool)
+    z_est = np.array([0.0, 0.0, 0.0, 10.0, 20.0, 30.0, 40.0, 40.0, 40.0])
+    z_ocr = np.array([0.0, 0.0, 0.0, 12.0, 24.0, 36.0, 48.0, 48.0, 48.0])
+    _out, _z0, _z1, ctrl, msg = warp_z_to_ocr(
+        rgb, filled, z_min=0.0, pixels_per_mm=1.0,
+        z_est_mm=z_est, z_ocr_mm=z_ocr, control_spacing_mm=10.0,
+    )
+    assert "drop=" in msg
+    assert ctrl is not None
+    assert float(ctrl[0]) >= 10.0 - 1e-6
