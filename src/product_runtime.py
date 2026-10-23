@@ -237,6 +237,18 @@ def apply_front_profile(config: Config) -> None:
         cyl.z_axis = "physical"
         cyl.spatial_filter_enabled = False
         cyl.physical_vector_filter_enabled = True
+        cyl.physical_max_dyaw_deg = float(
+            getattr(front, "physical_max_dyaw_deg", 2.0)
+        )
+        cyl.physical_max_dpitch_deg = float(
+            getattr(front, "physical_max_dpitch_deg", 2.0)
+        )
+        cyl.physical_max_applied_attitude_deg = float(
+            getattr(front, "physical_max_applied_attitude_deg", 1.2)
+        )
+        cyl.physical_untrusted_attitude_deg = float(
+            getattr(front, "physical_untrusted_attitude_deg", 0.8)
+        )
         filt = config.estimation.feature_filtering
         filt.magnitude_filter_enabled = False
         filt.direction_filter_enabled = False
@@ -245,6 +257,16 @@ def apply_front_profile(config: Config) -> None:
         motion.estimate_droll = False
         motion.hybrid_two_stage_enabled = False
         # 展開は前フレーム姿勢。マッチは dz と Δyaw/Δpitch。画素 LS は使わない。
+        # 残差 (η, z) 微調整は FrontConfig.residual_paste_warp（既定 true）。姿勢には積まない。
+        config.colormap.keep_painted_pixels = bool(
+            getattr(front, "keep_painted_colormap", False)
+        )
+        config.colormap.prefer_peripheral_pixels = bool(
+            getattr(front, "prefer_peripheral_colormap", True)
+        )
+        config.colormap.reject_z_behind_camera = bool(
+            getattr(front, "reject_z_behind_camera", True)
+        )
 
 
 def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:
@@ -353,6 +375,8 @@ def apply_product_cli(config: Config, args: Any) -> None:
         config.two_direction.end_frame = product_end_to_exclusive(args.end)
     if getattr(args, "debug", False):
         config.debug.enabled = True
+        config.debug.show_feature_points = True
+        config.debug.output_debug_images = True
         config.logging.level = "DEBUG"
     if getattr(args, "aov", None) is not None:
         config.camera.fov_degrees = float(args.aov)

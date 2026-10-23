@@ -263,6 +263,9 @@ class CameraConfig:
     CoordinateTransformerに渡されて歪み補正に使用される。
     """
 
+    apply_lens_calibration: bool = True
+    """False なら Kannala 歪み係数を使わない（f, cx, cy はファイル値のまま）。"""
+
     lens_calibration_file: Optional[str] = None
     """
     レンズキャリブレーション情報を外部ファイルから読み込む場合に指定
@@ -330,6 +333,11 @@ class CameraConfig:
                     f"cx={self.cx:.1f}, cy={self.cy:.1f}, "
                     f"calib_size=({self.calibrated_image_width}x{self.calibrated_image_height})"
                 )
+                if not bool(self.apply_lens_calibration):
+                    logger.info(
+                        "レンズ歪みモデルは無効（apply_lens_calibration=false）。"
+                        "f, cx, cy はファイル値を使用し、Kannala は使わない。"
+                    )
             except Exception as e:
                 logger.warning(
                     f"レンズキャリブレーション読み込み失敗: "
@@ -341,6 +349,11 @@ class CameraConfig:
             self.lens_calibration_file = None
             self._lens_calibration = None
 
+    def transformer_calibration(self):
+        """歪みモデル（Kannala 等）。False なら None。f, cx, cy はファイル値のまま。"""
+        if not bool(self.apply_lens_calibration):
+            return None
+        return self._lens_calibration
 
 
 @dataclass
@@ -866,7 +879,10 @@ class ColormapConfig:
         inner_radius_ratio: 内側トリミング半径比率（0.0-1.0）
         outer_radius_ratio: 外側トリミング半径比率（0.0-1.0）
         pixels_per_mm: カラーマップの解像度（ピクセル/mm）
-        blend_mode: ブレンドモード（overwrite, alpha, max等）
+        blend_mode: ブレンドモード（overwrite, keep, alpha, max等）
+        keep_painted_pixels: True なら既に塗った画素は上書きしない
+        prefer_peripheral_pixels: True なら画像半径が大きい（レンズ外周・鮮明）画素だけ既存を置き換える
+        reject_z_behind_camera: True ならカメラZより後ろの壁点は塗らない（正面の回り込み防止）
         alpha: z方向変形量に対する最大増加率（推奨1.2）
         trim_left_px: 左側トリミングピクセル数
         trim_right_px: 右側トリミングピクセル数
@@ -875,11 +891,18 @@ class ColormapConfig:
         delete_temporary_images: Phase3補正完了後に一時展開画像を削除するか
             True: 一時ファイルを削除（本番運用推奨、ディスク容量節約）
             False: 一時ファイルを保持（デバッグ・検証用）
+            Phase2末尾の全体 roll 補正前画像（temp の隣）も同じ扱い。
     """
     inner_radius_ratio: float = 0.6
     outer_radius_ratio: float = 0.815
     pixels_per_mm: float = 1.0
     blend_mode: str = "overwrite"
+    keep_painted_pixels: bool = False
+    """True なら空画素だけ書く。鮮明な外周画素まで残すので、通常は使わない。"""
+    prefer_peripheral_pixels: bool = False
+    """True ならソース画像半径が大きい画素だけ上書き。中心の不鮮明画素が外周の鮮明画素を消さない。"""
+    reject_z_behind_camera: bool = False
+    """True なら world Z < カメラZ の点を塗らない。傾きで反対側の裏側へ回り込む上書きを防ぐ。側視では使わない。"""
     alpha: float = 1.2  # z方向変形量に対する最大増加率
     trim_left_px: int = 0  # 左側トリミングピクセル数
     trim_right_px: int = 0  # 右側トリミングピクセル数
@@ -1199,9 +1222,59 @@ class FrontConfig:
     max_pitch: float = 15.0
     use_vanishing_point_yaw: bool = True
     use_vanishing_point_pitch: bool = True
+    initialize_attitude_from_vp: bool = True
+    """開始時の yaw/pitch を消失点から入れる。false なら initial_position の theta/phi（既定 0）。"""
     auto_tune_enabled: Optional[bool] = None
     physical_z_matching: bool = True
     """円筒マッチングを管 (θ, Z) にする。展開は前フレーム姿勢。dz と Δyaw/Δpitch はマッチ、roll=0。"""
+    physical_max_dyaw_deg: float = 2.0
+    """フレーム間 |Δyaw| がこれを超えたら移動量ごと破棄。"""
+    physical_max_dpitch_deg: float = 2.0
+    """フレーム間 |Δpitch| がこれを超えたら移動量ごと破棄。"""
+    physical_max_applied_attitude_deg: float = 1.2
+    """|Δyaw| または |Δpitch| がこれを超えたら姿勢だけ 0（dz は残す）。"""
+    physical_untrusted_attitude_deg: float = 0.8
+    """点数が physical_min_points_for_attitude 未満のとき、これより大きい姿勢は 0。"""
+    residual_paste_warp: bool = True
+    """3DoF 後の特徴点残差で、新しい帯の (η, z) サンプリングだけ微調整する。姿勢には積まない。"""
+    residual_theta_bins: int = 12
+    residual_z_bins: int = 4
+    residual_max_dtheta_deg: float = 2.0
+    residual_max_dz_mm: float = 8.0
+    residual_min_bin_points: int = 2
+    overlap_paste_align: bool = True
+    """新しい帯を、既に塗った重なりで (η, z) 並進合わせする。姿勢には積まない。"""
+    overlap_align_min_pixels: int = 1500
+    overlap_align_min_response: float = 0.04
+    overlap_align_max_dtheta_deg: float = 8.0
+    overlap_align_max_dz_mm: float = 15.0
+    strip_overlap_match: bool = False
+    """展開後の既描画と現帯で ORB を取り直し、重なり誤差を測る。"""
+    strip_overlap_correct: bool = False
+    """第2段階: 重なり誤差を絶対 z と roll に戻し、その姿勢で取り直して貼る。
+
+    移動量推定の droll=0 とは独立。補正した roll は次フレームも残る。
+    (z, roll) で悪化し z だけなら改善する場合は z のみ採用する。
+    """
+    strip_overlap_allow_bin_worse: bool = False
+    """True なら z+roll でも η ビン悪化を見ない。z のみは常にビン悪化を許容する。"""
+    deroll_colormap_after_phase2: bool = False
+    """Phase2 末尾で、蓄積した roll(z) を展開図の η から戻し roll=0 相当にする。"""
+    deroll_smooth_roll: bool = False
+    """True なら全体 roll 補正のずらし量を z 方向に平滑化する。折線のままと比較する。"""
+    deroll_smooth_window_mm: float = 800.0
+    """deroll_smooth_roll の移動平均窓（mm）。"""
+    keep_painted_colormap: bool = False
+    """塗済みを一切上書きしない。外周の鮮明画素が使えないので既定はオフ。"""
+    prefer_peripheral_colormap: bool = True
+    """同じ展開画素は、よりレンズ外周寄りのソースだけ採用する。中心の不鮮明画素は残さない。"""
+    reject_z_behind_camera: bool = True
+    """カメラ位置より小さい Z は塗らない。
+
+    ヨーで近い壁の一部がカメラより後ろに見えることはあるが、その Z は
+    前フレームがほぼ側視（外周）で既に書いている。今フレームで遡って
+    上書きする必要はなく、反対側へ回り込む裏側の誤塗も同時に防げる。
+    """
 
 
 @dataclass
@@ -1493,7 +1566,12 @@ class Config:
 
         # cylindrical設定を別途設定
         if use_cylindrical and cylindrical_dict and CYLINDRICAL_MATCHING_AVAILABLE:
-            feature_matching_cfg.cylindrical = CylindricalMatchingConfig(**cylindrical_dict)
+            cyl_names = {
+                f.name for f in CylindricalMatchingConfig.__dataclass_fields__.values()
+            }
+            feature_matching_cfg.cylindrical = CylindricalMatchingConfig(
+                **{k: v for k, v in cylindrical_dict.items() if k in cyl_names}
+            )
         elif use_cylindrical:
             # デフォルト値を使用
             if CYLINDRICAL_MATCHING_AVAILABLE and CylindricalMatchingConfig is not None:
@@ -2186,10 +2264,12 @@ class ConfigValidator:
             )
         
         # ブレンドモード
-        if cfg.blend_mode not in ["overwrite", "alpha", "max", "average"]:
+        if cfg.blend_mode not in ["overwrite", "keep", "alpha", "max", "average"]:
             self.logger.warning(
                 f"colormap.blend_mode: 未知のモードです: {cfg.blend_mode}"
             )
+        if cfg.blend_mode == "keep":
+            cfg.keep_painted_pixels = True
         
         # Task 2.5.2: Z長さ制限パラメータ
         if cfg.max_z_pixels_per_frame <= 0:
