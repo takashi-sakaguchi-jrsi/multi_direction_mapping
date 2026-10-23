@@ -18,10 +18,15 @@ import cv2
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
+from scipy.ndimage import uniform_filter1d
 import matplotlib.pyplot as plt
 
 from src.validation.geometry import optical_axis_eta, wrap_angle_rad
 from src.validation.strip_correction import select_z_correction_series
+
+# OpenCV remap は src/dst の幅・高さが SHRT_MAX 未満。展開図の z はこれを超える。
+_OPENCV_REMAP_MAX = 32766
+_ETA_SHIFT_CHUNK = 8192
 
 
 class ColormapCorrectionError(Exception):
@@ -522,10 +527,121 @@ def apply_front_attitude_trend_warp(
     col_z = np.arange(w, dtype=float) / max(float(pixels_per_mm), 1e-6)
     dth_col = np.interp(col_z, z_s, d_s, left=float(d_s[0]), right=float(d_s[-1]))
     d_rows = dth_col / (2.0 * np.pi) * h
-    map_x = np.repeat(np.arange(w, dtype=np.float32).reshape(1, -1), h, axis=0)
-    map_y = (
-        np.arange(h, dtype=np.float32).reshape(-1, 1) - d_rows.reshape(1, -1).astype(np.float32)
+    return remap_column_eta_shift(image, d_rows)
+
+
+def deroll_roll_per_column(
+    width: int,
+    z_mm: np.ndarray,
+    roll_rad: np.ndarray,
+    pixels_per_mm: float,
+    z_offset_mm: float = 0.0,
+    smooth: bool = False,
+    smooth_window_mm: float = 800.0,
+) -> Optional[np.ndarray]:
+    """各画素列の deroll 用 roll。smooth なら z 窓で移動平均する。"""
+    w = int(width)
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    roll = np.asarray(roll_rad, dtype=float).reshape(-1)
+    n = min(z.size, roll.size)
+    if n < 2 or w < 2:
+        return None
+    z, roll = z[:n], roll[:n]
+    finite = np.isfinite(z) & np.isfinite(roll)
+    if int(np.sum(finite)) < 2:
+        return None
+    z, roll = z[finite], roll[finite]
+    order = np.argsort(z)
+    z, roll = z[order], roll[order]
+    roll = np.unwrap(roll)
+    uniq = np.concatenate([[True], np.diff(z) > 1e-9])
+    z, roll = z[uniq], roll[uniq]
+    if z.size < 2:
+        return None
+    if float(np.max(np.abs(roll))) < 1e-6:
+        return None
+    ppm = max(float(pixels_per_mm), 1e-6)
+    col_z = float(z_offset_mm) + (np.arange(w, dtype=float) / ppm)
+    roll_col = np.interp(col_z, z, roll, left=float(roll[0]), right=float(roll[-1]))
+    if smooth:
+        roll_col = _smooth_roll_columns(roll_col, ppm, smooth_window_mm)
+    return roll_col.astype(float, copy=False)
+
+
+def _smooth_roll_columns(
+    roll_col: np.ndarray,
+    pixels_per_mm: float,
+    window_mm: float,
+) -> np.ndarray:
+    """画素列の roll を z 方向の移動平均で滑らかにする。"""
+    n = int(np.asarray(roll_col).size)
+    size = int(round(max(float(window_mm), 0.0) * max(float(pixels_per_mm), 1e-6)))
+    size = min(max(size, 0), n)
+    if size < 3 or n < 3:
+        return np.asarray(roll_col, dtype=float)
+    return uniform_filter1d(
+        np.asarray(roll_col, dtype=float), size=size, mode="nearest"
     )
-    return cv2.remap(
-        image, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP
+
+
+def deroll_colormap_to_zero(
+    image: np.ndarray,
+    z_mm: np.ndarray,
+    roll_rad: np.ndarray,
+    pixels_per_mm: float,
+    z_offset_mm: float = 0.0,
+    smooth: bool = False,
+    smooth_window_mm: float = 800.0,
+) -> np.ndarray:
+    """各 z 列を +roll(z) だけ周方向に戻し、roll=0 で塗った並びに近づける。
+
+    実画像ではカメラ roll を +Δ すると帯の行が約 +Δ する。
+    よって roll=r で塗った列は、行を +r 相当（remap では −(−r)）シフトすると
+    roll=0 相当になる。smooth なら列方向の roll を窓平均してからずらす。
+    """
+    h, w = image.shape[:2]
+    if h < 2 or w < 2:
+        return image
+    roll_col = deroll_roll_per_column(
+        w, z_mm, roll_rad, pixels_per_mm, z_offset_mm,
+        smooth=smooth, smooth_window_mm=smooth_window_mm,
     )
+    if roll_col is None:
+        return image
+    d_rows = -roll_col / (2.0 * np.pi) * h
+    return remap_column_eta_shift(image, d_rows)
+
+
+def remap_column_eta_shift(
+    image: np.ndarray,
+    d_rows: np.ndarray,
+    chunk_width: int = _ETA_SHIFT_CHUNK,
+) -> np.ndarray:
+    """各列を η 方向にずらす。列同士は混ぜないので幅を分割して remap する。
+
+    OpenCV remap は一辺が 32767 以上だと失敗する。
+    """
+    h, w = image.shape[:2]
+    shift = np.asarray(d_rows, dtype=np.float32).reshape(-1)
+    if shift.size != w:
+        raise ValueError(f"d_rows の長さが幅と一致しません: {shift.size} != {w}")
+    if h < 2 or w < 1:
+        return image
+    if h >= _OPENCV_REMAP_MAX:
+        raise ColormapCorrectionError(
+            f"画像の高さが OpenCV remap 上限以上です: h={h} (制限: {_OPENCV_REMAP_MAX})"
+        )
+    chunk = int(chunk_width) if chunk_width else _ETA_SHIFT_CHUNK
+    chunk = max(1, min(chunk, _OPENCV_REMAP_MAX, w))
+    out = np.empty_like(image)
+    rows = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    for x0 in range(0, w, chunk):
+        x1 = min(w, x0 + chunk)
+        cw = x1 - x0
+        src = np.ascontiguousarray(image[:, x0:x1])
+        map_x = np.repeat(np.arange(cw, dtype=np.float32).reshape(1, -1), h, axis=0)
+        map_y = rows - shift[x0:x1].reshape(1, -1)
+        out[:, x0:x1] = cv2.remap(
+            src, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP
+        )
+    return out

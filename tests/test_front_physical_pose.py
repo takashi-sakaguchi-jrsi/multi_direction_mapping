@@ -1,12 +1,19 @@
 """正面: 前フレーム姿勢での管 (θ,Z) マッチと姿勢トレンド補正"""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+
+from src.main_twopass import pre_deroll_colormap_path
 
 from src.colormap_correction import (
     apply_front_attitude_trend_warp,
     blend_orientation_toward_vp,
+    deroll_colormap_to_zero,
+    deroll_roll_per_column,
     front_attitude_trend_dtheta_rad,
+    remap_column_eta_shift,
 )
 from src.feature_matching_cylindrical import (
     CylindricalFeatureMatcher,
@@ -116,6 +123,85 @@ def test_attitude_warp_shifts_horizontal_band():
     src_row = int(np.argmax(image.mean(axis=(1, 2))))
     dst_row = int(np.argmax(out.mean(axis=(1, 2))))
     assert src_row != dst_row or float(np.mean(np.abs(out.astype(float) - image))) > 0.5
+
+
+def test_deroll_restores_band_after_roll_shear():
+    h, w = 360, 80
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    image[100:108, :, :] = 200
+    ppm = 1.0
+    z = np.arange(w, dtype=float)
+    roll = np.linspace(0.0, np.radians(20.0), w)
+    rolled = np.empty_like(image)
+    for c in range(w):
+        k = int(round(roll[c] * h / (2.0 * np.pi)))
+        rolled[:, c] = np.roll(image[:, c], k, axis=0)
+    src_row = int(np.argmax(image.mean(axis=(1, 2))))
+    rolled_row = int(np.argmax(rolled[:, -1].mean(axis=1)))
+    assert rolled_row != src_row
+    out = deroll_colormap_to_zero(rolled, z, roll, pixels_per_mm=ppm, z_offset_mm=0.0)
+    dst_row = int(np.argmax(out[:, -1].mean(axis=1)))
+    assert abs(dst_row - src_row) <= 2
+
+
+def test_deroll_smooth_reduces_column_jumps():
+    w = 400
+    z = np.linspace(0.0, 400.0, 40)
+    roll = np.linspace(0.0, np.radians(12.0), z.size)
+    roll[10] += np.radians(8.0)
+    roll[11] -= np.radians(6.0)
+    raw = deroll_roll_per_column(w, z, roll, pixels_per_mm=1.0, smooth=False)
+    sm = deroll_roll_per_column(
+        w, z, roll, pixels_per_mm=1.0, smooth=True, smooth_window_mm=80.0
+    )
+    assert raw is not None and sm is not None
+    assert float(np.max(np.abs(np.diff(sm)))) < float(np.max(np.abs(np.diff(raw))))
+    raw_img = deroll_colormap_to_zero(
+        np.zeros((40, w, 3), dtype=np.uint8), z, roll, 1.0, smooth=False
+    )
+    sm_img = deroll_colormap_to_zero(
+        np.zeros((40, w, 3), dtype=np.uint8), z, roll, 1.0,
+        smooth=True, smooth_window_mm=80.0,
+    )
+    assert raw_img.shape == sm_img.shape
+
+
+def test_deroll_smooth_off_matches_default():
+    h, w = 60, 80
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    image[20:24, :, :] = 180
+    z = np.linspace(0.0, 80.0, 16)
+    roll = np.linspace(0.0, np.radians(10.0), z.size)
+    a = deroll_colormap_to_zero(image, z, roll, pixels_per_mm=1.0)
+    b = deroll_colormap_to_zero(image, z, roll, pixels_per_mm=1.0, smooth=False)
+    assert np.array_equal(a, b)
+
+
+def test_pre_deroll_colormap_path_is_beside_temp():
+    temp = Path("data/output/colormap_temp_20261023_120000.png")
+    out = pre_deroll_colormap_path(temp)
+    assert out.parent == temp.parent
+    assert out.name == "colormap_temp_20261023_120000_before_deroll.png"
+
+
+def test_eta_shift_chunks_match_single_block():
+    rng = np.random.default_rng(0)
+    h, w = 40, 90
+    image = rng.integers(0, 255, size=(h, w, 3), dtype=np.uint8)
+    d_rows = np.linspace(0.0, 7.3, w)
+    full = remap_column_eta_shift(image, d_rows, chunk_width=w)
+    chunked = remap_column_eta_shift(image, d_rows, chunk_width=11)
+    assert np.array_equal(full, chunked)
+
+
+def test_deroll_skips_near_zero_roll():
+    h, w = 40, 20
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    image[10, 5] = 255
+    z = np.linspace(0.0, 20.0, 8)
+    roll = np.zeros(8)
+    out = deroll_colormap_to_zero(image, z, roll, pixels_per_mm=1.0)
+    assert np.array_equal(out, image)
 
 
 def test_pose_unwrap_maps_differ_from_zero_pose(transformer):

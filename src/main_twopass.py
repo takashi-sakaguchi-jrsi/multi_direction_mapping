@@ -80,6 +80,7 @@ from src.colormap_correction import (
     ColormapCorrectionError,
     apply_front_attitude_trend_warp,
     blend_orientation_toward_vp,
+    deroll_colormap_to_zero,
 )
 from src.progress_reporter import ProgressReporter
 from src.camera_utils import compute_fisheye_focal_length
@@ -125,6 +126,12 @@ class InitializationError(MainProcessError):
     pass
 
 
+def pre_deroll_colormap_path(temporary_colormap_path: Path) -> Path:
+    """全体 roll 補正前の展開図パス。temp と同じ場所・同じフラグで扱う。"""
+    temp = Path(temporary_colormap_path)
+    return temp.with_name(f"{temp.stem}_before_deroll{temp.suffix}")
+
+
 # ============================================================================
 # データクラス
 # ============================================================================
@@ -143,6 +150,46 @@ class CameraState:
     orientation: np.ndarray
     frame_num: int
     timestamp: float
+
+
+def resolve_initial_attitude_rad(
+    config: Config,
+    vanishing_points: Any,
+    camera: Any,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[float, float]:
+    """開始時の yaw/pitch [rad]。
+
+    front.initialize_attitude_from_vp が false、または VP 変換に失敗したときは
+    initial_position.theta / phi を使う（既定 0）。
+    """
+    theta0 = float(np.radians(config.initial_position.theta))
+    phi0 = float(np.radians(config.initial_position.phi))
+    front = getattr(config, "front", None)
+    use_vp = True if front is None else bool(
+        getattr(front, "initialize_attitude_from_vp", True)
+    )
+    log = logger.info if logger is not None else (lambda *_a, **_k: None)
+    warn = logger.warning if logger is not None else (lambda *_a, **_k: None)
+    if not use_vp:
+        log(
+            "初期姿勢角をconfig値で初期化（VP初期化オフ）: "
+            f"yaw={np.degrees(theta0):.2f}°, pitch={np.degrees(phi0):.2f}°"
+        )
+        return theta0, phi0
+    try:
+        vp_x, vp_y = vanishing_points[0]
+        initial_yaw, initial_pitch = convert_pixel_to_pose(
+            vp_x, vp_y, camera, theta0
+        )
+        log(
+            f"初期姿勢角をVP推定値で初期化: yaw={np.degrees(initial_yaw):.2f}°, "
+            f"pitch={np.degrees(initial_pitch):.2f}°"
+        )
+        return float(initial_yaw), float(initial_pitch)
+    except (IndexError, ValueError, TypeError) as e:
+        warn(f"VP推定値からの初期化に失敗、config値を使用: {e}")
+        return theta0, phi0
 
 
 # ============================================================================
@@ -191,6 +238,11 @@ class ColorMapPipelineTwoPass:
         self.colormap_gen: Optional[ColorMapGenerator] = None
         self.progress_rep: Optional[ProgressReporter] = None
         self.known_z_mm: Optional[np.ndarray] = None
+        self._paste_residual_field = None
+        self._residual_warp_stats = {"applied": 0, "skipped": 0}
+        self._debug_match_prev_uv = None
+        self._debug_match_curr_uv = None
+        self._debug_match_dZ = None
 
         # OCRエンジンパス設定（環境変数展開対応: %USERPROFILE%, $HOME 等）
         if self.config.ocr.tesseract_cmd:
@@ -279,10 +331,18 @@ class ColorMapPipelineTwoPass:
             
             # 座標変換ユーティリティ
             pipe_radius = self.config.pipe.diameter_mm / 2.0
+            calib = self.config.camera.transformer_calibration()
             self.transformer = CoordinateTransformer(
                 self.camera, pipe_radius,
-                calibration=self.config.camera._lens_calibration
+                calibration=calib
             )
+            if calib is None:
+                self.logger.info(
+                    "レンズ歪みキャリブレーション: 無効 "
+                    "（f, cx, cy はファイル値、Kannala は使わない）"
+                )
+            else:
+                self.logger.info("レンズ歪みキャリブレーション: 有効（Kannala）")
             
             # デバッグ可視化ユーティリティ
             self.debug_vis = DebugVisualizer(self.config.debug)
@@ -643,6 +703,91 @@ class ColorMapPipelineTwoPass:
         self.logger.info("=" * 80)
         self.logger.info("Phase2: カラーマップ生成開始")
         self.logger.info("=" * 80)
+        self._residual_warp_stats = {"applied": 0, "skipped": 0}
+        front = getattr(self.config, "front", None)
+        strip_match = bool(
+            front is not None
+            and str(getattr(self.config, "pipeline", "")).lower() == "front"
+            and bool(getattr(front, "strip_overlap_match", False))
+        )
+        residual_on = (
+            self._use_front_physical_matching()
+            and front is not None
+            and bool(getattr(front, "residual_paste_warp", True))
+            and not strip_match
+        )
+        if residual_on:
+            self.logger.info(
+                "残差貼り付け微調整: 有効 "
+                f"(θビン={int(getattr(front, 'residual_theta_bins', 12))}, "
+                f"zビン={int(getattr(front, 'residual_z_bins', 4))}, "
+                f"|Δθ|≤{float(getattr(front, 'residual_max_dtheta_deg', 2.0)):.1f}°, "
+                f"|ΔZ|≤{float(getattr(front, 'residual_max_dz_mm', 8.0)):.1f}mm)"
+            )
+        elif self._use_front_physical_matching():
+            reason = "（帯重なり実験のため）" if strip_match else ""
+            self.logger.info(f"残差貼り付け微調整: 無効{reason}")
+        if self._use_front_physical_matching():
+            cyl = getattr(
+                getattr(self.camera_estimator, "cylindrical_matcher", None),
+                "config",
+                None,
+            )
+            if cyl is None and front is not None:
+                cyl = front
+            self.logger.info(
+                "物理姿勢クリップ: "
+                f"適用上限 |Δyaw/Δpitch|≤{float(getattr(cyl, 'physical_max_applied_attitude_deg', 1.2)):.1f}° "
+                f"（超えたら姿勢だけ0、dzは残す）, "
+                f"失敗上限 Δyaw≤{float(getattr(cyl, 'physical_max_dyaw_deg', 2.0)):.1f}° "
+                f"Δpitch≤{float(getattr(cyl, 'physical_max_dpitch_deg', 2.0)):.1f}° "
+                f"（超えたら移動量ごと破棄）"
+            )
+        if strip_match:
+            self.logger.info(
+                "帯重なり特徴点測定: 有効（展開後の既描画と現帯から取り直し）"
+            )
+            if bool(getattr(front, "strip_overlap_correct", False)):
+                self.logger.info(
+                    "帯重なり広域補正: 有効（絶対 z, roll を修正して取り直し。"
+                    "移動量推定の droll=0 は維持）"
+                )
+                if bool(getattr(front, "strip_overlap_allow_bin_worse", False)):
+                    self.logger.info(
+                        "帯重なり広域補正: ηビン悪化を許容（z+roll も含む。"
+                        "全体RMSが下がれば採用）"
+                    )
+                else:
+                    self.logger.info(
+                        "帯重なり広域補正: zのみはηビン悪化を許容"
+                        "（z+roll はビン悪化で破棄）"
+                    )
+            else:
+                self.logger.info("帯重なり広域補正: 無効（第1段階は測定のみ）")
+            self.logger.info("重ね合わせ接合: 無効（帯重なり実験のため）")
+        elif (
+            front is not None
+            and str(getattr(self.config, "pipeline", "")).lower() == "front"
+            and bool(getattr(front, "overlap_paste_align", True))
+        ):
+            self.logger.info(
+                "重ね合わせ接合: 有効 "
+                f"|Δθ|≤{float(getattr(front, 'overlap_align_max_dtheta_deg', 8.0)):.1f}°, "
+                f"|ΔZ|≤{float(getattr(front, 'overlap_align_max_dz_mm', 15.0)):.1f}mm, "
+                f"min_resp={float(getattr(front, 'overlap_align_min_response', 0.04)):.3f}"
+            )
+        if (
+            front is not None
+            and str(getattr(self.config, "pipeline", "")).lower() == "front"
+            and bool(getattr(front, "deroll_colormap_after_phase2", False))
+        ):
+            smooth = bool(getattr(front, "deroll_smooth_roll", False))
+            window_mm = float(getattr(front, "deroll_smooth_window_mm", 800.0))
+            self.logger.info(
+                "Phase2末尾: 展開図の roll(z) を 0 に戻す画像補正を適用 "
+                f"smooth={'on' if smooth else 'off'}"
+                + (f" window={window_mm:.0f}mm" if smooth else "")
+            )
 
         # 初期z座標の決定（Phase1のz*を優先）
 
@@ -660,27 +805,9 @@ class ColorMapPipelineTwoPass:
             )
 
 
-        # Phase1のVP推定値から初期yaw/pitchを計算
-        try:
-            # 開始-1フレームのVP推定値（スムージング済み）
-            vp_x, vp_y = vanishing_points[0]
-
-            # VP座標からyaw/pitchを計算
-            initial_yaw, initial_pitch = convert_pixel_to_pose(
-                vp_x, vp_y, self.camera, np.radians(self.config.initial_position.theta)
-            )
-
-            self.logger.info(
-                f"初期姿勢角をVP推定値で初期化: yaw={np.degrees(initial_yaw):.2f}°, "
-                f"pitch={np.degrees(initial_pitch):.2f}°"
-            )
-        except (IndexError, ValueError, TypeError) as e:
-            # VP推定失敗時はconfig値を使用
-            initial_yaw = np.radians(self.config.initial_position.theta)
-            initial_pitch = np.radians(self.config.initial_position.phi)
-            self.logger.warning(
-                f"VP推定値からの初期化に失敗、config値を使用: {e}"
-            )
+        initial_yaw, initial_pitch = resolve_initial_attitude_rad(
+            self.config, vanishing_points, self.camera, logger=self.logger
+        )
 
         # カメラ状態初期化（actual_start_frameで初期化）
         camera_state = CameraState(
@@ -1306,6 +1433,19 @@ class ColorMapPipelineTwoPass:
         self.logger.info(f"  - 特徴点抽出失敗: {skipped_failed_count}")
         self.logger.info(f"  - Z方向停止: {skipped_dz_zero_count}")
         self.logger.info(f"dz_minが0にクリップされたフレーム数: {dz_min_clipped_count}")
+        rw = self._residual_warp_stats
+        self.logger.info(
+            f"残差貼り付け微調整: 適用={rw.get('applied', 0)}, "
+            f"適用なし={rw.get('skipped', 0)}"
+        )
+        oa = getattr(self.colormap_gen, "overlap_align_stats", None)
+        if oa:
+            self.logger.info(
+                f"重ね合わせ接合: 適用={oa.get('applied', 0)}, "
+                f"適用なし={oa.get('skipped', 0)}"
+            )
+        if getattr(self.colormap_gen, "strip_overlap_match", False):
+            self.colormap_gen.log_strip_overlap_stats()
         self.logger.info(f"OCR制約範囲逸脱数: {ocr_constraint_violation_count}")
         if total_frames > 0:
             self.logger.info(
@@ -1317,6 +1457,10 @@ class ColorMapPipelineTwoPass:
         self.logger.info(f"Yaw角補正回数: {self.camera_estimator.stats.get('yaw_constrained_count', 0)}")
         self.logger.info(f"Pitch角補正回数: {self.camera_estimator.stats.get('pitch_constrained_count', 0)}")
         self.logger.info(f"Roll角補正回数: {self.camera_estimator.stats.get('roll_constrained_count', 0)}")
+
+        color_map_img = self._deroll_colormap_after_phase2(
+            color_map_img, frame_data_list
+        )
 
         # Excel出力
         self._save_frame_data_to_excel(frame_data_list)
@@ -1356,6 +1500,7 @@ class ColorMapPipelineTwoPass:
             motion: motion辞書
             status: "SUCCESS" | "STATIC_FRAME" | "FAILED"
         """
+        self._paste_residual_field = None
         # Phase1のスムージング済み消失点をそのまま使用
         if yaw_est is not None and pitch_est is not None:
             self.logger.debug(
@@ -1393,6 +1538,7 @@ class ColorMapPipelineTwoPass:
                 # 静止状態チェック（最重要）
                 if status == "STATIC_FRAME":
                     self.logger.info(f"フレーム{camera_state.frame_num}: 静止状態のためスキップ（柔軟推定）")
+                    self._clear_debug_match_vectors()
                     # 移動量ゼロを返す（基準フレーム更新しない想定）
                     return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "STATIC_FRAME"
 
@@ -1400,6 +1546,7 @@ class ColorMapPipelineTwoPass:
                 # 特徴点抽出失敗チェック
                 if status == "FAILED" or prev_points is None or curr_points is None:
                     self.logger.warning("特徴点マッチング失敗、移動量をゼロとします")
+                    self._clear_debug_match_vectors()
                     return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
 
                 motion = self.camera_estimator.estimate_motion_flexible(
@@ -1415,6 +1562,7 @@ class ColorMapPipelineTwoPass:
                 # 静止状態チェック（最重要）
                 if status == "STATIC_FRAME":
                     self.logger.info(f"フレーム{camera_state.frame_num}: 静止状態のためスキップ（制約付き推定）")
+                    self._clear_debug_match_vectors()
                     # 移動量ゼロを返す（基準フレーム更新しない想定）
                     return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "STATIC_FRAME"
 
@@ -1422,6 +1570,7 @@ class ColorMapPipelineTwoPass:
                 # 特徴点抽出失敗チェック
                 if status == "FAILED" or prev_points is None or curr_points is None:
                     self.logger.warning("特徴点マッチング失敗、移動量をゼロとします")
+                    self._clear_debug_match_vectors()
                     return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
 
                 cyl_matcher = self.camera_estimator.cylindrical_matcher
@@ -1464,6 +1613,7 @@ class ColorMapPipelineTwoPass:
                         "dtheta": float(phys.get("dyaw", 0.0)),
                         "dphi": float(phys.get("dpitch", 0.0)),
                     }
+                    self._store_paste_residual_field(prev_cyl, curr_cyl, phys)
                 else:
                     # 位相相関結果をチェック
                     fixed_dz = None
@@ -1589,10 +1739,14 @@ class ColorMapPipelineTwoPass:
                 f"dz={motion_constrained['dz']:.2f}, droll={np.degrees(motion_constrained['droll']):.2f}°"
             )
 
+            self._capture_debug_match_vectors(
+                prev_points, curr_points, camera_state, curr_frame
+            )
             return movement_raw, movement_constrained, yaw_est, pitch_est, motion_constrained, "SUCCESS"
 
         except Exception as e:
             self.logger.warning(f"移動量推定失敗: {e}, 移動量をゼロとします")
+            self._clear_debug_match_vectors()
             return np.zeros(6), np.zeros(6), yaw_est, pitch_est, None, "FAILED"
 
     def _extract_features_from_frames(
@@ -1649,6 +1803,47 @@ class ColorMapPipelineTwoPass:
             return False
         return str(getattr(getattr(cyl, "config", None), "z_axis", "tan") or "tan").lower() == "physical"
 
+    def _store_paste_residual_field(
+        self,
+        prev_cyl: np.ndarray,
+        curr_cyl: np.ndarray,
+        phys: Dict[str, Any],
+    ) -> None:
+        """3DoF を姿勢に積んだあとの残差フィールド。失敗時は貼り付けを従来どおりにする。"""
+        self._paste_residual_field = None
+        front = getattr(self.config, "front", None)
+        if front is None or not bool(getattr(front, "residual_paste_warp", True)):
+            return
+        if bool(getattr(front, "strip_overlap_match", False)):
+            return
+        if not phys or not phys.get("success"):
+            return
+        from src.front_residual_warp import build_residual_warp_field
+        field = build_residual_warp_field(
+            prev_cyl,
+            curr_cyl,
+            dz=float(phys.get("dz", 0.0)),
+            dyaw=float(phys.get("dyaw", 0.0)),
+            dpitch=float(phys.get("dpitch", 0.0)),
+            pipe_radius_mm=float(self.config.pipe.diameter_mm) / 2.0,
+            theta_bins=int(getattr(front, "residual_theta_bins", 12)),
+            z_bins=int(getattr(front, "residual_z_bins", 4)),
+            max_dtheta_deg=float(getattr(front, "residual_max_dtheta_deg", 2.0)),
+            max_dz_mm=float(getattr(front, "residual_max_dz_mm", 8.0)),
+            min_bin_points=int(getattr(front, "residual_min_bin_points", 2)),
+        )
+        self._paste_residual_field = field
+        if field is not None:
+            self._residual_warp_stats["applied"] += 1
+            self.logger.info(
+                "残差貼り付け微調整: 適用 "
+                f"dη_rms={np.degrees(np.sqrt(np.mean(field.d_eta_rad ** 2))):.3f}°, "
+                f"dz_rms={float(np.sqrt(np.mean(field.d_z_mm ** 2))):.2f}mm"
+            )
+        else:
+            self._residual_warp_stats["skipped"] += 1
+            self.logger.info("残差貼り付け微調整: 適用なし（残差ほぼ0または点数不足）")
+
     def _generate_colormap_frame(
         self,
         curr_frame: np.ndarray,
@@ -1668,9 +1863,12 @@ class ColorMapPipelineTwoPass:
         # カメラ状態を辞書形式に変換
         camera_state_dict = {
             'position': camera_state.position,
-            'orientation': camera_state.orientation
+            'orientation': camera_state.orientation,
+            'frame_num': camera_state.frame_num,
         }
         
+        residual_warp = self._paste_residual_field
+        self._paste_residual_field = None
         # カラーマップに1フレーム追加
         color_map_img = self.colormap_gen.add_frame(
             curr_frame,
@@ -1678,10 +1876,82 @@ class ColorMapPipelineTwoPass:
             self.camera_params,
             color_map_img,
             max_dz=self.config.estimation.motion.max_dz,
-            alpha=self.config.colormap.alpha
+            alpha=self.config.colormap.alpha,
+            residual_warp=residual_warp,
         )
         
         return color_map_img
+
+    def _clear_debug_match_vectors(self) -> None:
+        self._debug_match_prev_uv = None
+        self._debug_match_curr_uv = None
+        self._debug_match_dZ = None
+
+    def _capture_debug_match_vectors(
+        self,
+        prev_points: Optional[np.ndarray],
+        curr_points: Optional[np.ndarray],
+        camera_state: CameraState,
+        curr_frame: np.ndarray,
+    ) -> None:
+        """推定に使った点をフレーム座標へ戻し、デバッグ描画用に保持する。"""
+        self._clear_debug_match_vectors()
+        dbg = getattr(self.config, "debug", None)
+        if dbg is None or not bool(getattr(dbg, "enabled", False)):
+            return
+        if not bool(getattr(dbg, "show_feature_points", True)):
+            return
+        matcher = getattr(self.camera_estimator, "cylindrical_matcher", None)
+        prev_c = getattr(matcher, "_last_prev_points_cyl", None) if matcher is not None else None
+        curr_c = getattr(matcher, "_last_curr_points_cyl", None) if matcher is not None else None
+        h, w = curr_frame.shape[:2]
+
+        def _is_frame_uv(pts: np.ndarray) -> bool:
+            pts = np.asarray(pts, dtype=float)
+            if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) == 0:
+                return False
+            return float(np.nanmax(np.abs(pts[:, 0]))) > 360.0 or float(
+                np.nanmax(np.abs(pts[:, 1]))
+            ) > float(h)
+
+        if (
+            prev_points is not None
+            and curr_points is not None
+            and len(prev_points) == len(curr_points)
+            and len(prev_points) > 0
+            and _is_frame_uv(prev_points)
+        ):
+            self._debug_match_prev_uv = np.asarray(prev_points, dtype=float)
+            self._debug_match_curr_uv = np.asarray(curr_points, dtype=float)
+            if prev_c is not None and curr_c is not None and len(prev_c) == len(prev_points):
+                self._debug_match_dZ = curr_c[:, 1] - prev_c[:, 1]
+            return
+        params = dict(self.camera_params or {})
+        params.setdefault("image_width", w)
+        params.setdefault("image_height", h)
+        params["cam_pos"] = np.asarray(camera_state.position, dtype=float)
+        params["roll"] = float(camera_state.orientation[0])
+        params["yaw"] = float(camera_state.orientation[1])
+        params["pitch"] = float(camera_state.orientation[2])
+        if (
+            matcher is not None
+            and prev_c is not None
+            and curr_c is not None
+            and len(prev_c) == len(curr_c)
+            and len(prev_c) > 0
+        ):
+            prev_uv, prev_mask = matcher._invert_to_frame_coordinates(
+                prev_c, None, None, params
+            )
+            curr_uv, curr_mask = matcher._invert_to_frame_coordinates(
+                curr_c, None, None, params
+            )
+            if prev_uv is not None and curr_uv is not None:
+                keep = prev_mask & curr_mask
+                if np.any(keep):
+                    self._debug_match_prev_uv = prev_uv[keep]
+                    self._debug_match_curr_uv = curr_uv[keep]
+                    self._debug_match_dZ = curr_c[keep, 1] - prev_c[keep, 1]
     
     def _debug_visualize(
         self,
@@ -1717,6 +1987,14 @@ class ColorMapPipelineTwoPass:
             camera_state.orientation[1],
             camera_state.orientation[2]
         )
+
+        if self._debug_match_prev_uv is not None and self._debug_match_curr_uv is not None:
+            debug_frame = self.debug_vis.draw_feature_vectors(
+                debug_frame,
+                self._debug_match_prev_uv,
+                self._debug_match_curr_uv,
+                dZ_mm=self._debug_match_dZ,
+            )
         
         # テキスト情報オーバーレイ
         info = {
@@ -1727,6 +2005,14 @@ class ColorMapPipelineTwoPass:
             'z_star': z_star  # Phase1の推定値
         }
         debug_frame = self.debug_vis.add_text_overlay(debug_frame, info)
+
+        if bool(getattr(self.config.debug, "output_debug_images", False)):
+            out_dir = Path(getattr(self.config.debug, "debug_image_path", "debug/"))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"features_{camera_state.frame_num:06d}.png"
+            cv2.imwrite(str(out_path), debug_frame)
+        elif self.debug_vis:
+            self.debug_vis.save_frame(debug_frame, camera_state.frame_num, prefix="features")
         
         # フレーム表示
         if not self.debug_vis.show_frame("Camera Car Simulator", debug_frame):
@@ -2142,34 +2428,86 @@ class ColorMapPipelineTwoPass:
         Raises:
             なし（削除失敗は例外としない）
         """
-        # 削除フラグチェック
-        if not self.config.colormap.delete_temporary_images:
-            self.logger.info(
-                f"一時展開画像を保持します（設定により）: {temporary_colormap_path}"
-            )
-            return
-        
-        # ファイルパス取得
         temp_path = Path(temporary_colormap_path)
-        
-        # ファイル存在チェック
-        if not temp_path.exists():
-            self.logger.info(
-                f"一時展開画像が存在しないためスキップします: {temp_path}"
-            )
+        paths = [temp_path, pre_deroll_colormap_path(temp_path)]
+        if not self.config.colormap.delete_temporary_images:
+            for path in paths:
+                if path.exists():
+                    self.logger.info(
+                        f"一時展開画像を保持します（設定により）: {path}"
+                    )
             return
-        
-        # 削除実行
-        self.logger.info(f"Phase3補正完了: 一時展開画像を削除します: {temp_path}")
+        for path in paths:
+            self._unlink_temporary_image(path, missing_ok=(path != temp_path))
+
+    def _unlink_temporary_image(self, path: Path, missing_ok: bool = False) -> None:
+        if not path.exists():
+            if not missing_ok:
+                self.logger.info(
+                    f"一時展開画像が存在しないためスキップします: {path}"
+                )
+            return
+        self.logger.info(f"Phase3補正完了: 一時展開画像を削除します: {path}")
         try:
-            temp_path.unlink()
-            self.logger.info(f"一時展開画像を削除しました: {temp_path}")
+            path.unlink()
+            self.logger.info(f"一時展開画像を削除しました: {path}")
         except Exception as e:
-            # 削除失敗は処理を中断させない
             self.logger.warning(
-                f"一時展開画像の削除に失敗しました: {temp_path} - {e}"
+                f"一時展開画像の削除に失敗しました: {path} - {e}"
             )
-            self.logger.warning(f"手動で削除してください: {temp_path}")
+            self.logger.warning(f"手動で削除してください: {path}")
+
+    def _deroll_colormap_after_phase2(
+        self,
+        color_map_img: Optional[np.ndarray],
+        frame_data_list: List[Dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        """Phase2 末尾で展開図を roll=0 相当へ戻す。Excel の roll 列は残す。"""
+        front = getattr(self.config, "front", None)
+        if color_map_img is None:
+            return color_map_img
+        if str(getattr(self.config, "pipeline", "")).lower() != "front":
+            return color_map_img
+        if not bool(getattr(front, "deroll_colormap_after_phase2", False)):
+            return color_map_img
+        if not frame_data_list:
+            return color_map_img
+        z = np.array([float(d.get("z", np.nan)) for d in frame_data_list], dtype=float)
+        roll = np.array(
+            [float(d.get("roll", np.nan)) for d in frame_data_list], dtype=float
+        )
+        finite = np.isfinite(z) & np.isfinite(roll)
+        if int(np.sum(finite)) < 2:
+            self.logger.info("Phase2末尾 deroll: 有効な roll(z) が不足のためスキップ")
+            return color_map_img
+        z_off = float(getattr(self.colormap_gen, "z_offset", 0.0) or 0.0)
+        ppm = float(self.colormap_gen.pixels_per_mm)
+        rolled_max = float(np.degrees(np.max(np.abs(roll[finite]))))
+        smooth = bool(getattr(front, "deroll_smooth_roll", False))
+        window_mm = float(getattr(front, "deroll_smooth_window_mm", 800.0))
+        self._save_pre_deroll_colormap(color_map_img)
+        warped = deroll_colormap_to_zero(
+            color_map_img, z, roll, pixels_per_mm=ppm, z_offset_mm=z_off,
+            smooth=smooth, smooth_window_mm=window_mm,
+        )
+        self.logger.info(
+            "Phase2末尾 deroll: 展開図の roll を 0 に戻した "
+            f"|roll|_max={rolled_max:.2f}° frames={int(np.sum(finite))} "
+            f"smooth={'on' if smooth else 'off'}"
+            + (f" window={window_mm:.0f}mm" if smooth else "")
+        )
+        return warped
+
+    def _save_pre_deroll_colormap(self, color_map_img: np.ndarray) -> None:
+        """全体 roll 補正前の展開図を temp の隣へ出す。削除は temp と同じフラグ。"""
+        timestamp = self._timestamp or "unknown"
+        temp_path = Path(
+            self.config.output.temporary_colormap_path.format(timestamp=timestamp)
+        )
+        out_path = pre_deroll_colormap_path(temp_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.imsave(str(out_path), color_map_img)
+        self.logger.info(f"全体roll補正前の展開図を保存しました: {out_path}")
 
     def _apply_front_attitude_trend(self, colormap_path: Path, excel_path: Path) -> None:
         """マッチ蓄積 yaw/pitch の低周波を消失点へ合わせる。"""
