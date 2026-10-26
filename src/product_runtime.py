@@ -249,6 +249,14 @@ def apply_front_profile(config: Config) -> None:
         cyl.physical_untrusted_attitude_deg = float(
             getattr(front, "physical_untrusted_attitude_deg", 0.8)
         )
+        from src.feature_matching_cylindrical import (
+            normalize_physical_attitude_source,
+        )
+        source = normalize_physical_attitude_source(
+            getattr(front, "physical_attitude_source", "match")
+        )
+        front.physical_attitude_source = source
+        cyl.physical_attitude_source = source
         filt = config.estimation.feature_filtering
         filt.magnitude_filter_enabled = False
         filt.direction_filter_enabled = False
@@ -256,7 +264,7 @@ def apply_front_profile(config: Config) -> None:
         motion.estimate_dx = False
         motion.estimate_droll = False
         motion.hybrid_two_stage_enabled = False
-        # 展開は前フレーム姿勢。マッチは dz と Δyaw/Δpitch。画素 LS は使わない。
+        # 展開は前フレーム姿勢。マッチは dz（と mode により Δyaw/Δpitch）。画素 LS は使わない。
         # 残差 (η, z) 微調整は FrontConfig.residual_paste_warp（既定 true）。姿勢には積まない。
         config.colormap.keep_painted_pixels = bool(
             getattr(front, "keep_painted_colormap", False)

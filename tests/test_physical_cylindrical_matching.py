@@ -9,8 +9,10 @@ from src.feature_matching_cylindrical import (
     CylindricalFeatureMatcher,
     CylindricalMatchingConfig,
     clip_front_physical_estimate,
+    estimate_front_physical_dz_only,
     estimate_front_physical_option2,
     filter_physical_motion_vectors,
+    filter_subpixel_displacement,
 )
 from src.product_runtime import apply_front_profile
 
@@ -51,6 +53,11 @@ def test_pure_dz_is_uniform_and_recovers_dz():
     assert est["success"]
     assert est["droll"] == 0.0
     assert est["dz"] == pytest.approx(dz_true, abs=1e-6)
+    dz_only = estimate_front_physical_dz_only(prev, curr)
+    assert dz_only["success"]
+    assert dz_only["dyaw"] == 0.0
+    assert dz_only["dpitch"] == 0.0
+    assert dz_only["dz"] == pytest.approx(dz_true, abs=1e-6)
 
 
 def test_yaw_like_harmonic_does_not_go_to_droll_or_dz():
@@ -196,6 +203,14 @@ def test_clip_suppresses_large_attitude_keeps_dz():
     assert tiny.get("attitude_suppressed") is False
     assert np.degrees(tiny["dyaw"]) == pytest.approx(0.3)
 
+    keep_yaw = clip_front_physical_estimate(
+        {"success": True, "dz": 4.0, "dyaw": np.radians(10.0), "dpitch": 0.0, "n_points": 20},
+        max_dyaw_deg=2.0,
+        clip_attitude=False,
+    )
+    assert keep_yaw["success"] is True
+    assert np.degrees(keep_yaw["dyaw"]) == pytest.approx(10.0)
+
 
 def test_harmonic_residual_iqr_drops_false_match():
     theta = np.linspace(0.0, 360.0, 20, endpoint=False)
@@ -223,3 +238,52 @@ def test_apply_front_profile_enables_option2():
     assert config.estimation.feature_filtering.magnitude_filter_enabled is False
     assert config.estimation.motion.estimate_dx is False
     assert config.estimation.motion.estimate_droll is False
+    assert cyl.exclude_subpixel_matches is False
+    assert cyl.physical_max_applied_attitude_deg == pytest.approx(1.2)
+    assert cyl.physical_max_dpitch_deg == pytest.approx(2.0)
+    assert cyl.physical_max_dyaw_deg == pytest.approx(2.0)
+
+
+def test_front_attitude_limits_copy_to_cylindrical():
+    config = Config.from_dict({
+        "pipeline": "front",
+        "front": {
+            "physical_max_applied_attitude_deg": 2.5,
+            "physical_max_dpitch_deg": 3.0,
+            "physical_max_dyaw_deg": 4.0,
+            "physical_untrusted_attitude_deg": 1.5,
+        },
+    })
+    apply_front_profile(config)
+    cyl = config.estimation.feature_matching.cylindrical
+    assert cyl.physical_max_applied_attitude_deg == pytest.approx(2.5)
+    assert cyl.physical_max_dpitch_deg == pytest.approx(3.0)
+    assert cyl.physical_max_dyaw_deg == pytest.approx(4.0)
+    assert cyl.physical_untrusted_attitude_deg == pytest.approx(1.5)
+
+
+def test_filter_subpixel_disabled_keeps_stationary():
+    prev = np.array([[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]])
+    curr = np.array([[10.1, 10.0], [35.0, 21.0], [30.2, 30.1]])
+    out_p, out_c = filter_subpixel_displacement(prev, curr, enabled=False)
+    assert len(out_p) == 3
+    np.testing.assert_array_equal(out_p, prev)
+
+
+def test_filter_subpixel_enabled_drops_small_when_movers_exist():
+    prev = np.array([[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]])
+    curr = np.array([[10.1, 10.0], [35.0, 21.0], [30.2, 30.1]])
+    out_p, out_c = filter_subpixel_displacement(
+        prev, curr, enabled=True, min_pixel_displacement=0.5
+    )
+    assert len(out_p) == 1
+    np.testing.assert_allclose(out_p[0], [20.0, 20.0])
+
+
+def test_filter_subpixel_enabled_keeps_all_when_all_stationary():
+    prev = np.array([[10.0, 10.0], [20.0, 20.0]])
+    curr = np.array([[10.1, 10.0], [20.2, 20.1]])
+    out_p, _ = filter_subpixel_displacement(
+        prev, curr, enabled=True, min_pixel_displacement=0.5
+    )
+    assert len(out_p) == 2

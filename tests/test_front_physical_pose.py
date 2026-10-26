@@ -18,8 +18,11 @@ from src.colormap_correction import (
 from src.feature_matching_cylindrical import (
     CylindricalFeatureMatcher,
     CylindricalMatchingConfig,
+    apply_physical_mapping_attitude,
+    estimate_front_physical_dz_only,
     estimate_front_physical_option2,
     filter_physical_motion_vectors,
+    normalize_physical_attitude_source,
 )
 
 
@@ -51,6 +54,103 @@ def test_local_motion_recovers_dz_dyaw_dpitch():
     assert result["dz"] == pytest.approx(dz, rel=0.05, abs=0.2)
     assert np.degrees(result["dyaw"]) == pytest.approx(np.degrees(dyaw), abs=0.08)
     assert np.degrees(result["dpitch"]) == pytest.approx(np.degrees(dpitch), abs=0.08)
+
+
+def test_dz_only_recovers_uniform_dz_without_yaw():
+    rng = np.random.default_rng(1)
+    n = 80
+    radius = 125.0
+    theta = rng.uniform(0.0, 360.0, n)
+    z = rng.uniform(80.0, 250.0, n)
+    dz = 5.0
+    dZ, dth = _synthetic_flow(theta, z, radius, dz, 0.0, 0.0)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta + dth, z + dZ])
+    result = estimate_front_physical_dz_only(prev, curr, pipe_radius_mm=radius)
+    assert result["success"]
+    assert result["dyaw"] == 0.0
+    assert result["dpitch"] == 0.0
+    assert result["dz"] == pytest.approx(dz, rel=0.05, abs=0.2)
+
+
+def test_dz_only_ignores_yaw_that_three_dof_recovers():
+    rng = np.random.default_rng(2)
+    n = 80
+    radius = 125.0
+    theta = rng.uniform(0.0, 360.0, n)
+    z = rng.uniform(80.0, 250.0, n)
+    dz, dyaw, dpitch = 5.0, np.radians(0.4), np.radians(-0.25)
+    dZ, dth = _synthetic_flow(theta, z, radius, dz, dyaw, dpitch)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta + dth, z + dZ])
+    three = estimate_front_physical_option2(prev, curr, pipe_radius_mm=radius)
+    one = estimate_front_physical_dz_only(prev, curr, pipe_radius_mm=radius)
+    assert three["success"] and one["success"]
+    assert np.degrees(three["dyaw"]) == pytest.approx(np.degrees(dyaw), abs=0.08)
+    assert one["dyaw"] == 0.0
+    assert one["dpitch"] == 0.0
+    assert three["dz"] == pytest.approx(dz, rel=0.05, abs=0.2)
+    assert one["dz"] == pytest.approx(dz, rel=0.15, abs=0.8)
+
+
+def test_dz_only_leaks_yaw_into_dz_when_theta_clustered():
+    rng = np.random.default_rng(3)
+    n = 80
+    radius = 125.0
+    theta = rng.normal(0.0, 12.0, n)
+    z = rng.uniform(80.0, 250.0, n)
+    dz, dyaw, dpitch = 5.0, np.radians(0.8), 0.0
+    dZ, dth = _synthetic_flow(theta, z, radius, dz, dyaw, dpitch)
+    prev = np.column_stack([theta, z])
+    curr = np.column_stack([theta + dth, z + dZ])
+    three = estimate_front_physical_option2(prev, curr, pipe_radius_mm=radius)
+    one = estimate_front_physical_dz_only(prev, curr, pipe_radius_mm=radius)
+    assert three["success"] and one["success"]
+    assert abs(three["dz"] - dz) < abs(one["dz"] - dz)
+    assert one["dyaw"] == 0.0
+
+
+def test_discard_mapping_uses_vanishing_point_delta():
+    motion = {
+        "dx": 0.0,
+        "dy": 0.0,
+        "dz": 5.0,
+        "droll": 0.0,
+        "dtheta": np.radians(0.4),
+        "dphi": np.radians(-0.2),
+    }
+    yaw0, pitch0 = np.radians(6.0), np.radians(-5.0)
+    yaw_est, pitch_est = np.radians(6.2), np.radians(-4.7)
+    kept = apply_physical_mapping_attitude(
+        motion, "match", yaw0, pitch0, yaw_est, pitch_est
+    )
+    assert kept["dtheta"] == pytest.approx(motion["dtheta"])
+    assert kept["dphi"] == pytest.approx(motion["dphi"])
+    replaced = apply_physical_mapping_attitude(
+        motion, "discard", yaw0, pitch0, yaw_est, pitch_est
+    )
+    assert replaced["dtheta"] == pytest.approx(yaw_est - yaw0)
+    assert replaced["dphi"] == pytest.approx(pitch_est - pitch0)
+    assert replaced["dtheta_match"] == pytest.approx(motion["dtheta"])
+    assert replaced["dz"] == pytest.approx(5.0)
+    dz_only = apply_physical_mapping_attitude(
+        {**motion, "dtheta": 0.0, "dphi": 0.0},
+        "dz_only",
+        yaw0,
+        pitch0,
+        yaw_est,
+        pitch_est,
+    )
+    assert dz_only["dtheta"] == pytest.approx(yaw_est - yaw0)
+    assert dz_only["dphi"] == pytest.approx(pitch_est - pitch0)
+
+
+def test_normalize_physical_attitude_source():
+    assert normalize_physical_attitude_source("Discard") == "discard"
+    assert normalize_physical_attitude_source("dz-only") == "dz_only"
+    assert normalize_physical_attitude_source(None) == "match"
+    with pytest.raises(ValueError):
+        normalize_physical_attitude_source("nope")
 
 
 def test_iqr_keeps_first_harmonic_dz():

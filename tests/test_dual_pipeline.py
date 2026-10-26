@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from src.config import Config
+from src.main_twopass import resolve_initial_attitude_rad
 from src.product_runtime import (
     PipelineCliError,
     apply_front_profile,
@@ -132,6 +133,53 @@ def test_cli_rejects_cross_pipeline_options(tmp_path: Path):
         validate_pipeline_cli_args("front", _args(input_dir=tmp_path))
 
 
+def test_front_config_parses_initialize_attitude_from_vp():
+    cfg = Config.from_dict({"front": {"initialize_attitude_from_vp": False}})
+    assert cfg.front.initialize_attitude_from_vp is False
+    assert Config().front.initialize_attitude_from_vp is True
+
+
+def test_initial_attitude_uses_config_when_vp_init_disabled():
+    cfg = Config.from_dict({
+        "front": {"initialize_attitude_from_vp": False},
+        "initial_position": {"theta": 0.0, "phi": 0.0},
+    })
+    yaw, pitch = resolve_initial_attitude_rad(cfg, [(900.0, 400.0)], camera=None)
+    assert yaw == pytest.approx(0.0)
+    assert pitch == pytest.approx(0.0)
+
+
+def test_initial_attitude_vp_failure_falls_back_to_config():
+    cfg = Config.from_dict({
+        "front": {"initialize_attitude_from_vp": True},
+        "initial_position": {"theta": 1.5, "phi": -0.5},
+    })
+    yaw, pitch = resolve_initial_attitude_rad(cfg, [], camera=None)
+    assert yaw == pytest.approx(np.radians(1.5))
+    assert pitch == pytest.approx(np.radians(-0.5))
+
+
+def test_front_config_parses_physical_attitude_source():
+    cfg = Config.from_dict({"front": {"physical_attitude_source": "dz_only"}})
+    assert cfg.front.physical_attitude_source == "dz_only"
+    apply_front_profile(cfg)
+    assert cfg.front.physical_attitude_source == "dz_only"
+    assert (
+        cfg.estimation.feature_matching.cylindrical.physical_attitude_source
+        == "dz_only"
+    )
+    cfg2 = Config.from_dict({"front": {"physical_attitude_source": "discard"}})
+    apply_front_profile(cfg2)
+    assert cfg2.front.physical_attitude_source == "discard"
+    assert Config().front.physical_attitude_source == "match"
+
+
+def test_apply_front_profile_rejects_unknown_attitude_source():
+    cfg = Config.from_dict({"front": {"physical_attitude_source": "nope"}})
+    with pytest.raises(ValueError, match="physical_attitude_source"):
+        apply_front_profile(cfg)
+
+
 def test_apply_front_profile_restores_vp_bounds():
     config = Config()
     config.estimation.use_vanishing_point_constraints = False
@@ -143,6 +191,7 @@ def test_apply_front_profile_restores_vp_bounds():
     assert config.estimation.motion.use_vanishing_point_yaw is True
     assert config.estimation.feature_matching.cylindrical.z_axis == "physical"
     assert config.estimation.motion.estimate_droll is False
+    assert config.estimation.feature_matching.cylindrical.physical_attitude_source == "match"
 
 
 def test_sideview_alias_json_merges_into_two_direction():

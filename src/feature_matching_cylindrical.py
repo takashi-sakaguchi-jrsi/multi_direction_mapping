@@ -133,6 +133,11 @@ class CylindricalMatchingConfig:
         physical_min_points_for_attitude: これ未満で大きな Δyaw/Δpitch は積まない（dz は積む）
         physical_untrusted_attitude_deg: 低点数のとき姿勢を捨てる閾値（度）
         physical_max_applied_attitude_deg: 点数に関係なく姿勢を捨てる上限（度）。微小振動は残す
+        physical_attitude_source: 展開に積む yaw/pitch。match=3DoF、
+            discard=3DoF推定は残し適用は消失点、dz_only=推定もdzのみ
+        exclude_subpixel_matches: 円筒上で変位が閾値未満の点を落とすか。
+            既定 False。True だと停止点（正しい微小移動）が落ち、継ぎ目誤マッチが多数派になり得る。
+        min_pixel_displacement: exclude_subpixel_matches=True のときの最小変位（px）
 
         # 位相相関パラメータ
         phase_correlation_enabled: 位相相関によるdz/droll推定の有効/無効
@@ -199,6 +204,9 @@ class CylindricalMatchingConfig:
     physical_min_points_for_attitude: int = 20
     physical_untrusted_attitude_deg: float = 0.8
     physical_max_applied_attitude_deg: float = 1.2
+    physical_attitude_source: str = "match"
+    exclude_subpixel_matches: bool = False
+    min_pixel_displacement: float = 0.5
 
     # 位相相関パラメータ
     phase_correlation_enabled: bool = False
@@ -423,39 +431,16 @@ class CylindricalFeatureMatcher:
             prev_points_pixel = np.float32([prev_kp[m.queryIdx].pt for m in matches])
             curr_points_pixel = np.float32([curr_kp[m.trainIdx].pt for m in matches])
 
-            # 同一位置マッチの除外（静止フレーム誤検出防止）
-            # 円筒画像上で同じ位置にマッチしたポイントは移動情報を持たない
-            pixel_displacements = np.linalg.norm(curr_points_pixel - prev_points_pixel, axis=1)
-            MIN_PIXEL_DISPLACEMENT = 0.5  # 最小ピクセル変位閾値
-            valid_mask = pixel_displacements > MIN_PIXEL_DISPLACEMENT
-            n_same_position = np.sum(~valid_mask)
-            n_with_displacement = np.sum(valid_mask)
-
-            if n_same_position > 0:
-                self.logger.debug(
-                    f"同一位置マッチ検出: {n_same_position}点 "
-                    f"(全{len(prev_points_pixel)}点中、"
-                    f"除外率={100.0*n_same_position/len(prev_points_pixel):.1f}%)"
-                )
-
-            # 変位を持つ点がある場合は、ゼロ変位点を常に除外して使用
-            # ゼロ変位点はモーション推定でdz=0に引き寄せる偏りを生むため
-            if n_with_displacement > 0:
-                prev_points_pixel = prev_points_pixel[valid_mask]
-                curr_points_pixel = curr_points_pixel[valid_mask]
-                if n_with_displacement < self.config.min_inlier_count:
-                    self.logger.info(
-                        f"変位有り点が少数({n_with_displacement}点 < "
-                        f"推奨{self.config.min_inlier_count}点)だがゼロ変位点を除外して続行"
-                    )
-                else:
-                    self.logger.debug(f"変位有り点のみ使用: {n_with_displacement}点")
-            else:
-                # 全点が同一位置の場合は静止フレームとして処理
-                self.logger.info(
-                    f"全マッチ点({len(prev_points_pixel)}点)が同一位置、"
-                    f"静止フレームの可能性が高い"
-                )
+            prev_points_pixel, curr_points_pixel = filter_subpixel_displacement(
+                prev_points_pixel,
+                curr_points_pixel,
+                enabled=bool(getattr(self.config, "exclude_subpixel_matches", False)),
+                min_pixel_displacement=float(
+                    getattr(self.config, "min_pixel_displacement", 0.5)
+                ),
+                logger=self.logger,
+                min_inlier_count=int(self.config.min_inlier_count),
+            )
 
             # (x, y) を (theta, z) に変換
             prev_points_cyl = self._pixel_to_cylindrical(prev_points_pixel)
@@ -810,10 +795,9 @@ class CylindricalFeatureMatcher:
             Y = R * np.sin(theta_rad)
             Z = cam_pos[2] + z_mm
             pts = np.column_stack([X, Y, Z])
-            pix = self.transformer.world_to_pixel(
-                pts, cam_pos, roll, yaw, pitch, apply_distortion=True
+            pix_ideal = self.transformer.world_to_pixel(
+                pts, cam_pos, roll, yaw, pitch, apply_distortion=False
             )
-            u, v = pix[:, 0], pix[:, 1]
         else:
             if self._use_physical_z():
                 z_safe = np.maximum(z_mm, 1e-3)
@@ -824,18 +808,15 @@ class CylindricalFeatureMatcher:
             x_cam = np.sin(zeta) * np.cos(theta_rad)
             y_cam = -np.sin(zeta) * np.sin(theta_rad)
             z_cam = np.cos(zeta)
-            u, v = self.transformer.camera.cam_to_img(x_cam, y_cam, z_cam)
+            u_id, v_id = self.transformer.camera.cam_to_img(x_cam, y_cam, z_cam)
+            pix_ideal = np.column_stack([u_id, v_id])
 
-            calibration = self.transformer.calibration
-            if calibration is not None:
-                dist_coeffs = self.transformer._get_dist_coeffs(calibration)
-                if not np.allclose(dist_coeffs, 0.0):
-                    pts = np.column_stack([u, v])
-                    pts_d = self.transformer.camera.distort_points(pts, dist_coeffs)
-                    u, v = pts_d[:, 0], pts_d[:, 1]
+        pix = self.transformer.distort_ideal_pixels(pix_ideal)
+        u, v = pix[:, 0], pix[:, 1]
         
         # 範囲内チェック（マスクとして返す）
         valid_mask = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+        valid_mask = valid_mask & self.transformer.kannala_rising_branch_mask(pix_ideal)
         
         # 全点を返し、範囲外はNaN
         points_frame = np.stack([u, v], axis=-1).astype(np.float32)
@@ -926,16 +907,14 @@ class CylindricalFeatureMatcher:
                 ],
                 axis=-1,
             )
-            pix = self.transformer.world_to_pixel(
+            pix_ideal = self.transformer.world_to_pixel(
                 world.reshape(-1, 3),
                 cam_pos,
                 roll,
                 yaw,
                 pitch,
-                apply_distortion=True,
+                apply_distortion=False,
             )
-            u = pix[:, 0].reshape(theta_grid.shape)
-            v = pix[:, 1].reshape(theta_grid.shape)
             pts_cam = (world.reshape(-1, 3) - cam_pos) @ R_w2c(roll, pitch, yaw)
             invalid_behind = pts_cam[:, 2].reshape(theta_grid.shape) <= 1e-6
         else:
@@ -946,16 +925,11 @@ class CylindricalFeatureMatcher:
             u_flat, v_flat = camera.cam_to_img(
                 x_cam.ravel(), y_cam.ravel(), z_cam.ravel()
             )
-            u = u_flat.reshape(zeta_grid.shape)
-            v = v_flat.reshape(zeta_grid.shape)
-            calibration = self.transformer.calibration
-            if calibration is not None:
-                dist_coeffs = self.transformer._get_dist_coeffs(calibration)
-                if not np.allclose(dist_coeffs, 0.0):
-                    pts_ideal = np.column_stack([u.ravel(), v.ravel()])
-                    pts_distorted = camera.distort_points(pts_ideal, dist_coeffs)
-                    u = pts_distorted[:, 0].reshape(zeta_grid.shape)
-                    v = pts_distorted[:, 1].reshape(zeta_grid.shape)
+            pix_ideal = np.column_stack([u_flat, v_flat])
+
+        pix = self.transformer.distort_ideal_pixels(pix_ideal)
+        u = pix[:, 0].reshape(theta_grid.shape)
+        v = pix[:, 1].reshape(theta_grid.shape)
 
         dist_from_center = np.hypot(u - center_x, v - center_y)
         max_radius = min(img_h, img_w) / 2.0
@@ -963,6 +937,9 @@ class CylindricalFeatureMatcher:
         outer_radius = max_radius * self.config.outer_radius_ratio
         invalid_mask = (dist_from_center < inner_radius) | (dist_from_center > outer_radius)
         invalid_mask |= (u < 0) | (u >= img_w) | (v < 0) | (v >= img_h)
+        invalid_mask |= ~self.transformer.kannala_rising_branch_mask(pix_ideal).reshape(
+            theta_grid.shape
+        )
         if invalid_behind is not None:
             invalid_mask |= invalid_behind
         u = np.where(invalid_mask, -1, u)
@@ -1524,6 +1501,53 @@ def fit_dc_first_harmonic(
     }
 
 
+def filter_subpixel_displacement(
+    prev_points_pixel: np.ndarray,
+    curr_points_pixel: np.ndarray,
+    *,
+    enabled: bool = False,
+    min_pixel_displacement: float = 0.5,
+    logger: Optional[logging.Logger] = None,
+    min_inlier_count: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """円筒上の微小変位点を落とす。既定は落とさない。
+
+    enabled=True のときだけ、変位が min_pixel_displacement 以下の点を除外する。
+    停止点まで落とすと継ぎ目誤マッチが多数派になり得る。
+    """
+    if prev_points_pixel is None or curr_points_pixel is None:
+        return prev_points_pixel, curr_points_pixel
+    if not enabled or float(min_pixel_displacement) <= 0.0:
+        return prev_points_pixel, curr_points_pixel
+    log = logger if logger is not None else logging.getLogger(__name__)
+    pixel_displacements = np.linalg.norm(
+        np.asarray(curr_points_pixel, dtype=float)
+        - np.asarray(prev_points_pixel, dtype=float),
+        axis=1,
+    )
+    valid_mask = pixel_displacements > float(min_pixel_displacement)
+    n_same = int(np.sum(~valid_mask))
+    n_move = int(np.sum(valid_mask))
+    if n_same > 0:
+        log.debug(
+            f"同一位置マッチ検出: {n_same}点 "
+            f"(全{len(prev_points_pixel)}点中、"
+            f"除外率={100.0 * n_same / max(len(prev_points_pixel), 1):.1f}%)"
+        )
+    if n_move > 0:
+        if n_move < int(min_inlier_count):
+            log.info(
+                f"変位有り点が少数({n_move}点 < 推奨{min_inlier_count}点)だが"
+                "ゼロ変位点を除外して続行"
+            )
+        return prev_points_pixel[valid_mask], curr_points_pixel[valid_mask]
+    log.info(
+        f"全マッチ点({len(prev_points_pixel)}点)が同一位置、"
+        "静止フレームの可能性が高い"
+    )
+    return prev_points_pixel, curr_points_pixel
+
+
 def filter_physical_motion_vectors(
     prev_cyl: np.ndarray,
     curr_cyl: np.ndarray,
@@ -1566,6 +1590,60 @@ def filter_physical_motion_vectors(
     return prev_cyl, curr_cyl
 
 
+PHYSICAL_ATTITUDE_SOURCES = ("match", "discard", "dz_only")
+_PHYSICAL_ATTITUDE_ALIASES = {
+    "match": "match",
+    "discard": "discard",
+    "vp": "discard",
+    "vp_discard": "discard",
+    "dz_only": "dz_only",
+    "dz-only": "dz_only",
+    "dzonly": "dz_only",
+}
+
+
+def normalize_physical_attitude_source(
+    value: Any,
+    default: str = "match",
+) -> str:
+    """front.physical_attitude_source を match / discard / dz_only に正規化する。"""
+    if value is None or str(value).strip() == "":
+        return default
+    key = str(value).strip().lower()
+    if key not in _PHYSICAL_ATTITUDE_ALIASES:
+        allowed = ", ".join(PHYSICAL_ATTITUDE_SOURCES)
+        raise ValueError(
+            f"front.physical_attitude_source は {allowed} のいずれかです: {value!r}"
+        )
+    return _PHYSICAL_ATTITUDE_ALIASES[key]
+
+
+def apply_physical_mapping_attitude(
+    motion: Dict[str, float],
+    source: Any,
+    yaw0: float,
+    pitch0: float,
+    yaw_est: Optional[float],
+    pitch_est: Optional[float],
+) -> Dict[str, float]:
+    """推定 Δyaw/Δpitch を残し、discard/dz_only では消失点との差分を積む。"""
+    out = dict(motion)
+    out["dtheta_match"] = float(out.get("dtheta", 0.0))
+    out["dphi_match"] = float(out.get("dphi", 0.0))
+    src = normalize_physical_attitude_source(source)
+    if src == "match":
+        return out
+    if yaw_est is not None:
+        out["dtheta"] = float(yaw_est) - float(yaw0)
+    else:
+        out["dtheta"] = 0.0
+    if pitch_est is not None:
+        out["dphi"] = float(pitch_est) - float(pitch0)
+    else:
+        out["dphi"] = 0.0
+    return out
+
+
 def clip_front_physical_estimate(
     result: Dict[str, Any],
     *,
@@ -1579,6 +1657,7 @@ def clip_front_physical_estimate(
     min_points_for_attitude: int = 20,
     untrusted_attitude_deg: float = 0.8,
     max_applied_attitude_deg: float = 1.2,
+    clip_attitude: bool = True,
 ) -> Dict[str, Any]:
     """解析結果が物理上限を超えたら無効にする。飽和値は積まない。
 
@@ -1607,30 +1686,32 @@ def clip_front_physical_estimate(
         out["success"] = False
         out["failure_reason"] = "dz_exceeded_clip"
         return out
-    if abs(dyaw) > max_yaw + eps or abs(dpitch) > max_pitch + eps:
-        out["success"] = False
-        out["failure_reason"] = "attitude_exceeded_clip"
-        return out
+    if clip_attitude:
+        if abs(dyaw) > max_yaw + eps or abs(dpitch) > max_pitch + eps:
+            out["success"] = False
+            out["failure_reason"] = "attitude_exceeded_clip"
+            return out
     if reject_reverse and dz < -abs(float(reverse_tol_mm)):
         out["success"] = False
         out["failure_reason"] = "reverse_travel"
         return out
     if dz_bounds is not None:
         dz = float(np.clip(dz, float(dz_bounds[0]), float(dz_bounds[1])))
-    dyaw_deg = abs(np.degrees(dyaw))
-    dpitch_deg = abs(np.degrees(dpitch))
-    att_deg = max(dyaw_deg, dpitch_deg)
     drop_att = False
     drop_reason = None
-    max_applied = abs(float(max_applied_attitude_deg))
-    untrusted = abs(float(untrusted_attitude_deg))
-    n_att = int(min_points_for_attitude)
-    if att_deg > max_applied + eps:
-        drop_att = True
-        drop_reason = "attitude_too_large"
-    elif n < n_att and att_deg > untrusted + eps:
-        drop_att = True
-        drop_reason = "low_n_large_attitude"
+    if clip_attitude:
+        dyaw_deg = abs(np.degrees(dyaw))
+        dpitch_deg = abs(np.degrees(dpitch))
+        att_deg = max(dyaw_deg, dpitch_deg)
+        max_applied = abs(float(max_applied_attitude_deg))
+        untrusted = abs(float(untrusted_attitude_deg))
+        n_att = int(min_points_for_attitude)
+        if att_deg > max_applied + eps:
+            drop_att = True
+            drop_reason = "attitude_too_large"
+        elif n < n_att and att_deg > untrusted + eps:
+            drop_att = True
+            drop_reason = "low_n_large_attitude"
     if drop_att:
         dyaw = 0.0
         dpitch = 0.0
@@ -1702,6 +1783,55 @@ def estimate_front_physical_option2(
         "droll_deg": 0.0,
         "dyaw": dyaw,
         "dpitch": dpitch,
+        "n_points": n,
+        "success": True,
+        "dZ_dc": float(fit_z["dc"]),
+        "dZ_std": float(np.std(fit_z["residual"])),
+        "dtheta_dc": float(fit_th["dc"]),
+        "dtheta_cos": float(fit_th["cos"]),
+        "dtheta_sin": float(fit_th["sin"]),
+        "dtheta_std": float(np.std(fit_th["residual"])),
+    }
+
+
+def estimate_front_physical_dz_only(
+    prev_cyl: np.ndarray,
+    curr_cyl: np.ndarray,
+    pipe_radius_mm: float = 125.0,
+) -> Dict[str, Any]:
+    """管 (θ, Z) から dz のみ。Δyaw/Δpitch は推定しない。
+
+    ΔZ = −dz の 1 列 LS。1 次はモデルに入れないので、θ が偏ると dz に漏れる。
+    """
+    prev_cyl = np.asarray(prev_cyl, dtype=float)
+    curr_cyl = np.asarray(curr_cyl, dtype=float)
+    n = int(len(prev_cyl))
+    fail = {
+        "dz": 0.0,
+        "droll": 0.0,
+        "droll_deg": 0.0,
+        "dyaw": 0.0,
+        "dpitch": 0.0,
+        "n_points": n,
+        "success": False,
+    }
+    if n < 1:
+        return fail
+    dZ = curr_cyl[:, 1] - prev_cyl[:, 1]
+    dtheta_deg = _wrap_deg(curr_cyl[:, 0] - prev_cyl[:, 0])
+    fit_z = fit_dc_first_harmonic(prev_cyl[:, 0], dZ)
+    fit_th = fit_dc_first_harmonic(prev_cyl[:, 0], dtheta_deg)
+    A = -np.ones((n, 1), dtype=float)
+    coeff, *_ = np.linalg.lstsq(A, dZ, rcond=None)
+    dz = float(coeff[0])
+    if not np.isfinite(dz):
+        return fail
+    return {
+        "dz": dz,
+        "droll": 0.0,
+        "droll_deg": 0.0,
+        "dyaw": 0.0,
+        "dpitch": 0.0,
         "n_points": n,
         "success": True,
         "dZ_dc": float(fit_z["dc"]),

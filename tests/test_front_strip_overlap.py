@@ -361,5 +361,6 @@ def test_front_defaults_keep_experiment_off():
     assert front.strip_overlap_allow_bin_worse is False
     assert front.deroll_colormap_after_phase2 is False
     assert front.residual_paste_warp is True
+    assert front.physical_attitude_source == "match"
     cam = CameraConfig()
     assert cam.apply_lens_calibration is True

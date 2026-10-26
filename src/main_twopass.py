@@ -73,6 +73,10 @@ from src.debug_visualizer import (
     DebugConfig,
 )
 from src.feature_matching import FeatureMatcher
+from src.feature_matching_cylindrical import (
+    apply_physical_mapping_attitude,
+    normalize_physical_attitude_source,
+)
 from src.camera_estimation import CameraEstimator, compute_frame_constraints
 from src.colormap_generator import ColorMapGenerator
 from src.colormap_correction import (
@@ -735,14 +739,39 @@ class ColorMapPipelineTwoPass:
             )
             if cyl is None and front is not None:
                 cyl = front
-            self.logger.info(
-                "物理姿勢クリップ: "
-                f"適用上限 |Δyaw/Δpitch|≤{float(getattr(cyl, 'physical_max_applied_attitude_deg', 1.2)):.1f}° "
-                f"（超えたら姿勢だけ0、dzは残す）, "
-                f"失敗上限 Δyaw≤{float(getattr(cyl, 'physical_max_dyaw_deg', 2.0)):.1f}° "
-                f"Δpitch≤{float(getattr(cyl, 'physical_max_dpitch_deg', 2.0)):.1f}° "
-                f"（超えたら移動量ごと破棄）"
-            )
+            source = "match"
+            if front is not None:
+                source = normalize_physical_attitude_source(
+                    getattr(front, "physical_attitude_source", "match")
+                )
+            if source == "match":
+                self.logger.info(
+                    "物理姿勢の適用: 3DoF 推定の Δyaw/Δpitch を積む (source=match)"
+                )
+                self.logger.info(
+                    "物理姿勢クリップ: "
+                    f"適用上限 |Δyaw/Δpitch|≤{float(getattr(cyl, 'physical_max_applied_attitude_deg', 1.2)):.1f}° "
+                    f"（超えたら姿勢だけ0、dzは残す）, "
+                    f"失敗上限 Δyaw≤{float(getattr(cyl, 'physical_max_dyaw_deg', 2.0)):.1f}° "
+                    f"Δpitch≤{float(getattr(cyl, 'physical_max_dpitch_deg', 2.0)):.1f}° "
+                    f"（超えたら移動量ごと破棄）"
+                )
+            elif source == "discard":
+                self.logger.info(
+                    "物理姿勢の適用: 3DoF で推定するが Δyaw/Δpitch は捨て、"
+                    "消失点との差分を積む (source=discard)"
+                )
+                self.logger.info(
+                    "物理姿勢クリップ: 推定値に対して "
+                    f"失敗上限 Δyaw≤{float(getattr(cyl, 'physical_max_dyaw_deg', 2.0)):.1f}° "
+                    f"Δpitch≤{float(getattr(cyl, 'physical_max_dpitch_deg', 2.0)):.1f}° "
+                    f"（超えたら移動量ごと破棄。適用姿勢は消失点）"
+                )
+            else:
+                self.logger.info(
+                    "物理姿勢の適用: 推定は dz のみ。"
+                    "Δyaw/Δpitch は消失点との差分を積む (source=dz_only)"
+                )
         if strip_match:
             self.logger.info(
                 "帯重なり特徴点測定: 有効（展開後の既描画と現帯から取り直し）"
@@ -1707,6 +1736,31 @@ class ColorMapPipelineTwoPass:
             motion_raw = motion.copy()
 
             if use_physical:
+                front_phys = getattr(self.config, "front", None)
+                source = normalize_physical_attitude_source(
+                    getattr(front_phys, "physical_attitude_source", "match")
+                    if front_phys is not None
+                    else "match"
+                )
+                if source != "match":
+                    yaw_0 = float(camera_state_dict["orientation"][1])
+                    phi_0 = float(camera_state_dict["orientation"][2])
+                    motion = apply_physical_mapping_attitude(
+                        motion,
+                        source,
+                        yaw_0,
+                        phi_0,
+                        camera_state_dict.get("yaw_estimated"),
+                        camera_state_dict.get("phi_estimated"),
+                    )
+                    self.logger.info(
+                        "物理姿勢の適用: 消失点 "
+                        f"Δyaw={np.degrees(motion['dtheta']):.4f}° "
+                        f"Δpitch={np.degrees(motion['dphi']):.4f}° "
+                        f"（推定 Δyaw={np.degrees(motion['dtheta_match']):.4f}° "
+                        f"Δpitch={np.degrees(motion['dphi_match']):.4f}° "
+                        f"は積まない, source={source}）"
+                    )
                 motion_constrained = motion.copy()
             else:
                 motion_constrained = self.camera_estimator._constrain_camera_pose(

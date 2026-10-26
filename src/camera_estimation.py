@@ -1126,7 +1126,9 @@ class CameraEstimator:
         """管 (θ, Z) から dz と Δyaw/Δpitch。droll は 0。"""
         from src.feature_matching_cylindrical import (
             clip_front_physical_estimate,
+            estimate_front_physical_dz_only,
             estimate_front_physical_option2,
+            normalize_physical_attitude_source,
         )
 
         radius = float(
@@ -1134,16 +1136,24 @@ class CameraEstimator:
             if pipe_radius_mm is not None
             else getattr(self.transformer, "pipe_radius", 125.0)
         )
-        result = estimate_front_physical_option2(
-            prev_points_cyl, curr_points_cyl, pipe_radius_mm=radius
-        )
-        if not result.get("success"):
-            return result
         cyl = getattr(getattr(self, "cylindrical_matcher", None), "config", None)
 
         def _cyl(name: str, default):
             return default if cyl is None else getattr(cyl, name, default)
 
+        source = normalize_physical_attitude_source(
+            _cyl("physical_attitude_source", "match")
+        )
+        if source == "dz_only":
+            result = estimate_front_physical_dz_only(
+                prev_points_cyl, curr_points_cyl, pipe_radius_mm=radius
+            )
+        else:
+            result = estimate_front_physical_option2(
+                prev_points_cyl, curr_points_cyl, pipe_radius_mm=radius
+            )
+        if not result.get("success"):
+            return result
         result = clip_front_physical_estimate(
             result,
             max_dz_mm=float(_cyl("physical_max_dz_mm", 20.0)),
@@ -1156,7 +1166,9 @@ class CameraEstimator:
             untrusted_attitude_deg=float(_cyl("physical_untrusted_attitude_deg", 0.8)),
             max_applied_attitude_deg=float(_cyl("physical_max_applied_attitude_deg", 1.2)),
             dz_bounds=dz_bounds,
+            clip_attitude=(source != "dz_only"),
         )
+        result["physical_attitude_source"] = source
         if not result.get("success"):
             self.logger.warning(
                 f"物理 (θ,Z) 推定を破棄: {result.get('failure_reason')} "
@@ -1166,7 +1178,12 @@ class CameraEstimator:
                 f"N={result.get('n_points')}"
             )
             return result
-        if result.get("attitude_suppressed"):
+        if source == "dz_only":
+            self.logger.info(
+                f"物理 (θ,Z) dzのみ: dz={result['dz']:.3f}mm, "
+                f"N={result['n_points']}"
+            )
+        elif result.get("attitude_suppressed"):
             self.logger.info(
                 f"物理 (θ,Z) 局所: dz={result['dz']:.3f}mm, "
                 f"dyaw/dpitch=0 "

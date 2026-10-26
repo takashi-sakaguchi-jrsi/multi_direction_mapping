@@ -1235,6 +1235,13 @@ class FrontConfig:
     """|Δyaw| または |Δpitch| がこれを超えたら姿勢だけ 0（dz は残す）。"""
     physical_untrusted_attitude_deg: float = 0.8
     """点数が physical_min_points_for_attitude 未満のとき、これより大きい姿勢は 0。"""
+    physical_attitude_source: str = "match"
+    """展開に積む yaw/pitch 増分。
+
+    match: 3DoF 推定の Δyaw/Δpitch を積む（現行）
+    discard: 3DoF で推定するが Δyaw/Δpitch は捨て、消失点との差分を積む
+    dz_only: 推定パラメータは dz のみ。Δyaw/Δpitch は消失点との差分
+    """
     residual_paste_warp: bool = True
     """3DoF 後の特徴点残差で、新しい帯の (η, z) サンプリングだけ微調整する。姿勢には積まない。"""
     residual_theta_bins: int = 12
