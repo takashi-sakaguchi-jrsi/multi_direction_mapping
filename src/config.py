@@ -1275,6 +1275,13 @@ class FrontConfig:
     """塗済みを一切上書きしない。外周の鮮明画素が使えないので既定はオフ。"""
     prefer_peripheral_colormap: bool = True
     """同じ展開画素は、よりレンズ外周寄りのソースだけ採用する。中心の不鮮明画素は残さない。"""
+    ocr_dz_anomaly_ratio: float = 0.3
+    """推定 |dz| が OCR 窓平均のこの倍率未満なら失敗経路（塗らず履歴中央値で z を進める）。
+
+    0 以下で無効。絶対 OCR 座標は使わない。
+    """
+    ocr_dz_anomaly_min_ocr_mm: float = 1.0
+    """OCR 窓平均がこれ未満のときは異常判定しない（真の停止と区別できない）。"""
     reject_z_behind_camera: bool = True
     """カメラ位置より小さい Z は塗らない。
 

@@ -196,6 +196,32 @@ def resolve_initial_attitude_rad(
         return theta0, phi0
 
 
+def is_abnormally_small_dz(
+    dz: Optional[float],
+    ocr_avg_dz: Optional[float],
+    *,
+    ratio: float,
+    min_ocr_mm: float,
+) -> bool:
+    """推定 dz が OCR 窓平均に対して異常に小さいか。
+
+    OCR 欠測・窓平均が min_ocr_mm 未満・ratio≤0 のときは判定しない。
+    """
+    if dz is None or ocr_avg_dz is None:
+        return False
+    r = float(ratio)
+    min_ocr = float(min_ocr_mm)
+    if r <= 0.0 or min_ocr <= 0.0:
+        return False
+    ocr = float(ocr_avg_dz)
+    if not np.isfinite(ocr) or ocr < min_ocr:
+        return False
+    est = float(dz)
+    if not np.isfinite(est):
+        return False
+    return abs(est) < r * ocr
+
+
 # ============================================================================
 # カラーマップ生成パイプライン（2パス処理版）
 # ============================================================================
@@ -817,6 +843,17 @@ class ColorMapPipelineTwoPass:
                 f"smooth={'on' if smooth else 'off'}"
                 + (f" window={window_mm:.0f}mm" if smooth else "")
             )
+        if (
+            front is not None
+            and str(getattr(self.config, "pipeline", "")).lower() == "front"
+            and float(getattr(front, "ocr_dz_anomaly_ratio", 0.0) or 0.0) > 0.0
+        ):
+            self.logger.info(
+                "OCR比異常判定: "
+                f"|dz| < {float(front.ocr_dz_anomaly_ratio):.2f}×OCR窓平均 "
+                f"かつ OCR窓平均≥{float(getattr(front, 'ocr_dz_anomaly_min_ocr_mm', 1.0)):.1f}mm/frame "
+                "なら失敗経路（塗らず履歴中央値で z を進める）"
+            )
 
         # 初期z座標の決定（Phase1のz*を優先）
 
@@ -874,6 +911,7 @@ class ColorMapPipelineTwoPass:
         colormap_generated_count = 0
         skipped_static_count = 0
         skipped_failed_count = 0
+        skipped_z_inconsistency_count = 0
         skipped_dz_zero_count = 0
 
         # フレームごとのデータ記録用リスト
@@ -895,9 +933,16 @@ class ColorMapPipelineTwoPass:
         # フォールバックdz用の履歴バッファ（直近10フレームの中央値をスキップ時に使用）
         dz_history: deque = deque(maxlen=10)
 
-        # OCR局所平均dz計算（Hybrid Stage 1用）
+        # OCR局所平均dz（Hybrid Stage 1 と OCR比異常判定で共有）
         ocr_local_avg_dz = None
-        if self.config.estimation.motion.hybrid_two_stage_enabled:
+        front_ocr_ratio = 0.0
+        if front is not None and str(getattr(self.config, "pipeline", "")).lower() == "front":
+            front_ocr_ratio = float(getattr(front, "ocr_dz_anomaly_ratio", 0.0) or 0.0)
+        need_ocr_local = (
+            self.config.estimation.motion.hybrid_two_stage_enabled
+            or front_ocr_ratio > 0.0
+        )
+        if need_ocr_local:
             ocr_local_avg_dz = self._compute_ocr_local_avg_dz(z_positions)
             if ocr_local_avg_dz is not None:
                 self.logger.info(
@@ -905,8 +950,10 @@ class ColorMapPipelineTwoPass:
                     f"mean={np.mean(ocr_local_avg_dz):.2f}mm/frame, "
                     f"min={np.min(ocr_local_avg_dz):.2f}, max={np.max(ocr_local_avg_dz):.2f}"
                 )
-            else:
+            elif self.config.estimation.motion.hybrid_two_stage_enabled:
                 self.logger.info("OCRデータなし: Hybrid Stage 1はmax_dz制約なしで動作")
+            elif front_ocr_ratio > 0.0:
+                self.logger.info("OCRデータなし: OCR比異常判定は行いません")
 
         _step3_last_pct = -1.0
 
@@ -1169,9 +1216,39 @@ class ColorMapPipelineTwoPass:
                     skipped_static_count += 1
                     continue
 
+                ocr_dz_fail = False
+                if (
+                    status != "FAILED"
+                    and front is not None
+                    and front_ocr_ratio > 0.0
+                ):
+                    ocr_dz_fail = is_abnormally_small_dz(
+                        float(movement_raw[2]),
+                        ocr_local_dz_value,
+                        ratio=front_ocr_ratio,
+                        min_ocr_mm=float(
+                            getattr(front, "ocr_dz_anomaly_min_ocr_mm", 1.0)
+                        ),
+                    )
+                    if ocr_dz_fail:
+                        ocr_show = (
+                            float(ocr_local_dz_value)
+                            if ocr_local_dz_value is not None
+                            else float("nan")
+                        )
+                        self.logger.warning(
+                            f"フレーム{frame_num}: 推定dzがOCR窓平均に対して異常に小さい "
+                            f"dz={float(movement_raw[2]):.3f}mm "
+                            f"OCR窓平均={ocr_show:.2f}mm/frame "
+                            f"閾値={front_ocr_ratio:.2f}× "
+                            "→ 失敗経路"
+                        )
+                        status = "FAILED"
+
                 # ★特徴点抽出失敗チェック（新規追加）
                 if status == "FAILED":
-                    self.logger.warning(f"フレーム{frame_num}: 特徴点抽出失敗のためスキップ")
+                    if not ocr_dz_fail:
+                        self.logger.warning(f"フレーム{frame_num}: 特徴点抽出失敗のためスキップ")
                     if not first_valid_frame_found:
                         self.logger.info(
                             f"フレーム{frame_num}: 開始フレーム先送り（有効フレーム未検出のため基準フレームを更新）"
@@ -1209,7 +1286,10 @@ class ColorMapPipelineTwoPass:
                         'vp_feature_inlier_count': None,
                         'vp_feature_inlier_ratio': None,
                     })
-                    skipped_failed_count += 1
+                    if ocr_dz_fail:
+                        skipped_z_inconsistency_count += 1
+                    else:
+                        skipped_failed_count += 1
                     continue
 
 
@@ -1454,12 +1534,18 @@ class ColorMapPipelineTwoPass:
         self.logger.info("Phase2完了: 統計情報")
         self.logger.info("=" * 80)
         total_frames = end_frame - actual_start_frame
-        total_skipped = skipped_static_count + skipped_failed_count + skipped_dz_zero_count
+        total_skipped = (
+            skipped_static_count
+            + skipped_failed_count
+            + skipped_z_inconsistency_count
+            + skipped_dz_zero_count
+        )
         self.logger.info(f"処理フレーム数: {total_frames}")
         self.logger.info(f"カラーマップ生成フレーム数: {colormap_generated_count}")
         self.logger.info(f"スキップフレーム数: {total_skipped}")
         self.logger.info(f"  - 静止状態: {skipped_static_count}")
         self.logger.info(f"  - 特徴点抽出失敗: {skipped_failed_count}")
+        self.logger.info(f"  - Z方向矛盾: {skipped_z_inconsistency_count}")
         self.logger.info(f"  - Z方向停止: {skipped_dz_zero_count}")
         self.logger.info(f"dz_minが0にクリップされたフレーム数: {dz_min_clipped_count}")
         rw = self._residual_warp_stats

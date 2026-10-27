@@ -347,7 +347,7 @@ class CylindricalFeatureMatcher:
         1. 円筒座標変換(前処理含む)
         2. 全画像でORB特徴点検出
         3. マッチング
-        3.5. 静止状態フレームスキップ判定（Task 4.2.9）
+        3.5. 物理 (ΔZ, Δθ) フィルタ（静止スキップはしない）
         4. 空間分散フィルタ(円筒座標グリッド)
         5. フレーム座標に逆変換
         
@@ -365,8 +365,7 @@ class CylindricalFeatureMatcher:
             prev_points: 前フレームのマッチ点座標 (N, 2)、失敗時はNone
             curr_points: 現フレームのマッチ点座標 (N, 2)、失敗時はNone
             status: str - 処理結果ステータス
-                - "SUCCESS": 成功
-                - "STATIC_FRAME": 静止状態フレーム検出のためスキップ
+                - "SUCCESS": 成功（mean|ΔZ|≈0 でも推定へ進める）
                 - "FAILED": 特徴点抽出またはマッチング失敗
         """
         try:
@@ -463,43 +462,7 @@ class CylindricalFeatureMatcher:
                 if len(prev_points_cyl) < 2:
                     self.logger.warning("物理フィルタ後の点数が不足")
                     return None, None, "FAILED"
-                if self.static_frame_detection_config.enabled:
-                    dZ = curr_points_cyl[:, 1] - prev_points_cyl[:, 1]
-                    avg_abs = float(np.mean(np.abs(dZ)))
-                    if (
-                        len(prev_points_cyl) >= self.static_frame_detection_config.min_points
-                        and avg_abs <= self.static_frame_detection_config.movement_threshold
-                    ):
-                        self.logger.info(
-                            f"静止状態（物理Z）: mean|ΔZ|={avg_abs:.4f}mm "
-                            f"<= {self.static_frame_detection_config.movement_threshold}"
-                        )
-                        return None, None, "STATIC_FRAME"
             else:
-                if self.static_frame_detection_config.enabled:
-                    try:
-                        prev_points_frame_temp, curr_points_frame_temp = \
-                            self._invert_paired_to_frame_coordinates(
-                                prev_points_cyl, curr_points_cyl,
-                                theta_grid, z_grid, camera_params
-                            )
-                        if prev_points_frame_temp is not None and curr_points_frame_temp is not None:
-                            should_skip, _skip_stats = should_skip_static_frame(
-                                prev_points_frame_temp,
-                                curr_points_frame_temp,
-                                threshold=self.static_frame_detection_config.movement_threshold,
-                                min_points=self.static_frame_detection_config.min_points,
-                                pixels_per_mm=self.pixels_per_mm
-                            )
-                            if should_skip:
-                                return None, None, "STATIC_FRAME"
-                        else:
-                            self.logger.warning("フレーム座標への逆変換に失敗、静止状態判定をスキップ")
-                    except Exception as e:
-                        self.logger.warning(
-                            f"静止状態フレーム判定でエラー: {e}、処理を続行します",
-                            exc_info=True,
-                        )
 
                 self.logger.debug("Phase 4: 空間分散フィルタ")
                 prev_points_cyl, curr_points_cyl = self._apply_spatial_filter(
