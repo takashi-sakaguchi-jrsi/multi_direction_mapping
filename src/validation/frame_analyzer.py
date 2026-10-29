@@ -193,10 +193,13 @@ class FrameAnalyzer:
             config=self.config.estimation,
             ocr_tesseract_config=self.config.ocr.tesseract_config,
             ocr_preprocessing_enabled=self.config.ocr.preprocessing_enabled,
+            ocr_preprocessing_method=self.config.ocr.preprocessing_method,
+            ocr_retry_thresholds=self.config.ocr.retry_thresholds,
             max_distance_increment_mm=float(self.config.ocr.max_distance_increment_mm),
             enforce_ocr_increment_upper_bound=bool(
                 self.config.ocr.enforce_ocr_increment_upper_bound
             ),
+            countup_mean_dz_max_mm=float(self.config.ocr.countup_mean_dz_max_mm),
             known_z_mm=known_z_mm,
             progress_callback=_ocr_progress if progress_callback is not None else None,
         )

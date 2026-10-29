@@ -9,7 +9,8 @@
     "center_offset_x": 0,
     "center_offset_y": 0,
     "image_width": 1920,
-    "image_height": 1080
+    "image_height": 1080,
+    "ocr_roi_ratio": [0.0556, 0.1000, 0.0438, 0.1063]
   },
   "pipe": {
     "diameter_mm": 250.0
@@ -143,6 +144,9 @@
     },
     "legacy_vp": {
       "enabled": false
+    },
+    "camera": {
+      "ocr_roi_ratio": [0.0556, 0.1000, 0.0438, 0.1063]
     }
   }
 }

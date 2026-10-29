@@ -3,8 +3,16 @@
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
-from src.camera_estimation import CameraEstimator, compute_distance_constraints_only
+from src.camera_estimation import (
+    CameraEstimator,
+    compute_distance_constraints_only,
+    ocr_z_ocr_max_mm,
+    ocr_allowed_inclusive_hi_mm,
+    ocr_expected_range_mm,
+    validate_ocr_distance_value,
+)
 from src.config import Config
 from src.ocr_utils import estimate_high_precision_z_positions, compute_average_speed
 
@@ -38,6 +46,7 @@ def test_ocr_only_z_matches_high_precision_helper(transformer):
 
 def _run_ocr_only_with_distances(
     transformer, distances, max_increment=10.0, enforce_upper=True,
+    countup_mean_dz_max=10.0,
 ):
     cfg = Config.from_defaults()
     cfg.estimation.use_offset_moving_average = False
@@ -55,6 +64,7 @@ def _run_ocr_only_with_distances(
             config=cfg.estimation,
             max_distance_increment_mm=max_increment,
             enforce_ocr_increment_upper_bound=enforce_upper,
+            countup_mean_dz_max_mm=countup_mean_dz_max,
         )
 
 
@@ -134,3 +144,98 @@ def test_ocr_only_expected_range_has_no_plus_cap_when_disabled(transformer):
     assert seen[0] is None
     assert seen[1][0] == 100.0
     assert seen[1][1] == float("inf")
+
+
+def test_ocr_countup_mean_dz_max_is_independent_of_motion_max_dz():
+    cfg = Config.from_defaults()
+    cfg.estimation.motion.max_dz = 3.0
+    cfg.ocr.countup_mean_dz_max_mm = 10.0
+    assert cfg.estimation.motion.max_dz == pytest.approx(3.0)
+    assert cfg.ocr.countup_mean_dz_max_mm == pytest.approx(10.0)
+
+
+def test_ocr_z_ocr_max_follows_delayed_count_up_physics():
+    assert ocr_z_ocr_max_mm(100.0, 1, 10.0) == 120.0
+    assert ocr_z_ocr_max_mm(10.0, 1, 10.0) == 30.0
+    assert ocr_z_ocr_max_mm(10.0, 10, 10.0) == 120.0
+    assert ocr_allowed_inclusive_hi_mm(100.0, 1, 10.0, 10.0) == pytest.approx(110.0)
+    assert ocr_allowed_inclusive_hi_mm(10.0, 1, 10.0, 60.0) == pytest.approx(30.0 - 1e-9)
+    assert ocr_expected_range_mm(100.0, 1, 10.0, countup_mean_dz_max=10.0) == (
+        100.0,
+        pytest.approx(110.0),
+    )
+
+
+def test_ocr_validate_allows_tick_and_rejects_faster_than_countup_mean_dz_max():
+    ok_tick = validate_ocr_distance_value(
+        frame_idx=1,
+        ocr_distance=110.0,
+        prev_ocr_distance=100.0,
+        prev_ocr_success=True,
+        base_ocr_distance=100.0,
+        frame_gap=1,
+        max_increment=10.0,
+        countup_mean_dz_max=10.0,
+    )
+    assert ok_tick == 110.0
+    too_fast = validate_ocr_distance_value(
+        frame_idx=1,
+        ocr_distance=40.0,
+        prev_ocr_distance=10.0,
+        prev_ocr_success=True,
+        base_ocr_distance=10.0,
+        frame_gap=1,
+        max_increment=60.0,
+        countup_mean_dz_max=10.0,
+    )
+    assert too_fast is None
+    delayed = validate_ocr_distance_value(
+        frame_idx=10,
+        ocr_distance=40.0,
+        prev_ocr_distance=10.0,
+        prev_ocr_success=True,
+        base_ocr_distance=10.0,
+        frame_gap=10,
+        max_increment=60.0,
+        countup_mean_dz_max=10.0,
+    )
+    assert delayed == 40.0
+
+
+def test_ocr_only_allows_delayed_count_up_jump(transformer):
+    distances = [10.0] * 10 + [40.0]
+    _, _, ocr_dist, success = _run_ocr_only_with_distances(
+        transformer, distances, max_increment=60.0, countup_mean_dz_max=10.0,
+    )
+    assert np.all(success)
+    np.testing.assert_allclose(ocr_dist, distances)
+
+
+def test_ocr_only_rejects_jump_too_fast_for_countup_mean_dz_max(transformer):
+    _, _, ocr_dist, success = _run_ocr_only_with_distances(
+        transformer, [10.0, 40.0], max_increment=60.0, countup_mean_dz_max=10.0,
+    )
+    assert list(success) == [True, False]
+    np.testing.assert_allclose(ocr_dist[success], [10.0])
+
+
+def test_high_precision_splits_actual_delta_not_fixed_10mm():
+    ocr = np.array([10.0] * 10 + [40.0], dtype=float)
+    success = np.ones(ocr.size, dtype=bool)
+    z = estimate_high_precision_z_positions(ocr, success, 3.0)
+    np.testing.assert_allclose(z[:10], 10.0 + np.arange(10) * 3.0)
+    assert z[10] == pytest.approx(40.0)
+
+
+def test_high_precision_10mm_ticks_still_split_by_next_delta():
+    ocr = np.array([3000.0, 3010.0, 3010.0, 3020.0, 3020.0, 3030.0])
+    success = np.ones(ocr.size, dtype=bool)
+    z = estimate_high_precision_z_positions(ocr, success, 6.0)
+    np.testing.assert_allclose(z, [3000.0, 3010.0, 3015.0, 3020.0, 3025.0, 3030.0])
+
+
+def test_high_precision_last_plateau_holds_display_value():
+    ocr = np.array([10.0, 10.0, 10.0], dtype=float)
+    success = np.ones(3, dtype=bool)
+    z = estimate_high_precision_z_positions(ocr, success, 1.0)
+    np.testing.assert_allclose(z, [10.0, 10.0, 10.0])

@@ -28,6 +28,7 @@ from src.calibration import fisheye_intrinsics_for_size, load_calibration
 from src.config import Config, load_config
 from src.progress_reporter import ProgressReporter
 from src.product_runtime import (
+    apply_sideview_profile,
     copy_final_colormap,
     copy_validation_report_to_reports,
     ocr_metadata_output_path,
@@ -42,7 +43,12 @@ from src.validation.known_z import (
     resolve_known_z_mm,
     source_pixels_per_mm_from_metadata,
 )
-from src.coordinate_transform import CoordinateTransformer, FisheyeCamera
+from src.camera_utils import compute_pinhole_focal_length
+from src.coordinate_transform import (
+    CoordinateTransformer,
+    FisheyeCamera,
+    PinholeCamera,
+)
 from src.validation.best_view_accumulator import BestViewAccumulator
 from src.validation.frame_analyzer import FrameAnalyzer, resolve_frame_window, zip_records_with_frames
 from src.validation.geometry import (
@@ -95,6 +101,30 @@ GENERATION_F_PX = 341.87536947032544
 
 
 def build_transformer(config: Config) -> CoordinateTransformer:
+    w = int(config.two_direction.capture.image_width_px or config.camera.image_width)
+    h = int(config.two_direction.capture.image_height_px or config.camera.image_height)
+    model = str(config.camera.camera_model or "fisheye").lower()
+    if model == "pinhole":
+        config.camera.lens_calibration_file = None
+        config.camera._lens_calibration = None
+        if float(config.camera.fx or 0) > 0:
+            fx = float(config.camera.fx)
+            cx = float(config.camera.cx) if config.camera.cx else w / 2.0
+            cy = float(config.camera.cy) if config.camera.cy else h / 2.0
+        else:
+            fx = float(compute_pinhole_focal_length(config.camera.fov_degrees, (h, w)))
+            cx = w / 2.0 + float(config.camera.center_offset_x or 0)
+            cy = h / 2.0 + float(config.camera.center_offset_y or 0)
+        camera = PinholeCamera(
+            f=fx, cx=cx, cy=cy, image_width=w, image_height=h
+        )
+        logger.info(
+            f"レンズ: calib=off model=pinhole fov={config.camera.fov_degrees:.1f}° "
+            f"f={fx:.6f} cx={cx:.3f} cy={cy:.3f} size={w}x{h}"
+        )
+        radius = config.pipe.diameter_mm / 2.0
+        return CoordinateTransformer(camera=camera, pipe_radius=radius, calibration=None)
+
     calib = None
     calib_path = config.camera.lens_calibration_file
     if calib_path:
@@ -105,22 +135,22 @@ def build_transformer(config: Config) -> CoordinateTransformer:
             calib = None
     else:
         config.camera._lens_calibration = None
-    w = config.two_direction.capture.image_width_px or config.camera.image_width
-    h = config.two_direction.capture.image_height_px or config.camera.image_height
     if calib is not None and getattr(calib, "fx", 0) > 0:
-        fx, cx, cy, _dist, _fov = fisheye_intrinsics_for_size(calib, int(w), int(h))
+        fx, cx, cy, _dist, _fov = fisheye_intrinsics_for_size(calib, w, h)
+        if not bool(config.camera.apply_lens_calibration):
+            calib = None
     else:
         calib = None
         fx = float(config.camera.fx) if config.camera.fx else GENERATION_F_PX
         cx = float(config.camera.cx) if config.camera.cx else w / 2.0
         cy = float(config.camera.cy) if config.camera.cy else h / 2.0
     camera = FisheyeCamera(
-        f=fx, cx=cx, cy=cy, image_width=int(w), image_height=int(h)
+        f=fx, cx=cx, cy=cy, image_width=w, image_height=h
     )
     radius = config.pipe.diameter_mm / 2.0
     logger.info(
         f"レンズ: calib={'on' if calib is not None else 'off'} "
-        f"f={fx:.6f} cx={cx:.3f} cy={cy:.3f} size={int(w)}x{int(h)}"
+        f"f={fx:.6f} cx={cx:.3f} cy={cy:.3f} size={w}x{h}"
     )
     return CoordinateTransformer(camera=camera, pipe_radius=radius, calibration=calib)
 
@@ -152,12 +182,13 @@ def run_two_direction_validation(
     timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
     t_run = time.perf_counter()
+    apply_sideview_profile(config)
     td = config.two_direction
     modes = modes or list(td.modes)
     frames_by_tag = {"A": frames_a, "B": frames_b, "C": frames_c}
     jobs = td.active_run_slots(frames_by_tag)
-    if len(jobs) < 2:
-        raise ValueError("接合には 2 本以上の run が必要です")
+    if len(jobs) < 1:
+        raise ValueError("解析する run がありません")
     logger.info(
         "active runs: "
         + ", ".join(

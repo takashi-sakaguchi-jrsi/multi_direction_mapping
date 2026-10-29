@@ -13,6 +13,7 @@ from src.product_runtime import (
     apply_front_profile,
     apply_product_cli,
     apply_sideview_named_input,
+    apply_sideview_profile,
     cleanup_sideview_intermediates,
     effective_pipeline,
     resolve_named_front_video,
@@ -55,9 +56,8 @@ def test_named_prefix_picks_xxx_not_yyy(tmp_path: Path):
         for suf in ("U", "R", "L"):
             _touch(folder / f"{prefix}_{suf}.mp4")
     found = resolve_named_run_videos(folder, "xxx")
-    assert found["A"].name == "xxx_U.mp4"
-    assert found["B"].name == "xxx_R.mp4"
-    assert found["C"].name == "xxx_L.mp4"
+    assert set(found) == {"000"}
+    assert found["000"].name == "xxx_U.mp4"
 
 
 def test_named_prefix_first_extension_wins(tmp_path: Path):
@@ -66,16 +66,15 @@ def test_named_prefix_first_extension_wins(tmp_path: Path):
     _touch(folder / "xxx_U.avi")
     _touch(folder / "xxx_R.avi")
     found = resolve_named_run_videos(folder, "xxx")
-    assert found["A"].suffix == ".mp4"
-    assert found["B"].suffix == ".avi"
-    assert "C" not in found
+    assert found["000"].suffix == ".mp4"
+    assert set(found) == {"000"}
 
 
-def test_named_prefix_missing_ur_raises(tmp_path: Path):
+def test_named_prefix_u_only_is_enough(tmp_path: Path):
     folder = tmp_path / "input"
     _touch(folder / "xxx_U.mp4")
-    with pytest.raises(FileNotFoundError):
-        resolve_named_run_videos(folder, "xxx")
+    found = resolve_named_run_videos(folder, "xxx")
+    assert found["000"].name == "xxx_U.mp4"
 
 
 def test_sideview_named_input_clears_missing_l(tmp_path: Path):
@@ -86,7 +85,9 @@ def test_sideview_named_input_clears_missing_l(tmp_path: Path):
     config.two_direction.run_C.video_path = "stale_L.mp4"
     apply_sideview_named_input(config, str(folder), "xxx")
     assert Path(config.two_direction.run_A.video_path).name == "xxx_U.mp4"
+    assert config.two_direction.run_A.run_id == "000"
     assert config.two_direction.run_C.video_path == ""
+    assert [r.run_id for r in config.two_direction.runs] == ["000"]
 
 
 def test_front_input_sets_video_path(tmp_path: Path):
@@ -178,6 +179,92 @@ def test_apply_front_profile_rejects_unknown_attitude_source():
     cfg = Config.from_dict({"front": {"physical_attitude_source": "nope"}})
     with pytest.raises(ValueError, match="physical_attitude_source"):
         apply_front_profile(cfg)
+
+
+def test_pipeline_profiles_split_camera_and_ocr_increment():
+    config = Config.from_dict({
+        "camera": {"fov_degrees": 185.0, "fx": 300.0},
+        "ocr": {"max_distance_increment_mm": 10.0, "countup_mean_dz_max_mm": 10.0},
+        "front": {
+            "max_distance_increment_mm": 10.0,
+            "countup_mean_dz_max_mm": 10.0,
+            "camera": {"fov_degrees": 185.0, "fx": 341.0},
+        },
+        "two_direction": {
+            "max_distance_increment_mm": 60.0,
+            "countup_mean_dz_max_mm": 12.0,
+            "camera": {"fov_degrees": 60.0, "fx": 900.0, "camera_model": "pinhole"},
+        },
+    })
+    apply_front_profile(config)
+    assert config.ocr.max_distance_increment_mm == pytest.approx(10.0)
+    assert config.ocr.countup_mean_dz_max_mm == pytest.approx(10.0)
+    assert config.camera.fov_degrees == pytest.approx(185.0)
+    assert config.camera.fx == pytest.approx(341.0)
+
+    side = Config.from_dict({
+        "camera": {"fov_degrees": 185.0, "fx": 300.0},
+        "ocr": {"max_distance_increment_mm": 10.0, "countup_mean_dz_max_mm": 10.0},
+        "front": {
+            "max_distance_increment_mm": 10.0,
+            "countup_mean_dz_max_mm": 10.0,
+            "camera": {"fov_degrees": 185.0, "fx": 341.0},
+        },
+        "two_direction": {
+            "max_distance_increment_mm": 60.0,
+            "countup_mean_dz_max_mm": 12.0,
+            "camera": {"fov_degrees": 60.0, "fx": 900.0, "camera_model": "pinhole"},
+        },
+    })
+    apply_sideview_profile(side)
+    assert side.ocr.max_distance_increment_mm == pytest.approx(60.0)
+    assert side.ocr.countup_mean_dz_max_mm == pytest.approx(12.0)
+    assert side.camera.fov_degrees == pytest.approx(60.0)
+    assert side.camera.fx == pytest.approx(900.0)
+    assert side.camera.camera_model == "pinhole"
+    assert side.camera.ocr_roi_ratio == pytest.approx([0.0556, 0.1000, 0.0438, 0.1063])
+    assert side.camera.lens_calibration_file in (None, "")
+    assert side.front.max_distance_increment_mm == pytest.approx(10.0)
+
+
+def test_sideview_pinhole_overlay_does_not_keep_fisheye_calib():
+    config = Config.from_dict({
+        "camera": {
+            "fov_degrees": 185.0,
+            "camera_model": "fisheye",
+            "apply_lens_calibration": False,
+            "fx": 343.9,
+            "fy": 344.2,
+            "cx": 980.3,
+            "cy": 552.7,
+        },
+        "two_direction": {
+            "camera": {
+                "fov_degrees": 60.0,
+                "camera_model": "pinhole",
+                "ocr_roi_ratio": [0.0556, 0.1000, 0.0438, 0.1063],
+            }
+        },
+    })
+    apply_sideview_profile(config)
+    assert config.camera.camera_model == "pinhole"
+    assert config.camera.fov_degrees == pytest.approx(60.0)
+    assert config.camera.lens_calibration_file in (None, "")
+    assert config.camera.fx == pytest.approx(0.0)
+    assert config.camera.ocr_roi_ratio == pytest.approx(
+        [0.0556, 0.1000, 0.0438, 0.1063]
+    )
+
+
+def test_sideview_profile_keeps_two_direction_ocr_roi():
+    config = Config.from_dict({
+        "camera": {"ocr_roi_ratio": [0.0, 0.12, 0.0, 0.32]},
+        "two_direction": {"max_distance_increment_mm": 60.0},
+    })
+    apply_sideview_profile(config)
+    assert config.camera.ocr_roi_ratio == pytest.approx(
+        [0.0556, 0.1000, 0.0438, 0.1063]
+    )
 
 
 def test_apply_front_profile_restores_vp_bounds():

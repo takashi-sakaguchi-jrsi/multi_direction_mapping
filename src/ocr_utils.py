@@ -72,7 +72,7 @@ class OCRConfig:
     ):
         self.threshold = threshold
         self.psm_mode = psm_mode
-        self.retry_thresholds = retry_thresholds or [100, 120, 80, 150]
+        self.retry_thresholds = retry_thresholds or [100, 120, 80, 150, 160, 180, 200]
         self.distance_pattern_decimal = distance_pattern_decimal
         self.distance_pattern_integer = distance_pattern_integer
         self.preprocessing_enabled = preprocessing_enabled
@@ -117,6 +117,21 @@ class OCRConfig:
             preprocessing_method=preprocessing_method,
             retry_thresholds=retry_thresholds,
         )
+
+
+def build_ocr_runtime_config(
+    tesseract_config: str,
+    preprocessing_enabled: bool = False,
+    preprocessing_method: str = "enhanced",
+    retry_thresholds: Optional[List[int]] = None,
+) -> "OCRConfig":
+    """呼び出し側フラグから実行用 OCRConfig を組み立てる。"""
+    return OCRConfig(
+        psm_mode=OCRConfig._extract_psm_mode(tesseract_config),
+        preprocessing_enabled=preprocessing_enabled,
+        preprocessing_method=preprocessing_method,
+        retry_thresholds=retry_thresholds,
+    )
 
 
 # ==================== 内部関数 ====================
@@ -343,8 +358,161 @@ MULTI_STRATEGY_PRESETS = {
         ("otsu", None),
         ("fixed", 100),
         ("fixed", 150),
+        ("fixed", 160),
+        ("fixed", 180),
+        ("fixed", 200),
     ],
 }
+
+# HUD 数字のよくある取り違え（0.26↔0.96 / 0.22↔0.27 / 0.41↔0.47 / 1.30↔1.40）
+_OCR_DIGIT_CONFUSIONS = (
+    ("9", "2"),
+    ("7", "2"),
+    ("2", "9"),
+    ("2", "7"),
+    ("7", "1"),
+    ("1", "7"),
+    ("7", "4"),
+    ("4", "7"),
+    ("5", "6"),
+    ("6", "5"),
+    ("3", "4"),
+    ("4", "3"),
+)
+_OCR_SAME_DISPLAY_MM = 1.0
+_OCR_TENTHS_PLACE_MM = 100.0
+
+
+def ocr_confusion_alternates_mm(distance_mm: float) -> List[float]:
+    """表示 0.01m の各桁で 2↔7 / 2↔9 / 1↔7 / 4↔7 などを1文字だけ置換した候補。"""
+    meters = float(distance_mm) / 1000.0
+    text = f"{meters:.2f}"
+    mapping = {}
+    for src, dst in _OCR_DIGIT_CONFUSIONS:
+        mapping.setdefault(src, set()).add(dst)
+    out: List[float] = []
+    seen = {round(float(distance_mm), 1)}
+    for i, ch in enumerate(text):
+        for dst in mapping.get(ch, ()):
+            alt_text = text[:i] + dst + text[i + 1:]
+            try:
+                alt_mm = float(alt_text) * 1000.0
+            except ValueError:
+                continue
+            key = round(alt_mm, 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(alt_mm)
+    return out
+
+
+def is_ocr_digit_confusion(a_mm: float, b_mm: float) -> bool:
+    """a と b が1文字の数字取り違え関係なら True。"""
+    if abs(float(a_mm) - float(b_mm)) < _OCR_SAME_DISPLAY_MM:
+        return False
+    return any(
+        abs(alt - float(b_mm)) < _OCR_SAME_DISPLAY_MM
+        for alt in ocr_confusion_alternates_mm(a_mm)
+    )
+
+
+def _ocr_same_display(a_mm: float, b_mm: float) -> bool:
+    return abs(float(a_mm) - float(b_mm)) < _OCR_SAME_DISPLAY_MM
+
+
+def _ocr_in_expected_range(
+    distance_mm: float,
+    expected_range_mm: Optional[Tuple[float, float]],
+) -> bool:
+    if expected_range_mm is None:
+        return True
+    min_mm, max_mm = expected_range_mm
+    if distance_mm < min_mm:
+        return False
+    if np.isfinite(max_mm) and distance_mm > max_mm:
+        return False
+    return True
+
+
+def resolve_ocr_distance_with_range(
+    distance_mm: float,
+    expected_range_mm: Optional[Tuple[float, float]],
+) -> Optional[float]:
+    """範囲と数字取り違えを見て採用値を決める。
+
+    範囲内でも 1.30↔1.40 のような 0.1m 桁の取り違えは、現在表示 Z_0 に
+    近い方を採用する。上限 150mm だと 1270→1400 が範囲内に入るため。
+    """
+    raw = float(distance_mm)
+    if expected_range_mm is None:
+        return raw
+    plateau = float(expected_range_mm[0])
+
+    candidates: List[float] = []
+    if _ocr_in_expected_range(raw, expected_range_mm):
+        candidates.append(raw)
+    for alt_mm in ocr_confusion_alternates_mm(raw):
+        if not _ocr_in_expected_range(alt_mm, expected_range_mm):
+            continue
+        if any(abs(alt_mm - c) < _OCR_SAME_DISPLAY_MM for c in candidates):
+            continue
+        candidates.append(float(alt_mm))
+    if not candidates:
+        return None
+
+    def _log_chosen(chosen: float) -> float:
+        if abs(chosen - raw) >= _OCR_SAME_DISPLAY_MM:
+            logger.info(
+                f"OCR digit-confusion repair: {raw:.1f}mm → {chosen:.1f}mm"
+            )
+        return chosen
+
+    for cand in candidates:
+        if _ocr_same_display(cand, plateau):
+            return _log_chosen(cand)
+
+    tenths = [
+        cand for cand in candidates
+        if abs(cand - raw) < _OCR_SAME_DISPLAY_MM
+        or abs(cand - raw) >= _OCR_TENTHS_PLACE_MM - 1.0
+    ]
+    pool = tenths if tenths else candidates
+    chosen = min(pool, key=lambda c: (abs(c - plateau), abs(c - raw)))
+    return _log_chosen(chosen)
+
+
+def _choose_extracted_distance(
+    others: List[Tuple[float, Optional[int]]],
+    expected_range_mm: Optional[Tuple[float, float]],
+) -> Optional[Tuple[float, Optional[int]]]:
+    """カウントアップ候補から採用値を選ぶ。
+
+    220→270（2↔7）のように現在表示 Z_0 の数字取り違えはカウントアップにしない。
+    同じ候補の中に取り違えでない値（220→260）があればそちらを使う。
+    """
+    if not others:
+        return None
+    if expected_range_mm is None:
+        return others[0]
+    plateau = float(expected_range_mm[0])
+    kept = [
+        (mm, th) for mm, th in others
+        if not is_ocr_digit_confusion(mm, plateau)
+    ]
+    if not kept:
+        logger.info(
+            f"OCR plateau hold: {others[0][0]:.1f}mm looks like digit confusion of "
+            f"{plateau:.1f}mm"
+        )
+        return plateau, others[0][1]
+    from collections import Counter
+    counts = Counter(round(item[0], 1) for item in kept)
+    best_val, _best_n = counts.most_common(1)[0]
+    for mm, th in kept:
+        if abs(mm - best_val) < _OCR_SAME_DISPLAY_MM:
+            return mm, th
+    return kept[0]
 
 
 def _get_strategy_list(preprocessing_method: str) -> List[Tuple[str, Optional[int]]]:
@@ -486,15 +654,9 @@ def extract_distance_from_frame(
     "xx.xx m" または "xxxx m" 形式の距離を読み取る。
     ピリオド欠落（例: "410m" → "4.10m"）にも対応。
 
-    preprocessing_enabled=True の場合:
-        マルチ戦略方式を使用。複数の前処理方式でOCRを実行し、
-        合意に基づいて結果を返す（誤読検出機能あり）。
-
-    preprocessing_enabled=False の場合:
-        前回成功した閾値（preferred_threshold）を優先して試行。
-        expected_range_mmが指定されている場合、結果が範囲外なら
-        別の閾値でリトライし、範囲内の結果を返す。
-        すべての閾値で範囲外または解析失敗の場合はエラーを送出。
+    preprocessing_enabled=True でも retry_thresholds と expected_range_mm を使う。
+    前処理プリセットのあとに未使用の retry_thresholds を固定閾値として足す。
+    範囲外の読みは 2↔9 / 2↔7 などの数字取り違え補正を一度試す。
 
     Args:
         frame: 入力フレーム画像（OpenCVで取得したBGR形式）
@@ -525,77 +687,97 @@ def extract_distance_from_frame(
 
     validate_roi_ratio(roi_ratio)
 
-    # マルチ戦略方式（preprocessing_enabled=True）
+    attempts: List[Tuple[str, Optional[int]]] = []
     if config.preprocessing_enabled:
-        return _extract_with_multi_strategy(
-            frame, roi_ratio, config.psm_mode,
-            config.distance_pattern_decimal,
-            config.distance_pattern_integer,
-            preprocessing_method=config.preprocessing_method
-        ), None
-
-    # 従来方式（preprocessing_enabled=False）
-    # 閾値リストを構築: preferred_thresholdを先頭に配置
-    thresholds = list(config.retry_thresholds)
-    if preferred_threshold is not None and preferred_threshold in thresholds:
-        thresholds.remove(preferred_threshold)
-        thresholds.insert(0, preferred_threshold)
+        attempts.extend(_get_strategy_list(config.preprocessing_method))
+    extra_thresholds = list(config.retry_thresholds)
+    if preferred_threshold is not None:
+        extra_thresholds = [preferred_threshold] + [
+            t for t in extra_thresholds if t != preferred_threshold
+        ]
+    seen_fixed = {th for method, th in attempts if method == "fixed" and th is not None}
+    for threshold in extra_thresholds:
+        if threshold in seen_fixed:
+            continue
+        attempts.append(("fixed", threshold))
+        seen_fixed.add(threshold)
 
     last_error = None
     first_parsed_result = None
     first_parsed_threshold = None
+    plateau = None if expected_range_mm is None else float(expected_range_mm[0])
+    countup_candidates: List[Tuple[float, Optional[int]]] = []
 
-    for attempt, threshold in enumerate(thresholds, 1):
+    for attempt, (method, threshold) in enumerate(attempts, 1):
         try:
             logger.debug(
-                f"OCR attempt {attempt}/{len(thresholds)} "
-                f"with threshold={threshold}"
+                f"OCR attempt {attempt}/{len(attempts)} "
+                f"method={method} threshold={threshold}"
             )
-
-            # OCR実行
             text = _extract_with_threshold(
-                frame, roi_ratio, threshold, config.psm_mode
+                frame,
+                roi_ratio,
+                threshold if threshold is not None else 100,
+                config.psm_mode,
+                preprocessing_method=method,
             )
-
-            # 距離解析
             distance_mm = _parse_distance_text(
                 text,
                 config.distance_pattern_decimal,
                 config.distance_pattern_integer
             )
-
-            # 最初の解析成功結果を記録
             if first_parsed_result is None:
                 first_parsed_result = distance_mm
                 first_parsed_threshold = threshold
 
-            # 範囲チェック（max が非有限ならプラス側上限なし）
-            if expected_range_mm is not None:
-                min_mm, max_mm = expected_range_mm
-                too_low = distance_mm < min_mm
-                too_high = np.isfinite(max_mm) and distance_mm > max_mm
-                if too_low or too_high:
-                    logger.debug(
-                        f"OCR result {distance_mm}mm outside expected range "
-                        f"[{min_mm:.0f}, {max_mm:.0f}]mm (threshold={threshold}), "
-                        f"trying next threshold"
-                    )
-                    continue
-
-            logger.info(
-                f"Distance extracted successfully: {distance_mm}mm "
-                f"(threshold={threshold}, attempt={attempt})"
+            resolved = resolve_ocr_distance_with_range(
+                distance_mm, expected_range_mm
             )
-            return distance_mm, threshold
+            if resolved is None:
+                logger.debug(
+                    f"OCR result {distance_mm}mm outside expected range "
+                    f"and no digit-confusion repair "
+                    f"(method={method}, threshold={threshold})"
+                )
+                continue
+
+            if plateau is not None and _ocr_same_display(resolved, plateau):
+                logger.info(
+                    f"Distance extracted successfully: {resolved}mm "
+                    f"(plateau hold, method={method}, threshold={threshold}, "
+                    f"attempt={attempt})"
+                )
+                return resolved, threshold
+            if plateau is None:
+                logger.info(
+                    f"Distance extracted successfully: {resolved}mm "
+                    f"(method={method}, threshold={threshold}, attempt={attempt})"
+                )
+                return resolved, threshold
+
+            countup_candidates.append((resolved, threshold))
+            logger.debug(
+                f"OCR count-up candidate {resolved}mm "
+                f"(method={method}, threshold={threshold})"
+            )
 
         except OCRTextNotFoundError as e:
             last_error = e
             log_fn = logger.warning if log_failures else logger.debug
             log_fn(
-                f"OCR attempt {attempt} failed with threshold={threshold}: "
-                f"text='{e.ocr_text}'"
+                f"OCR attempt {attempt} failed with method={method} "
+                f"threshold={threshold}: text='{e.ocr_text}'"
             )
             continue
+
+    chosen = _choose_extracted_distance(countup_candidates, expected_range_mm)
+    if chosen is not None:
+        resolved, threshold = chosen
+        logger.info(
+            f"Distance extracted successfully: {resolved}mm "
+            f"(threshold={threshold}, candidates={len(countup_candidates)})"
+        )
+        return resolved, threshold
 
     # すべてのリトライが失敗
     if first_parsed_result is not None:
@@ -880,10 +1062,12 @@ def estimate_high_precision_z_positions(
     success_flags: np.ndarray,
     average_speed: float
 ) -> np.ndarray:
-    """平均速度ベースの高精度Z位置推定（簡易等分割法）
+    """平均速度ベースの高精度Z位置推定（差分等分割法）
 
     OCR読み取り値から高精度Z位置を推定する。
-    同一OCR値が連続する場合、10mm区間を等分割して補間する。
+    同一OCR値が n フレーム続く区間は、次の異なる成功値との差分 Δ を
+    n 等分して割り振る。表示が 10mm のまま 10 フレーム続いたあと 40mm
+    に進む場合、Δ=30mm を 30/10 mm 間隔で載せる。
 
     Args:
         ocr_distances: OCR読み取り距離配列 (N,) [mm]
@@ -894,23 +1078,18 @@ def estimate_high_precision_z_positions(
         z_positions: 高精度Z位置配列 (N,) [mm]
 
     処理ロジック:
-        同一値Xがn個連続した場合、i番目（0-indexed）の値を X + i * 10 / n とする。
+        同一値 X が n 個連続し、次の成功値が Y なら
+        k 番目（0-indexed）を X + k * (Y−X) / n とする。
+        次の成功値が無い最後の区間は差分 0（表示値のまま）。
 
-        例: OCR値が [3000, 3000, 3000, 3000] の場合（n=4）
-            i=0 → 3000 + 0 * 10 / 4 = 3000.0
-            i=1 → 3000 + 1 * 10 / 4 = 3002.5
-            i=2 → 3000 + 2 * 10 / 4 = 3005.0
-            i=3 → 3000 + 3 * 10 / 4 = 3007.5
+        例: 10mm が 10 フレーム続いたあと 40mm
+            k=0 → 10.0, k=1 → 13.0, …, k=9 → 37.0, 次区間先頭 → 40.0
 
-    Examples:
-        >>> ocr_dist = np.array([3000.0, 3010.0, 3010.0, 3020.0, 3020.0, 3030.0])
-        >>> success = np.array([True, True, True, True, True, True])
-        >>> avg_speed = 6.0
-        >>> z_pos = estimate_high_precision_z_positions(ocr_dist, success, avg_speed)
-        >>> print(z_pos)  # [3000.0, 3010.0, 3015.0, 3020.0, 3025.0, 3030.0]
+        例: 10mm 刻み [3000, 3010, 3010, 3020, 3020, 3030]
+            → [3000.0, 3010.0, 3015.0, 3020.0, 3025.0, 3030.0]
 
     Note:
-        - OCR失敗フレーム(NaN)は前後の値から線形補間
+        - OCR失敗フレームは前後の値から線形補間
         - 平均速度パラメータは互換性のために残すが使用しない
     """
     n_frames = len(ocr_distances)
@@ -950,10 +1129,18 @@ def estimate_high_precision_z_positions(
 
         # [i, j) の範囲が同一OCR値
         n_consecutive = j - i
-
-        # 等分割計算
+        nxt = j
+        while nxt < n_frames and (
+            not success_flags[nxt] or ocr_distances[nxt] == current_ocr_value
+        ):
+            nxt += 1
+        if nxt < n_frames and success_flags[nxt]:
+            delta = float(ocr_distances[nxt]) - float(current_ocr_value)
+        else:
+            delta = 0.0
+        step = delta / n_consecutive if n_consecutive else 0.0
         for k in range(n_consecutive):
-            z_estimated[i + k] = current_ocr_value + k * 10.0 / n_consecutive
+            z_estimated[i + k] = current_ocr_value + k * step
 
         if n_consecutive > 1:
             interpolated_count += n_consecutive

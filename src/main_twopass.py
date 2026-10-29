@@ -527,10 +527,17 @@ class ColorMapPipelineTwoPass:
             # ========================================
             # フォールバック: v1.0形式（従来方式）
             # ========================================
-            f = compute_fisheye_focal_length(
-                self.config.camera.fov_degrees,
-                (height, width)
-            )
+            if str(self.config.camera.camera_model or "").lower() == "pinhole":
+                from src.camera_utils import compute_pinhole_focal_length
+                f = compute_pinhole_focal_length(
+                    self.config.camera.fov_degrees,
+                    (height, width)
+                )
+            else:
+                f = compute_fisheye_focal_length(
+                    self.config.camera.fov_degrees,
+                    (height, width)
+                )
             cx = width // 2 + self.config.camera.center_offset_x
             cy = height // 2 + self.config.camera.center_offset_y
             is_from_calibration = False
@@ -623,12 +630,15 @@ class ColorMapPipelineTwoPass:
                 config=self.config.estimation,
                 ocr_tesseract_config=self.config.ocr.tesseract_config,
                 ocr_preprocessing_enabled=self.config.ocr.preprocessing_enabled,
+                ocr_preprocessing_method=self.config.ocr.preprocessing_method,
+                ocr_retry_thresholds=self.config.ocr.retry_thresholds,
                 ocr_enabled=self.config.ocr.enabled,
                 progress_callback=progress_callback,
                 max_distance_increment_mm=self.config.ocr.max_distance_increment_mm,
                 enforce_ocr_increment_upper_bound=(
                     self.config.ocr.enforce_ocr_increment_upper_bound
                 ),
+                countup_mean_dz_max_mm=self.config.ocr.countup_mean_dz_max_mm,
             )
 
 

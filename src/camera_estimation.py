@@ -11,6 +11,7 @@
 """
 
 import logging
+import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
@@ -36,6 +37,9 @@ ANGLE_EPSILON = 0.01  # 約0.57度
 # 位置の初期値がbounds境界にある場合に使用するオフセット（mm）
 # soft_l1損失関数が境界で正しく機能するよう、境界から少し内側に初期値を設定
 POSITION_EPSILON = 0.01  # 0.01mm
+
+# OCR 距離表示の最小目盛（0.01m = 10mm）
+OCR_DISPLAY_TICK_MM = 10.0
 
 
 # ============================================================================
@@ -2876,12 +2880,14 @@ class CameraEstimator:
         frame_gap: int,
         max_increment: float,
         enforce_upper_bound: bool = True,
+        countup_mean_dz_max: float = 10.0,
     ) -> Optional[float]:
         """OCR距離の妥当性を検証（物理制約ベース）
 
-        呼び出し側でbase_ocr_distanceにprev_ocr_distance（直前の成功OCR値）を
-        渡し、frame_gapにその成功フレームからの差を渡すことで、
-        per-frame incrementベースの検証を行う。
+        base_ocr_distance はカウントアップ直前の表示値 Z_0、frame_gap は
+        そのカウントアップから現在までのフレーム数 n。
+        countup_mean_dz_max は OCR カウントアップ間の移動平均 dz の最大値
+        （estimation.motion.max_dz とは別）。
         """
         return validate_ocr_distance_value(
             frame_idx=frame_idx,
@@ -2893,6 +2899,7 @@ class CameraEstimator:
             max_increment=max_increment,
             logger=self.logger,
             enforce_upper_bound=enforce_upper_bound,
+            countup_mean_dz_max=countup_mean_dz_max,
         )
 
     def _collect_reference_frames(
@@ -2905,6 +2912,9 @@ class CameraEstimator:
         ocr_preprocessing_enabled: bool,
         max_distance_increment_mm: float = 10.0,
         enforce_ocr_increment_upper_bound: bool = True,
+        countup_mean_dz_max_mm: float = 10.0,
+        ocr_preprocessing_method: str = "enhanced",
+        ocr_retry_thresholds: Optional[List[int]] = None,
     ) -> List[Dict]:
         """基準フレームを収集（OCR距離検証統合版）
 
@@ -2917,7 +2927,8 @@ class CameraEstimator:
             ocr_roi_ratio: OCR読み取りROI領域 (x1, y1, x2, y2)
             ocr_tesseract_config: Tesseract設定文字列
             ocr_preprocessing_enabled: OCR前処理の有効化フラグ
-            max_distance_increment_mm: 1フレームあたりの最大距離増分(mm)（デフォルト: 10.0）
+            max_distance_increment_mm: カウントアップ遅れ時の表示ジャンプ上限(mm)
+            countup_mean_dz_max_mm: OCR カウントアップ間の移動平均 dz の最大値(mm/frame)
 
         Returns:
             reference_frames: 基準フレームリスト
@@ -2927,7 +2938,7 @@ class CameraEstimator:
                     'dark_center': (float, float)
                 }, ...]
         """
-        from src.ocr_utils import extract_distance_from_frame
+        from src.ocr_utils import extract_distance_from_frame, build_ocr_runtime_config
 
         reference_frames = []
         prev_ocr_distance = None  # 前フレームのOCR距離
@@ -2935,6 +2946,8 @@ class CameraEstimator:
         prev_ocr_frame_idx = None  # 直前のOCR成功フレームインデックス
         base_ocr_distance = None   # 直前の基準フレームのOCR距離
         base_ocr_frame_idx = start_frame  # 直前の基準フレームのインデックス
+        plateau_ocr_distance = None  # カウントアップ直前の表示値 Z_0
+        plateau_ocr_frame_idx = None
 
         # BUG-011統計情報用
         ocr_raw_success_count = 0      # OCR読取り成功数（検証前）
@@ -2971,15 +2984,25 @@ class CameraEstimator:
             
             # OCR距離読み取り
             try:
-                from src.ocr_utils import OCRConfig as OCRConfigUtils
-                _ocr_config = OCRConfigUtils(
-                    psm_mode=OCRConfigUtils._extract_psm_mode(ocr_tesseract_config),
-                    preprocessing_enabled=ocr_preprocessing_enabled,
+                _ocr_config = build_ocr_runtime_config(
+                    ocr_tesseract_config,
+                    ocr_preprocessing_enabled,
+                    ocr_preprocessing_method,
+                    ocr_retry_thresholds,
+                )
+                expected_range = ocr_expected_range_from_plateau(
+                    plateau_ocr_distance,
+                    plateau_ocr_frame_idx,
+                    frame_idx,
+                    max_distance_increment_mm,
+                    enforce_ocr_increment_upper_bound,
+                    countup_mean_dz_max_mm,
                 )
                 ocr_distance_raw, _ = extract_distance_from_frame(
                     frame,
                     ocr_roi_ratio,
-                    config=_ocr_config
+                    config=_ocr_config,
+                    expected_range_mm=expected_range,
                 )
                 if ocr_distance_raw is not None:
                     ocr_raw_success_count += 1
@@ -2987,25 +3010,20 @@ class CameraEstimator:
                 self.logger.warning(f"フレーム{frame_idx}: OCR読み取り失敗 - {e}")
                 ocr_distance_raw = None
 
-            # BUG-011修正: OCR距離の妥当性検証（prev_ocr_distanceベースを優先）
-            if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-                gap_for_validate = frame_idx - prev_ocr_frame_idx
-                ref_distance = prev_ocr_distance
-            elif base_ocr_distance is not None:
-                gap_for_validate = frame_idx - base_ocr_frame_idx
-                ref_distance = base_ocr_distance
-            else:
-                gap_for_validate = 1
-                ref_distance = None
+            # OCR距離の妥当性検証（カウントアップ直前値 Z_0 と経過フレーム n）
+            z0, n_since_count_up = ocr_plateau_n(
+                plateau_ocr_distance, plateau_ocr_frame_idx, frame_idx
+            )
             ocr_distance = self.validate_ocr_distance(
                 frame_idx=frame_idx,
                 ocr_distance=ocr_distance_raw,
                 prev_ocr_distance=prev_ocr_distance,
                 prev_ocr_success=prev_ocr_success,
-                base_ocr_distance=ref_distance,
-                frame_gap=gap_for_validate,
+                base_ocr_distance=z0,
+                frame_gap=n_since_count_up,
                 max_increment=max_distance_increment_mm,
                 enforce_upper_bound=enforce_ocr_increment_upper_bound,
+                countup_mean_dz_max=countup_mean_dz_max_mm,
             )
 
             # OCR距離が検証合格した場合、統計カウント
@@ -3051,6 +3069,10 @@ class CameraEstimator:
                 prev_ocr_distance = ocr_distance
                 prev_ocr_success = True
                 prev_ocr_frame_idx = frame_idx
+                plateau_ocr_distance, plateau_ocr_frame_idx = update_ocr_plateau(
+                    plateau_ocr_distance, plateau_ocr_frame_idx,
+                    ocr_distance, frame_idx,
+                )
             else:
                 prev_ocr_success = False
 
@@ -3237,6 +3259,9 @@ class CameraEstimator:
         read_ocr: bool = True,
         max_distance_increment_mm: float = 10.0,
         enforce_ocr_increment_upper_bound: bool = True,
+        countup_mean_dz_max_mm: float = 10.0,
+        ocr_preprocessing_method: str = "enhanced",
+        ocr_retry_thresholds: Optional[List[int]] = None,
     ) -> Dict:
         """Phase1: 暗部重心VP + 累積10mm間隔での特徴点ベースVP推定
         
@@ -3257,7 +3282,7 @@ class CameraEstimator:
                 'search_ranges': 探索範囲制約
             }
         """
-        from src.ocr_utils import extract_distance_from_frame
+        from src.ocr_utils import extract_distance_from_frame, build_ocr_runtime_config
         
         self.logger.info("=" * 80)
         self.logger.info("Phase1: VP収集開始（累積10mm間隔特徴点VP付き）")
@@ -3269,6 +3294,9 @@ class CameraEstimator:
             ocr_roi_ratio, ocr_tesseract_config, ocr_preprocessing_enabled,
             max_distance_increment_mm=max_distance_increment_mm,
             enforce_ocr_increment_upper_bound=enforce_ocr_increment_upper_bound,
+            countup_mean_dz_max_mm=countup_mean_dz_max_mm,
+            ocr_preprocessing_method=ocr_preprocessing_method,
+            ocr_retry_thresholds=ocr_retry_thresholds,
         )
         
         if len(reference_frames) < self.config.vanishing_point.min_reference_frames:
@@ -3318,10 +3346,11 @@ class CameraEstimator:
             
             # OCR距離（read_ocr=Trueの場合のみ）
             if read_ocr:
-                from src.ocr_utils import OCRConfig as OCRConfigUtils
-                _ocr_config = OCRConfigUtils(
-                    psm_mode=OCRConfigUtils._extract_psm_mode(ocr_tesseract_config),
-                    preprocessing_enabled=ocr_preprocessing_enabled,
+                _ocr_config = build_ocr_runtime_config(
+                    ocr_tesseract_config,
+                    ocr_preprocessing_enabled,
+                    ocr_preprocessing_method,
+                    ocr_retry_thresholds,
                 )
                 ocr_distance, _ = extract_distance_from_frame(
                     frame,
@@ -3897,6 +3926,7 @@ def collect_vanishing_points_and_ocr_distances(
     ocr_config: Optional['OCRConfig'] = None,
     max_distance_increment_mm: float = 10.0,
     enforce_ocr_increment_upper_bound: bool = True,
+    countup_mean_dz_max_mm: float = 10.0,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """消失点とOCR距離を同時に収集（1回の動画読み込みで処理）
 
@@ -3939,6 +3969,8 @@ def collect_vanishing_points_and_ocr_distances(
         prev_ocr_frame_idx = None  # 直前のOCR成功フレームインデックス
         base_ocr_distance = None
         base_ocr_frame_idx = 0
+        plateau_ocr_distance = None
+        plateau_ocr_frame_idx = None
     else:
         ocr_distances = None
         success_flags = None
@@ -4035,24 +4067,14 @@ def collect_vanishing_points_and_ocr_distances(
 
     if read_ocr:
         try:
-            # 期待距離範囲を計算（prev_ocr_distanceベースを優先）
-            expected_range = None
-            if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-                gap_from_prev = start_frame - prev_ocr_frame_idx
-                expected_range = ocr_expected_range_mm(
-                    prev_ocr_distance,
-                    gap_from_prev,
-                    max_distance_increment_mm,
-                    enforce_ocr_increment_upper_bound,
-                )
-            elif base_ocr_distance is not None:
-                frame_gap = start_frame - base_ocr_frame_idx
-                expected_range = ocr_expected_range_mm(
-                    base_ocr_distance,
-                    frame_gap,
-                    max_distance_increment_mm,
-                    enforce_ocr_increment_upper_bound,
-                )
+            expected_range = ocr_expected_range_from_plateau(
+                plateau_ocr_distance,
+                plateau_ocr_frame_idx,
+                start_frame,
+                max_distance_increment_mm,
+                enforce_ocr_increment_upper_bound,
+                countup_mean_dz_max_mm,
+            )
 
             distance_raw, used_threshold = extract_distance_from_frame(
                 first_frame,
@@ -4064,25 +4086,19 @@ def collect_vanishing_points_and_ocr_distances(
             if used_threshold is not None:
                 last_successful_threshold = used_threshold
 
-            # BUG-011修正: OCR距離の妥当性検証
-            if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-                gap_for_validate = start_frame - prev_ocr_frame_idx
-                ref_distance = prev_ocr_distance
-            elif base_ocr_distance is not None:
-                gap_for_validate = start_frame - base_ocr_frame_idx
-                ref_distance = base_ocr_distance
-            else:
-                gap_for_validate = 1
-                ref_distance = None
+            z0, n_since_count_up = ocr_plateau_n(
+                plateau_ocr_distance, plateau_ocr_frame_idx, start_frame
+            )
             distance = estimator.validate_ocr_distance(
                 frame_idx=start_frame,
                 ocr_distance=distance_raw,
                 prev_ocr_distance=prev_ocr_distance,
                 prev_ocr_success=prev_ocr_success,
-                base_ocr_distance=ref_distance,
-                frame_gap=gap_for_validate,
+                base_ocr_distance=z0,
+                frame_gap=n_since_count_up,
                 max_increment=max_distance_increment_mm,
                 enforce_upper_bound=enforce_ocr_increment_upper_bound,
+                countup_mean_dz_max=countup_mean_dz_max_mm,
             )
 
             if distance is not None and not np.isnan(distance):
@@ -4092,6 +4108,10 @@ def collect_vanishing_points_and_ocr_distances(
                 prev_ocr_distance = distance
                 prev_ocr_success = True
                 prev_ocr_frame_idx = start_frame
+                plateau_ocr_distance, plateau_ocr_frame_idx = update_ocr_plateau(
+                    plateau_ocr_distance, plateau_ocr_frame_idx,
+                    distance, start_frame,
+                )
                 if base_ocr_distance is None:
                     base_ocr_distance = distance
                     base_ocr_frame_idx = start_frame
@@ -4162,25 +4182,15 @@ def collect_vanishing_points_and_ocr_distances(
         # OCR距離読み取り（read_ocr=Trueの場合のみ）
         if read_ocr:
             try:
-                # 期待距離範囲を計算（prev_ocr_distanceベースを優先）
                 current_frame_idx = start_frame + i
-                expected_range = None
-                if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-                    gap_from_prev = current_frame_idx - prev_ocr_frame_idx
-                    expected_range = ocr_expected_range_mm(
-                        prev_ocr_distance,
-                        gap_from_prev,
-                        max_distance_increment_mm,
-                        enforce_ocr_increment_upper_bound,
-                    )
-                elif base_ocr_distance is not None:
-                    frame_gap = current_frame_idx - base_ocr_frame_idx
-                    expected_range = ocr_expected_range_mm(
-                        base_ocr_distance,
-                        frame_gap,
-                        max_distance_increment_mm,
-                        enforce_ocr_increment_upper_bound,
-                    )
+                expected_range = ocr_expected_range_from_plateau(
+                    plateau_ocr_distance,
+                    plateau_ocr_frame_idx,
+                    current_frame_idx,
+                    max_distance_increment_mm,
+                    enforce_ocr_increment_upper_bound,
+                    countup_mean_dz_max_mm,
+                )
 
                 distance_raw, used_threshold = extract_distance_from_frame(
                     frame,
@@ -4192,25 +4202,19 @@ def collect_vanishing_points_and_ocr_distances(
                 if used_threshold is not None:
                     last_successful_threshold = used_threshold
 
-                # BUG-011修正: OCR距離の妥当性検証（prev_ocr_distanceベースを優先）
-                if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-                    gap_for_validate = current_frame_idx - prev_ocr_frame_idx
-                    ref_distance = prev_ocr_distance
-                elif base_ocr_distance is not None:
-                    gap_for_validate = current_frame_idx - base_ocr_frame_idx
-                    ref_distance = base_ocr_distance
-                else:
-                    gap_for_validate = 1
-                    ref_distance = None
+                z0, n_since_count_up = ocr_plateau_n(
+                    plateau_ocr_distance, plateau_ocr_frame_idx, current_frame_idx
+                )
                 distance = estimator.validate_ocr_distance(
                     frame_idx=current_frame_idx,
                     ocr_distance=distance_raw,
                     prev_ocr_distance=prev_ocr_distance,
                     prev_ocr_success=prev_ocr_success,
-                    base_ocr_distance=ref_distance,
-                    frame_gap=gap_for_validate,
+                    base_ocr_distance=z0,
+                    frame_gap=n_since_count_up,
                     max_increment=max_distance_increment_mm,
                     enforce_upper_bound=enforce_ocr_increment_upper_bound,
+                    countup_mean_dz_max=countup_mean_dz_max_mm,
                 )
 
                 if distance is not None and not np.isnan(distance):
@@ -4220,6 +4224,10 @@ def collect_vanishing_points_and_ocr_distances(
                     prev_ocr_distance = distance
                     prev_ocr_success = True
                     prev_ocr_frame_idx = current_frame_idx
+                    plateau_ocr_distance, plateau_ocr_frame_idx = update_ocr_plateau(
+                        plateau_ocr_distance, plateau_ocr_frame_idx,
+                        distance, current_frame_idx,
+                    )
                     # 基準フレームの更新判定（10mm間隔到達時）
                     if base_ocr_distance is not None:
                         if distance >= base_ocr_distance + 10.0:
@@ -5789,6 +5797,9 @@ def compute_frame_constraints(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     max_distance_increment_mm: float = 10.0,
     enforce_ocr_increment_upper_bound: bool = True,
+    countup_mean_dz_max_mm: float = 10.0,
+    ocr_preprocessing_method: str = "enhanced",
+    ocr_retry_thresholds: Optional[List[int]] = None,
 ) -> Tuple[Dict[int, Dict[str, Tuple[float, float]]], Optional[np.ndarray], Optional[np.ndarray]]:
 
     """全フレームの探索範囲制約を一括計算（逐次読み込み版）
@@ -5843,16 +5854,18 @@ def compute_frame_constraints(
         estimate_high_precision_z_positions,  # 既存手法（バックアップ用に残す）
         estimate_positions_offset_moving_average,  # 新手法
         compute_z_ranges,
-        OCRConfig as OCRConfigUtils
+        build_ocr_runtime_config,
     )
 
     logger = logging.getLogger(__name__)
     n_frames = end_frame - start_frame  # 左閉右開区間 [start_frame, end_frame)
 
     # OCRConfig変換: config.py側の設定をocr_utils側のOCRConfigに反映
-    _ocr_config = OCRConfigUtils(
-        psm_mode=OCRConfigUtils._extract_psm_mode(ocr_tesseract_config),
-        preprocessing_enabled=ocr_preprocessing_enabled,
+    _ocr_config = build_ocr_runtime_config(
+        ocr_tesseract_config,
+        ocr_preprocessing_enabled,
+        ocr_preprocessing_method,
+        ocr_retry_thresholds,
     )
 
     # 消失点推定値の初期化（Phase2で使用）
@@ -5890,8 +5903,11 @@ def compute_frame_constraints(
                     ocr_roi_ratio=ocr_roi_ratio,
                     ocr_tesseract_config=ocr_tesseract_config,
                     ocr_preprocessing_enabled=ocr_preprocessing_enabled,
+                    ocr_preprocessing_method=ocr_preprocessing_method,
+                    ocr_retry_thresholds=ocr_retry_thresholds,
                     max_distance_increment_mm=max_distance_increment_mm,
                     enforce_ocr_increment_upper_bound=enforce_ocr_increment_upper_bound,
+                    countup_mean_dz_max_mm=countup_mean_dz_max_mm,
                 )
                 
                 # 返り値から必要なデータを取得
@@ -5927,6 +5943,7 @@ def compute_frame_constraints(
                     ocr_config=_ocr_config,
                     max_distance_increment_mm=max_distance_increment_mm,
                     enforce_ocr_increment_upper_bound=enforce_ocr_increment_upper_bound,
+                    countup_mean_dz_max_mm=countup_mean_dz_max_mm,
                 )
         else:
             logger.info("Phase1: 暗部中心法による消失点推定を使用（enable_feature_based_vp=false）")
@@ -5942,6 +5959,7 @@ def compute_frame_constraints(
                 ocr_config=_ocr_config,
                 max_distance_increment_mm=max_distance_increment_mm,
                 enforce_ocr_increment_upper_bound=enforce_ocr_increment_upper_bound,
+                countup_mean_dz_max_mm=countup_mean_dz_max_mm,
             )
         # 異常値除去（分布ベース + 変動量ベース + ベクトル判定）
 
@@ -6050,6 +6068,7 @@ def compute_frame_constraints(
                 ocr_config=_ocr_config,
                 max_distance_increment_mm=max_distance_increment_mm,
                 enforce_ocr_increment_upper_bound=enforce_ocr_increment_upper_bound,
+                countup_mean_dz_max_mm=countup_mean_dz_max_mm,
             )
             vp = None  # 消失点は使用しない
         else:
@@ -6250,20 +6269,104 @@ def compute_frame_constraints(
     return constraints_dict, z_positions_output, vanishing_points_output
 
 
+def ocr_plateau_n(
+    plateau_z: Optional[float],
+    plateau_frame: Optional[int],
+    frame_idx: int,
+) -> Tuple[Optional[float], int]:
+    """カウントアップ直前値 Z_0 と、そこから現在までのフレーム数 n。"""
+    if plateau_z is None or plateau_frame is None:
+        return None, 0
+    return float(plateau_z), int(frame_idx) - int(plateau_frame)
+
+
+def update_ocr_plateau(
+    plateau_z: Optional[float],
+    plateau_frame: Optional[int],
+    distance: float,
+    frame_idx: int,
+) -> Tuple[float, int]:
+    """受理した表示値が上がったときだけ Z_0 を更新する。同じ台地では n を伸ばす。"""
+    if plateau_z is None or distance > plateau_z:
+        return float(distance), int(frame_idx)
+    return float(plateau_z), int(plateau_frame)
+
+
+def ocr_z_ocr_max_mm(
+    z0: float,
+    n: int,
+    countup_mean_dz_max: float,
+    tick: float = OCR_DISPLAY_TICK_MM,
+) -> float:
+    """真の距離上限 (Z_0+tick)+n*countup_mean_dz_max から Z_ocr_max を作る。
+
+    countup_mean_dz_max は OCR カウントアップ間の移動平均 dz の最大値であり、
+    estimation.motion.max_dz とは別の OCR 評価用パラメータ。
+
+    Z* < (Z_0 + 10) + n * countup_mean_dz_max
+    Z_ocr_max = floor(((Z_0+10)+n*countup_mean_dz_max) / 10) * 10
+    """
+    n = max(int(n), 0)
+    z_star_hi = (float(z0) + float(tick)) + n * float(countup_mean_dz_max)
+    return math.floor(z_star_hi / float(tick)) * float(tick)
+
+
+def ocr_allowed_inclusive_hi_mm(
+    z0: float,
+    n: int,
+    countup_mean_dz_max: float,
+    max_increment: float,
+    tick: float = OCR_DISPLAY_TICK_MM,
+) -> float:
+    """Z_ocr の包括上限。Z_ocr < Z_ocr_max かつ Z_ocr <= Z_0 + max_increment。
+
+    max_distance_increment は 1 フレーム増分ではなく、遅れカウントアップの
+    表示ジャンプ上限なので、Z_ocr_max を Z_0 + max_increment で切る。
+    """
+    z_ocr_max = ocr_z_ocr_max_mm(z0, n, countup_mean_dz_max, tick=tick)
+    cap = float(z0) + float(max_increment)
+    return min(cap, z_ocr_max - 1e-9)
+
+
 def ocr_expected_range_mm(
     ref: Optional[float],
     gap: int,
     max_increment: float,
     enforce_upper_bound: bool = True,
+    *,
+    countup_mean_dz_max: float = 10.0,
+    tick: float = OCR_DISPLAY_TICK_MM,
 ) -> Optional[Tuple[float, float]]:
-    """OCR 期待範囲 [前回値, 前回値+増分×gap]。上限オフなら max=inf。"""
+    """OCR 期待範囲 [Z_0, 許容上限]。上限オフなら max=inf。"""
     if ref is None:
         return None
     lo = float(ref)
-    gap_n = max(int(gap), 1)
-    if enforce_upper_bound:
-        return (lo, lo + float(max_increment) * gap_n)
-    return (lo, float("inf"))
+    if not enforce_upper_bound:
+        return (lo, float("inf"))
+    return (
+        lo,
+        ocr_allowed_inclusive_hi_mm(
+            lo, gap, countup_mean_dz_max, max_increment, tick=tick
+        ),
+    )
+
+
+def ocr_expected_range_from_plateau(
+    plateau_z: Optional[float],
+    plateau_frame: Optional[int],
+    frame_idx: int,
+    max_increment: float,
+    enforce_upper_bound: bool,
+    countup_mean_dz_max: float,
+) -> Optional[Tuple[float, float]]:
+    z0, n = ocr_plateau_n(plateau_z, plateau_frame, frame_idx)
+    return ocr_expected_range_mm(
+        z0,
+        n,
+        max_increment,
+        enforce_upper_bound,
+        countup_mean_dz_max=countup_mean_dz_max,
+    )
 
 
 def validate_ocr_distance_value(
@@ -6276,15 +6379,19 @@ def validate_ocr_distance_value(
     max_increment: float,
     logger: Optional[logging.Logger] = None,
     enforce_upper_bound: bool = True,
+    countup_mean_dz_max: float = 10.0,
 ) -> Optional[float]:
-    """OCR距離の妥当性を検証（物理制約ベース、オリジナル BUG-011 と同じ規則）。
+    """OCR距離の妥当性を検証。
 
     検証ルール:
         1. ocr_distance が None の場合はそのまま返す（読取り失敗）
         2. 参照距離なし（最初のフレーム）→ 検証なしで合格
         3. 逆転検出（前フレーム成功時のみ）: ocr_distance < prev_ocr_distance → 破棄
-        4. 範囲チェック: ocr_distance >= ref。
-           enforce_upper_bound ならさらに <= ref + max_increment * gap
+        4. 範囲チェック: Z_ocr >= Z_0。
+           enforce_upper_bound なら
+           Z_ocr < Z_ocr_max かつ Z_ocr <= Z_0 + max_distance_increment。
+           Z_ocr_max = floor(((Z_0+10)+n*countup_mean_dz_max)/10)*10。
+           countup_mean_dz_max は OCR カウントアップ間の移動平均 dz の最大値。
     """
     log = logger or logging.getLogger(__name__)
     if ocr_distance is None:
@@ -6300,9 +6407,16 @@ def validate_ocr_distance_value(
             return None
     min_distance = base_ocr_distance
     if enforce_upper_bound:
-        max_distance = base_ocr_distance + max_increment * frame_gap
+        z_ocr_max = ocr_z_ocr_max_mm(
+            base_ocr_distance, frame_gap, countup_mean_dz_max
+        )
+        cap = float(base_ocr_distance) + float(max_increment)
+        max_distance = min(cap, z_ocr_max - 1e-9)
         in_range = min_distance <= ocr_distance <= max_distance
-        expected_txt = f"[{min_distance:.1f}, {max_distance:.1f}]"
+        expected_txt = (
+            f"[{min_distance:.1f}, {max_distance:.1f}] "
+            f"(Z_ocr_max={z_ocr_max:.1f})"
+        )
     else:
         in_range = ocr_distance >= min_distance
         expected_txt = f"[{min_distance:.1f}, inf]"
@@ -6310,7 +6424,7 @@ def validate_ocr_distance_value(
         log.warning(
             f"OCR距離検証失敗: frame={frame_idx}, "
             f"value={ocr_distance:.1f}mm, "
-            f"expected={expected_txt}mm (gap={frame_gap}), "
+            f"expected={expected_txt}mm (n={frame_gap}), "
             f"reason=範囲外"
         )
         return None
@@ -6331,6 +6445,9 @@ def compute_distance_constraints_only(
     max_distance_increment_mm: float = 10.0,
     known_z_mm: Optional[np.ndarray] = None,
     enforce_ocr_increment_upper_bound: bool = True,
+    countup_mean_dz_max_mm: float = 10.0,
+    ocr_preprocessing_method: str = "enhanced",
+    ocr_retry_thresholds: Optional[List[int]] = None,
 ) -> Tuple[Dict[int, Dict[str, Tuple[float, float]]], Optional[np.ndarray], np.ndarray, np.ndarray]:
     """OCR-only の距離制約。暗部・輝度・VP 系列は呼び出さない。
 
@@ -6338,8 +6455,10 @@ def compute_distance_constraints_only(
     （第1段階: 仮想動画の生成距離を代用する）。既知zは逆転・ジャンプ検証しない。
 
     実 Tesseract 経路はオリジナルと同じ逆転検証を通す。
-    enforce_ocr_increment_upper_bound が True のとき、1フレームあたり
-    max_distance_increment_mm（既定 10 mm）のプラス側上限も見る。
+    enforce_ocr_increment_upper_bound が True のとき、カウントアップ直前値 Z_0 と
+    経過フレーム n、OCR 評価用 countup_mean_dz_max（カウントアップ間の移動平均
+    dz の最大値。motion.max_dz とは別）から Z_ocr_max を作り、さらに
+    max_distance_increment_mm で表示ジャンプを切る。
     False なら下限だけ見て、表示の 20mm 以上飛びを捨てない。
 
     Returns:
@@ -6348,7 +6467,7 @@ def compute_distance_constraints_only(
     from src.ocr_utils import (
         extract_distance_from_frame,
         OCRTextNotFoundError,
-        OCRConfig as OCRConfigUtils,
+        build_ocr_runtime_config,
         compute_average_speed,
         estimate_high_precision_z_positions,
         estimate_positions_offset_moving_average,
@@ -6362,9 +6481,11 @@ def compute_distance_constraints_only(
         config = estimator.config
     ocr_logger = estimator.logger if estimator is not None else logger
 
-    _ocr_config = OCRConfigUtils(
-        psm_mode=OCRConfigUtils._extract_psm_mode(ocr_tesseract_config),
-        preprocessing_enabled=ocr_preprocessing_enabled,
+    _ocr_config = build_ocr_runtime_config(
+        ocr_tesseract_config,
+        ocr_preprocessing_enabled,
+        ocr_preprocessing_method,
+        ocr_retry_thresholds,
     )
 
     prev_ocr_distance: Optional[float] = None
@@ -6372,46 +6493,49 @@ def compute_distance_constraints_only(
     prev_ocr_frame_idx: Optional[int] = None
     base_ocr_distance: Optional[float] = None
     base_ocr_frame_idx: Optional[int] = None
+    plateau_ocr_distance: Optional[float] = None
+    plateau_ocr_frame_idx: Optional[int] = None
     last_successful_threshold: Optional[int] = None
     ocr_raw_success_count = 0
     ocr_validated_success_count = 0
 
     def _ref_for_frame(frame_idx: int):
-        if prev_ocr_distance is not None and prev_ocr_frame_idx is not None:
-            gap = frame_idx - prev_ocr_frame_idx
-            ref = prev_ocr_distance
-        elif base_ocr_distance is not None and base_ocr_frame_idx is not None:
-            gap = frame_idx - base_ocr_frame_idx
-            ref = base_ocr_distance
-        else:
-            gap = 1
-            ref = None
-        if gap < 1:
-            gap = 1
-        expected = ocr_expected_range_mm(
-            ref, gap, max_distance_increment_mm, enforce_ocr_increment_upper_bound
+        z0, n = ocr_plateau_n(
+            plateau_ocr_distance, plateau_ocr_frame_idx, frame_idx
         )
-        return gap, ref, expected
+        expected = ocr_expected_range_mm(
+            z0,
+            n,
+            max_distance_increment_mm,
+            enforce_ocr_increment_upper_bound,
+            countup_mean_dz_max=countup_mean_dz_max_mm,
+        )
+        return n, z0, expected
 
     def _accept(distance_raw: Optional[float], frame_idx: int) -> Tuple[float, bool]:
         nonlocal prev_ocr_distance, prev_ocr_success, prev_ocr_frame_idx
         nonlocal base_ocr_distance, base_ocr_frame_idx, ocr_validated_success_count
-        gap, ref, _ = _ref_for_frame(frame_idx)
+        nonlocal plateau_ocr_distance, plateau_ocr_frame_idx
+        n, z0, _ = _ref_for_frame(frame_idx)
         distance = validate_ocr_distance_value(
             frame_idx=frame_idx,
             ocr_distance=distance_raw,
             prev_ocr_distance=prev_ocr_distance,
             prev_ocr_success=prev_ocr_success,
-            base_ocr_distance=ref,
-            frame_gap=gap,
+            base_ocr_distance=z0,
+            frame_gap=n,
             max_increment=max_distance_increment_mm,
             logger=ocr_logger,
             enforce_upper_bound=enforce_ocr_increment_upper_bound,
+            countup_mean_dz_max=countup_mean_dz_max_mm,
         )
         if distance is not None and not np.isnan(distance):
             prev_ocr_distance = distance
             prev_ocr_success = True
             prev_ocr_frame_idx = frame_idx
+            plateau_ocr_distance, plateau_ocr_frame_idx = update_ocr_plateau(
+                plateau_ocr_distance, plateau_ocr_frame_idx, distance, frame_idx
+            )
             if base_ocr_distance is None:
                 base_ocr_distance = distance
                 base_ocr_frame_idx = frame_idx

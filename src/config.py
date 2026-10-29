@@ -176,6 +176,7 @@ class CameraConfig:
         キャリブレーション情報から読み込まれるため、この設定は無視されます。
     """
     ocr_roi_ratio: List[float] = field(default_factory=lambda: [0.0, 0.12, 0.0, 0.32])
+    """正面 HUD 用の広い枠。側視は SIDEVIEW_OCR_ROI_RATIO を two_direction.camera から載せる。"""
     image_width: int = 1220
     image_height: int = 1080
     focal_length_mm: float = 2.8
@@ -293,6 +294,11 @@ class CameraConfig:
 
     def __post_init__(self):
         """初期化後の処理: キャリブレーションファイル読み込み"""
+        if str(self.camera_model or "").lower() == "pinhole":
+            # 側視ピンホールは正面魚眼の校正ファイルで fov/fx を上書きしない
+            self.lens_calibration_file = None
+            self._lens_calibration = None
+            return
         if self.lens_calibration_file:
             logger = logging.getLogger(__name__)
             try:
@@ -944,10 +950,15 @@ class OCRConfig:
         tesseract_config: Tesseractの設定文字列
         preprocessing_enabled: 強化前処理パイプラインの有効/無効
         confidence_threshold: 信頼度閾値（0-100）
-        max_distance_increment_mm: OCR距離の1フレームあたり最大増加量(mm)
-        enforce_ocr_increment_upper_bound: Trueなら [前回値, 前回値+増分×gap] で検証。
+        max_distance_increment_mm: 実行時の作業コピー。カウントアップが最も遅れた
+            場合の表示ジャンプ上限[mm]。正面は front.max_distance_increment_mm、
+            側視は two_direction.max_distance_increment_mm を経路適用時に載せる。
+        countup_mean_dz_max_mm: OCR 評価専用。カウントアップ間の移動平均 dz
+            の最大値[mm/frame]。estimation.motion.max_dz とは別物。
+            経路適用時に front / two_direction の同名項目を載せる。
+        enforce_ocr_increment_upper_bound: Trueならカウントアップ直前値 Z_0 と
+            経過フレーム n から Z_ocr_max を作り、プラス側上限を見る。
             Falseなら下限（逆転・過小）だけ見て、プラス側上限は見ない。
-            高速走行で表示が 20mm 以上飛ぶ場合に使う。
         preprocessing_method: デフォルト前処理方式（"enhanced", "fixed", "otsu"）
         target_roi_height: 動的拡大の目標ROI高さ（ピクセル）
         clahe_clip_limit: CLAHE のclipLimit
@@ -963,6 +974,7 @@ class OCRConfig:
     preprocessing_enabled: bool = True
     confidence_threshold: float = 60.0
     max_distance_increment_mm: float = 10.0
+    countup_mean_dz_max_mm: float = 10.0
     enforce_ocr_increment_upper_bound: bool = True
     preprocessing_method: str = "enhanced"
     target_roi_height: int = 200
@@ -1213,6 +1225,14 @@ class LegacyVpConfig:
     enabled: bool = False
 
 
+# two_direction_config.json の距離表示枠。正面 camera.ocr_roi_ratio とは別。
+SIDEVIEW_OCR_ROI_RATIO = [0.0556, 0.1000, 0.0438, 0.1063]
+
+
+def default_sideview_camera_overlay() -> Dict[str, Any]:
+    return {"ocr_roi_ratio": list(SIDEVIEW_OCR_ROI_RATIO)}
+
+
 @dataclass
 class FrontConfig:
     """正面経路でトップレベルへ適用する上書き。pipeline=front のときだけ使う。"""
@@ -1289,6 +1309,13 @@ class FrontConfig:
     前フレームがほぼ側視（外周）で既に書いている。今フレームで遡って
     上書きする必要はなく、反対側へ回り込む裏側の誤塗も同時に防げる。
     """
+    max_distance_increment_mm: float = 10.0
+    """正面 OCR のカウントアップ遅れ時の表示ジャンプ上限[mm]。経路適用時に ocr へ載せる。"""
+    countup_mean_dz_max_mm: float = 10.0
+    """OCR 評価専用。カウントアップ間の移動平均 dz の最大値[mm/frame]。
+    estimation.motion.max_dz とは別。経路適用時に ocr へ載せる。"""
+    camera: Optional[Dict[str, Any]] = None
+    """正面の camera 上書き（指定キーだけ Config.camera に載せる）。None なら触らない。"""
 
 
 @dataclass
@@ -1311,6 +1338,25 @@ class TwoDirectionConfig:
     match_source_pixels_per_mm: bool = False
     """True なら元展開図の pix/mm を生成カラーマップに使う（再現確認用）"""
     capture: CaptureConfig = field(default_factory=CaptureConfig)
+    n_directions: int = 8
+    """側視カメラ台数。8 方向ピンホールが正。run_A/B/C 互換は 3。"""
+    fov_deg: float = 60.0
+    """側視 1 台の水平画角[deg]。工程1では幾何生成のみ（投影モデルは工程2）。"""
+    optical_axis_spacing_deg: float = 45.0
+    """隣接カメラの光軸間隔[deg]。任意 roll はこれに量子化しない。"""
+    max_distance_increment_mm: float = 60.0
+    """側視 OCR のカウントアップ遅れ時の表示ジャンプ上限[mm]。60° の 0.02〜0.06m 飛び用。"""
+    countup_mean_dz_max_mm: float = 10.0
+    """OCR 評価専用。カウントアップ間の移動平均 dz の最大値[mm/frame]。
+    estimation.motion.max_dz とは別。経路適用時に ocr へ載せる。"""
+    camera: Optional[Dict[str, Any]] = field(
+        default_factory=default_sideview_camera_overlay
+    )
+    """側視の camera 上書き（指定キーだけ Config.camera に載せる）。
+    ocr_roi_ratio の既定は two_direction_config.json と同じ距離表示枠。
+    JSON で camera を部分指定しても ocr_roi_ratio は落とさない。"""
+    runs: List[RunConfig] = field(default_factory=list)
+    """可変 run リスト。空なら run_A/B/C 互換スロットを使う。"""
     run_A: RunConfig = field(default_factory=lambda: RunConfig(
         run_id="U", physical_roll_deg=0.0
     ))
@@ -1337,18 +1383,32 @@ class TwoDirectionConfig:
     legacy_vp: LegacyVpConfig = field(default_factory=LegacyVpConfig)
 
     def run_slots(self) -> List[Tuple[str, "RunConfig"]]:
-        """設定スロット A/B/C。C は常に存在するが空パスなら未使用。"""
+        """runs があればそれを、無ければ互換スロット A/B/C を返す。"""
+        if self.runs:
+            out: List[Tuple[str, RunConfig]] = []
+            for i, run_cfg in enumerate(self.runs):
+                tag = str(run_cfg.run_id or "").strip() or f"{i:03d}"
+                out.append((tag, run_cfg))
+            return out
         return [("A", self.run_A), ("B", self.run_B), ("C", self.run_C)]
 
     def active_run_slots(
         self, frames_by_tag: Optional[Dict[str, Any]] = None
     ) -> List[Tuple[str, "RunConfig"]]:
-        """解析する run。A/B は常に含み、C は frames か video_path があるときだけ。"""
+        """解析する run。runs 指定時はパスまたは frames があるものだけ。
+
+        互換 A/B/C では A/B を常に含み、C は frames か video_path があるときだけ。
+        """
         frames_by_tag = frames_by_tag or {}
+        using_runs = bool(self.runs)
         out: List[Tuple[str, RunConfig]] = []
         for tag, run_cfg in self.run_slots():
             if frames_by_tag.get(tag) is not None:
                 out.append((tag, run_cfg))
+                continue
+            if using_runs:
+                if bool(getattr(run_cfg, "video_path", "")):
+                    out.append((tag, run_cfg))
                 continue
             if tag in ("A", "B") or bool(getattr(run_cfg, "video_path", "")):
                 out.append((tag, run_cfg))
@@ -1368,17 +1428,26 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
     if not data:
         return TwoDirectionConfig()
     top = {k: v for k, v in data.items() if k not in {
-        "capture", "run_A", "run_B", "run_C", "center_prior", "hard_bounds",
+        "capture", "runs", "run_A", "run_B", "run_C", "center_prior", "hard_bounds",
         "registration", "seam_warp", "pitch_trend_warp", "best_view", "feature_matching_sideview",
         "projection", "legacy_vp",
     }}
     cfg = _dataclass_from_dict(TwoDirectionConfig, top)
+    cam_overlay = default_sideview_camera_overlay()
+    if isinstance(cfg.camera, dict):
+        cam_overlay.update(cfg.camera)
+    cfg.camera = cam_overlay
     cfg.capture = _dataclass_from_dict(CaptureConfig, data.get("capture"))
     cfg.run_A = _dataclass_from_dict(RunConfig, data.get("run_A"))
     cfg.run_B = _dataclass_from_dict(RunConfig, data.get("run_B"))
     cfg.run_C = _dataclass_from_dict(RunConfig, data.get("run_C") or {
         "run_id": "L", "physical_roll_deg": 240.0,
     })
+    runs_raw = data.get("runs") or []
+    cfg.runs = [
+        _dataclass_from_dict(RunConfig, item) if isinstance(item, dict) else item
+        for item in runs_raw
+    ]
     cfg.center_prior = _dataclass_from_dict(CenterPriorConfig, data.get("center_prior"))
     cfg.hard_bounds = _dataclass_from_dict(HardBoundsConfig, data.get("hard_bounds"))
     cfg.registration = _dataclass_from_dict(RegistrationConfig, data.get("registration"))
@@ -1656,7 +1725,11 @@ class Config:
         )
         
         colormap_cfg = ColormapConfig(**config_dict.get("colormap", {}))
-        ocr_cfg = OCRConfig(**config_dict.get("ocr", {}))
+        ocr_raw = dict(config_dict.get("ocr") or {})
+        if "countup_mean_dz_max_mm" not in ocr_raw and "dz_max_mm" in ocr_raw:
+            ocr_raw["countup_mean_dz_max_mm"] = ocr_raw["dz_max_mm"]
+        ocr_raw.pop("dz_max_mm", None)
+        ocr_cfg = OCRConfig(**ocr_raw)
         initial_position_cfg = InitialPositionConfig(
             **config_dict.get("initial_position", {})
         )
@@ -2313,6 +2386,14 @@ class ConfigValidator:
                 f"ocr.confidence_thresholdは0-100の範囲である必要があります: "
                 f"{cfg.confidence_threshold}"
             )
+        if float(cfg.max_distance_increment_mm) <= 0.0:
+            raise ConfigValidationError(
+                "ocr.max_distance_increment_mm は正である必要があります"
+            )
+        if float(cfg.countup_mean_dz_max_mm) <= 0.0:
+            raise ConfigValidationError(
+                "ocr.countup_mean_dz_max_mm は正である必要があります"
+            )
     
     def validate_initial_position_config(self) -> None:
         """初期位置設定のバリデーション
@@ -2392,13 +2473,38 @@ class ConfigValidator:
                 raise ConfigValidationError(
                     f"two_direction.modes は A/C のみ許可: {cfg.modes}"
                 )
+        if int(cfg.n_directions) < 1:
+            raise ConfigValidationError(
+                f"two_direction.n_directions は 1 以上: {cfg.n_directions}"
+            )
+        if float(cfg.optical_axis_spacing_deg) <= 0.0:
+            raise ConfigValidationError(
+                "two_direction.optical_axis_spacing_deg は正である必要があります"
+            )
+        if float(cfg.fov_deg) <= 0.0:
+            raise ConfigValidationError(
+                "two_direction.fov_deg は正である必要があります"
+            )
+        if float(cfg.max_distance_increment_mm) <= 0.0:
+            raise ConfigValidationError(
+                "two_direction.max_distance_increment_mm は正である必要があります"
+            )
+        if float(cfg.countup_mean_dz_max_mm) <= 0.0:
+            raise ConfigValidationError(
+                "two_direction.countup_mean_dz_max_mm は正である必要があります"
+            )
         for tag, run in cfg.run_slots():
             if tag == "C" and not run.video_path:
                 continue
-            if run.physical_roll_deg not in (0.0, 120.0, 240.0, -120.0):
+            try:
+                roll = float(run.physical_roll_deg)
+            except (TypeError, ValueError) as exc:
                 raise ConfigValidationError(
-                    f"physical_roll_deg は 0/120/240/-120 のいずれか: "
-                    f"{run.physical_roll_deg}"
+                    f"physical_roll_deg が不正です: {run.physical_roll_deg}"
+                ) from exc
+            if roll != roll or abs(roll) == float("inf"):
+                raise ConfigValidationError(
+                    f"physical_roll_deg が不正です: {run.physical_roll_deg}"
                 )
         if cfg.capture.usable_outer_radius_ratio <= 0:
             raise ConfigValidationError(

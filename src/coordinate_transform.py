@@ -325,6 +325,24 @@ class FisheyeCamera(CameraModel):
             self.cy + dy * scale
         ])
 
+    def kannala_theta_peak(
+        self,
+        dist_coeffs: np.ndarray,
+        theta_max: float,
+    ) -> float:
+        """θ_d(θ) が最大になる入射角。これより先は画像半径が戻る。"""
+        k1, k2, k3, k4 = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)[:4]
+        tmax = float(theta_max)
+        if tmax <= 0.0:
+            tmax = float(np.pi) * 0.5
+        grid = np.linspace(0.0, tmax, 257)
+        t2 = grid * grid
+        theta_d = grid * (
+            1.0 + k1 * t2 + k2 * t2 ** 2 + k3 * t2 ** 3 + k4 * t2 ** 4
+        )
+        peak = float(grid[int(np.argmax(theta_d))])
+        return min(max(peak, 1e-6), tmax)
+
     def invert_kannala_theta(
         self,
         theta_d: np.ndarray,
@@ -353,9 +371,7 @@ class FisheyeCamera(CameraModel):
             t2 = th * th
             return 1.0 + 3.0 * k1 * t2 + 5.0 * k2 * t2 ** 2 + 7.0 * k3 * t2 ** 3 + 9.0 * k4 * t2 ** 4
 
-        grid = np.linspace(0.0, tmax, 257)
-        peak = float(grid[int(np.argmax(_poly(grid)))])
-        peak = min(max(peak, 1e-6), tmax)
+        peak = self.kannala_theta_peak(dist_coeffs, tmax)
         poly_max = float(_poly(np.array([peak]))[0])
         theta = np.clip(td, 0.0, peak)
         for _ in range(int(iters)):
@@ -902,6 +918,29 @@ class CoordinateTransformer:
         
         return yaw_world, pitch_world
     
+    def _pixel_rays_to_cylinder(
+        self,
+        pts_px: np.ndarray,
+        cam_pos: np.ndarray,
+        roll: float,
+        yaw: float,
+        pitch: float,
+    ) -> np.ndarray:
+        """画素視線を world_to_pixel と同じ R_c2w で円筒面へ落とす。"""
+        yaw_cam, pitch_cam = self.camera.pixel_to_angles_cam(pts_px)
+        vx = np.cos(pitch_cam) * np.sin(yaw_cam)
+        vy = np.sin(pitch_cam)
+        vz = np.cos(pitch_cam) * np.cos(yaw_cam)
+        v_cam = np.stack((vx, vy, vz), axis=-1)
+        ray_direction = v_cam @ R_c2w(roll, pitch, yaw)
+        ray_direction = ray_direction / (
+            np.linalg.norm(ray_direction, axis=1, keepdims=True) + 1e-12
+        )
+        ray_origin = np.tile(
+            np.asarray(cam_pos, dtype=float).reshape(3), (len(pts_px), 1)
+        )
+        return self.compute_cylinder_intersection(ray_origin, ray_direction)
+
     def pixel_to_world(
         self,
         pts_px: np.ndarray,
@@ -928,42 +967,18 @@ class CoordinateTransformer:
         Raises:
             CylinderIntersectionError: 円筒との交点が見つからない場合
         
-        処理の流れ:
-            1. 歪み補正（calibrationが指定されている場合）
-            2. ピクセル座標からカメラ座標系の角度を計算
-            3. カメラ座標系の角度をワールド座標系の角度に変換
-            4. ワールド座標系の角度から視線ベクトルを計算
-            5. 視線と円筒の交点を計算
+        Note:
+            視線は world_to_pixel と同じ v_cam @ R_c2w。ワールド角からレイを
+            組み直すと dx の符号が反転し、反対側の壁へ落ちる。
         """
-        # 1. 歪み補正（calibrationが指定されている場合）
-        pts_corrected = pts_px
+        pts_corrected = np.asarray(pts_px, dtype=float)
         if calibration is not None:
             dist_coeffs = self._get_dist_coeffs(calibration)
             if not np.allclose(dist_coeffs, 0.0):
                 pts_corrected = self.camera.undistort_points(pts_px, dist_coeffs)
-        
-        # 2. ピクセル → カメラ座標系の角度
-        yaw_cam, pitch_cam = self.camera.pixel_to_angles_cam(pts_corrected)
-        
-        # カメラ座標系 → ワールド座標系の角度
-        yaw_world, pitch_world = self.cam_to_world_angles(
-            yaw_cam, pitch_cam, roll, yaw, pitch
+        return self._pixel_rays_to_cylinder(
+            pts_corrected, cam_pos, roll, yaw, pitch
         )
-        
-        # ワールド座標系の視線ベクトル（正規化済み）
-        dx_v = -np.cos(pitch_world) * np.sin(yaw_world)  # 右側が+
-        dy_v = np.sin(pitch_world)
-        dz_v = np.cos(pitch_world) * np.cos(yaw_world)
-        ray_direction = np.stack((dx_v, dy_v, dz_v), axis=-1)
-        
-        # レイの原点（カメラ位置）
-        N = len(pts_px)
-        ray_origin = np.tile(cam_pos, (N, 1))
-        
-        # 円筒との交点を計算
-        intersection = self.compute_cylinder_intersection(ray_origin, ray_direction)
-        
-        return intersection
 
     def pixel_to_world_R_c2w(
         self,
@@ -973,22 +988,8 @@ class CoordinateTransformer:
         yaw: float,
         pitch: float,
     ) -> np.ndarray:
-        """画像座標 → 円筒面。world_to_pixel の逆（視線は v_cam @ R_c2w）。
-
-        pixel_to_world は正面カメラ用にワールド角からレイを組み直すため、
-        真横（pitch=90°）では画像 x が反転する。こちらは回転行列と一致する。
-        """
-        yaw_cam, pitch_cam = self.camera.pixel_to_angles_cam(pts_px)
-        vx = np.cos(pitch_cam) * np.sin(yaw_cam)
-        vy = np.sin(pitch_cam)
-        vz = np.cos(pitch_cam) * np.cos(yaw_cam)
-        v_cam = np.stack((vx, vy, vz), axis=-1)
-        ray_direction = v_cam @ R_c2w(roll, pitch, yaw)
-        ray_direction = ray_direction / (
-            np.linalg.norm(ray_direction, axis=1, keepdims=True) + 1e-12
-        )
-        ray_origin = np.tile(np.asarray(cam_pos, dtype=float).reshape(3), (len(pts_px), 1))
-        return self.compute_cylinder_intersection(ray_origin, ray_direction)
+        """画像座標 → 円筒面。world_to_pixel の逆（視線は v_cam @ R_c2w）。"""
+        return self._pixel_rays_to_cylinder(pts_px, cam_pos, roll, yaw, pitch)
 
     def world_to_pixel(
         self,
@@ -1037,6 +1038,36 @@ class CoordinateTransformer:
                 pts_px = self.camera.distort_points(pts_px, dist_coeffs)
 
         return pts_px
+
+    def distort_ideal_pixels(self, pixels_ideal: np.ndarray) -> np.ndarray:
+        """等距離座標へ Kannala 順歪み。キャリブが無ければそのまま。"""
+        pts = np.asarray(pixels_ideal, dtype=float)
+        if self.calibration is None:
+            return pts
+        dist_coeffs = self._get_dist_coeffs(self.calibration)
+        if np.allclose(dist_coeffs, 0.0):
+            return pts
+        return self.camera.distort_points(pts, dist_coeffs)
+
+    def kannala_rising_branch_mask(
+        self,
+        pixels_ideal: np.ndarray,
+        theta_max: float = float(np.pi) * 0.6,
+    ) -> np.ndarray:
+        """等距離 θ が Kannala ピーク以下なら True。キャリブ無しは常に True。"""
+        pts = np.asarray(pixels_ideal, dtype=float)
+        n = len(pts)
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        if self.calibration is None or not hasattr(self.camera, "kannala_theta_peak"):
+            return np.ones(n, dtype=bool)
+        dist_coeffs = self._get_dist_coeffs(self.calibration)
+        if np.allclose(dist_coeffs, 0.0):
+            return np.ones(n, dtype=bool)
+        r_ideal = np.hypot(pts[:, 0] - self.camera.cx, pts[:, 1] - self.camera.cy)
+        theta_id = r_ideal / max(float(self.camera.f), 1e-12)
+        peak = self.camera.kannala_theta_peak(dist_coeffs, float(theta_max))
+        return theta_id <= peak
     
     def compute_cylinder_intersection(
         self,

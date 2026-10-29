@@ -49,12 +49,11 @@ def test_apply_sideview_named_directory(tmp_path, config):
     (tmp_path / "pipe_L.mp4").write_bytes(b"")
     apply_sideview_named_input(config, str(tmp_path), "pipe")
     assert config.two_direction.run_A.video_path.endswith("pipe_U.mp4")
-    assert config.two_direction.run_B.video_path.endswith("pipe_R.mp4")
-    assert config.two_direction.run_C.video_path.endswith("pipe_L.mp4")
-    assert config.two_direction.run_A.run_id == "U"
+    assert config.two_direction.run_A.run_id == "000"
     assert config.two_direction.run_A.physical_roll_deg == 0.0
-    assert config.two_direction.run_B.physical_roll_deg == 120.0
-    assert config.two_direction.run_C.physical_roll_deg == 240.0
+    assert config.two_direction.run_B.video_path == ""
+    assert config.two_direction.run_C.video_path == ""
+    assert [r.run_id for r in config.two_direction.runs] == ["000"]
 
 
 def test_apply_sideview_named_exact_suffixes(tmp_path, config):
@@ -63,8 +62,9 @@ def test_apply_sideview_named_exact_suffixes(tmp_path, config):
     (tmp_path / "sess_L.mp4").write_bytes(b"")
     apply_sideview_named_input(config, str(tmp_path), "sess")
     assert config.two_direction.run_A.video_path.endswith("sess_U.mp4")
-    assert config.two_direction.run_B.video_path.endswith("sess_R.mp4")
-    assert config.two_direction.run_C.video_path.endswith("sess_L.mp4")
+    assert config.two_direction.run_B.video_path == ""
+    assert config.two_direction.run_C.video_path == ""
+    assert [r.run_id for r in config.two_direction.runs] == ["000"]
 
 
 def test_create_progress_reporter_four_steps(tmp_path, config):

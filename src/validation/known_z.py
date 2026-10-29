@@ -114,6 +114,12 @@ def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
     """
     if not is_generation_camera_metadata(meta):
         return
+    if str(getattr(config.camera, "camera_model", "") or "").lower() == "pinhole":
+        if "pipe_diameter_mm" in meta and meta["pipe_diameter_mm"]:
+            config.pipe.diameter_mm = float(meta["pipe_diameter_mm"])
+        elif "radius_mm" in meta and meta["radius_mm"]:
+            config.pipe.diameter_mm = float(meta["radius_mm"]) * 2.0
+        return
     calib_path = meta.get("lens_calibration_file")
     if calib_path:
         config.camera.lens_calibration_file = str(calib_path)

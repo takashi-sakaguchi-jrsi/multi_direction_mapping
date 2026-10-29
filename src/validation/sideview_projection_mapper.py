@@ -103,9 +103,10 @@ class SideviewProjectionMapper:
         world = self.eta_z_to_world(eta_grid, z_grid).reshape(-1, 3)
         cam_pos = np.asarray(camera_position, dtype=float).reshape(3)
         roll, yaw, pitch = [float(v) for v in orientation[:3]]
-        pixels = self.transformer.world_to_pixel(
-            world, cam_pos, roll, yaw, pitch, apply_distortion=True
+        pixels_ideal = self.transformer.world_to_pixel(
+            world, cam_pos, roll, yaw, pitch, apply_distortion=False
         )
+        pixels = self.transformer.distort_ideal_pixels(pixels_ideal)
         map_x = pixels[:, 0].astype(np.float32)
         map_y = pixels[:, 1].astype(np.float32)
         map_x_2d = np.nan_to_num(
@@ -119,7 +120,8 @@ class SideviewProjectionMapper:
             map_x_2d,
             map_y_2d,
             interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
         )
         if sampled.ndim == 2:
             colors = cv2.cvtColor(sampled, cv2.COLOR_GRAY2RGB)
@@ -137,7 +139,14 @@ class SideviewProjectionMapper:
             (map_x >= 0.0) & (map_x <= fw - 1.0)
             & (map_y >= 0.0) & (map_y <= fh - 1.0)
         )
-        valid = in_front & in_disk & in_img & np.isfinite(map_x) & np.isfinite(map_y)
+        valid = (
+            in_front
+            & in_disk
+            & in_img
+            & np.isfinite(map_x)
+            & np.isfinite(map_y)
+            & self.transformer.kannala_rising_branch_mask(pixels_ideal)
+        )
         if not self.allow_signed_z:
             valid = valid & (world[:, 2] >= cam_pos[2])
         return colors, valid.reshape(height, width)

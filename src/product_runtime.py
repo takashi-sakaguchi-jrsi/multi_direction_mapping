@@ -13,9 +13,19 @@ import json
 
 import numpy as np
 
-from src.config import Config
+from src.config import (
+    CameraConfig,
+    Config,
+    RunConfig,
+    default_sideview_camera_overlay,
+)
 from src.progress_reporter import ProgressReporter
-from src.validation.geometry import infer_suffix_from_path, physical_roll_from_suffix
+from src.validation.geometry import (
+    build_direction_layout,
+    infer_suffix_from_path,
+    physical_roll_from_suffix,
+    wrap_angle_deg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +108,20 @@ class DirectionProgressPlan:
     seam_step: int
     n_runs: int
 
+    def _lookup_run_step(self, table: Dict[str, int], run_id: str) -> int:
+        if run_id in table:
+            return table[run_id]
+        if str(run_id) in ("U", "000", "A"):
+            for alt in ("000", "U", "A"):
+                if alt in table:
+                    return table[alt]
+        return next(iter(table.values()))
+
     def analyze_id(self, run_id: str) -> int:
-        if run_id in self.analyze_step:
-            return self.analyze_step[run_id]
-        return next(iter(self.analyze_step.values()))
+        return self._lookup_run_step(self.analyze_step, run_id)
 
     def accumulate_id(self, run_id: str) -> int:
-        if run_id in self.accumulate_step:
-            return self.accumulate_step[run_id]
-        return next(iter(self.accumulate_step.values()))
+        return self._lookup_run_step(self.accumulate_step, run_id)
 
 
 def _split_weight(total: float, n: int) -> List[float]:
@@ -210,11 +225,47 @@ def effective_pipeline(config: Config) -> str:
     return str(getattr(config, "pipeline", "sideview") or "sideview").lower()
 
 
+def overlay_camera_config(
+    base: CameraConfig, overlay: Optional[Dict[str, Any]]
+) -> CameraConfig:
+    """overlay に書いたキーだけ CameraConfig へ載せる。未指定は base のまま。
+
+    camera_model=pinhole のときは正面の魚眼校正ファイルと、overlay に無い
+    fx/cx を引き継がない。引き継ぐと __post_init__ が 185° 校正で上書きする。
+    """
+    if not overlay:
+        return base
+    names = {
+        f.name for f in CameraConfig.__dataclass_fields__.values() if f.init
+    }
+    payload = {name: getattr(base, name) for name in names}
+    for key, value in overlay.items():
+        if key in names:
+            payload[key] = value
+    model = str(payload.get("camera_model") or "").lower()
+    if model == "pinhole" and "lens_calibration_file" not in overlay:
+        payload["lens_calibration_file"] = None
+        payload["_lens_calibration"] = None
+        payload["apply_lens_calibration"] = False
+        for key in (
+            "fx", "fy", "cx", "cy",
+            "calibrated_image_width", "calibrated_image_height",
+        ):
+            if key not in overlay:
+                payload[key] = 0 if key.startswith("calibrated") else 0.0
+    return CameraConfig(**payload)
+
+
 def apply_front_profile(config: Config) -> None:
     """正面経路の衝突項目を FrontConfig で上書きする。側視の既定値は触らない。"""
     front = getattr(config, "front", None)
     if front is None:
         return
+    config.ocr.max_distance_increment_mm = float(front.max_distance_increment_mm)
+    config.ocr.countup_mean_dz_max_mm = float(front.countup_mean_dz_max_mm)
+    cam = getattr(front, "camera", None)
+    if cam:
+        config.camera = overlay_camera_config(config.camera, cam)
     config.estimation.use_vanishing_point_constraints = bool(
         front.use_vanishing_point_constraints
     )
@@ -277,6 +328,26 @@ def apply_front_profile(config: Config) -> None:
         )
 
 
+def apply_sideview_profile(config: Config) -> None:
+    """側視経路の camera / OCR 増分を two_direction から載せる。正面の値は触らない。"""
+    td = getattr(config, "two_direction", None)
+    if td is None:
+        return
+    config.ocr.max_distance_increment_mm = float(td.max_distance_increment_mm)
+    config.ocr.countup_mean_dz_max_mm = float(td.countup_mean_dz_max_mm)
+    cam = getattr(td, "camera", None)
+    if not cam:
+        cam = default_sideview_camera_overlay()
+    config.camera = overlay_camera_config(config.camera, cam)
+    logger.info(
+        "側視 camera 上書き: model=%s fov=%.1f° calib_file=%s roi=%s",
+        config.camera.camera_model,
+        float(config.camera.fov_degrees),
+        config.camera.lens_calibration_file,
+        list(config.camera.ocr_roi_ratio),
+    )
+
+
 def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:
     pipeline = str(pipeline or "sideview").lower()
     has_input = bool(getattr(args, "input", None))
@@ -323,31 +394,76 @@ def apply_front_named_input(config: Config, input_dir: str, name: str) -> None:
     config.input.video_path = str(resolve_named_front_video(Path(input_dir), str(name)))
 
 
-def resolve_named_run_videos(input_dir: Path, name: str) -> Dict[str, Path]:
-    """{dir}/{name}_U/R/L.{ext}。拡張子は .mp4 → .avi → .mov → .mkv の先頭ヒット。"""
+def _first_named_video(folder: Path, name: str, suffix: str) -> Optional[Path]:
+    for ext in _VIDEO_SUFFIXES:
+        candidate = folder / f"{name}_{suffix}{ext}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def resolve_named_run_videos(
+    input_dir: Path,
+    name: str,
+    *,
+    n_directions: int = 8,
+    optical_axis_spacing_deg: float = 45.0,
+    fov_deg: float = 60.0,
+) -> Dict[str, Path]:
+    """{dir}/{name}_{ccc}.{ext}。ccc はカメラカー roll の 3 桁。
+
+    0° は `_U` を別名として認める。`_R`/`_L` は 120°/240° が layout に
+    含まれるとき（3 方向）だけ別名。8 方向では R/L を接合相手にしない。
+    1 本（0° のみ）でも可。拡張子は .mp4 → .avi → .mov → .mkv の先頭ヒット。
+    """
     folder = Path(input_dir)
+    layout = build_direction_layout(
+        n_directions, optical_axis_spacing_deg, fov_deg
+    )
     found: Dict[str, Path] = {}
-    mapping = (("U", "A"), ("R", "B"), ("L", "C"))
-    for suf, tag in mapping:
-        for ext in _VIDEO_SUFFIXES:
-            candidate = folder / f"{name}_{suf}{ext}"
-            if candidate.is_file():
-                found[tag] = candidate
-                break
-    if "A" not in found or "B" not in found:
+    for roll, rid in zip(layout.rolls_deg, layout.run_ids):
+        path = _first_named_video(folder, name, rid)
+        if path is None and abs(wrap_angle_deg(roll)) < 1e-6:
+            path = _first_named_video(folder, name, "U")
+        if path is None:
+            for alias, alias_roll in (("R", 120.0), ("L", 240.0)):
+                if abs(wrap_angle_deg(roll - alias_roll)) < 1e-6:
+                    path = _first_named_video(folder, name, alias)
+                    break
+        if path is not None:
+            found[rid] = path
+    if not found:
         raise FileNotFoundError(
-            f"側視動画が見つかりません: {folder}/{name}_U|_R （L は任意）"
+            f"側視動画が見つかりません: {folder}/{name}_000|_U "
+            f"（n_directions={int(n_directions)}）"
         )
     return found
 
 
 def apply_sideview_named_input(config: Config, input_dir: str, name: str) -> None:
-    found = resolve_named_run_videos(Path(input_dir), str(name))
-    config.two_direction.run_C.video_path = ""
-    for tag, video in found.items():
-        _set_run_video(config, tag, video)
-    if "C" not in found:
-        config.two_direction.run_C.video_path = ""
+    td = config.two_direction
+    found = resolve_named_run_videos(
+        Path(input_dir),
+        str(name),
+        n_directions=int(td.n_directions),
+        optical_axis_spacing_deg=float(td.optical_axis_spacing_deg),
+        fov_deg=float(td.fov_deg),
+    )
+    td.run_A.video_path = ""
+    td.run_B.video_path = ""
+    td.run_C.video_path = ""
+    td.runs = []
+    for rid, video in found.items():
+        run = RunConfig(
+            video_path=str(video),
+            run_id=rid,
+            physical_roll_deg=physical_roll_from_suffix(rid),
+        )
+        td.runs.append(run)
+        if abs(wrap_angle_deg(run.physical_roll_deg)) < 1e-6:
+            td.run_A.video_path = run.video_path
+            td.run_A.run_id = run.run_id
+            td.run_A.physical_roll_deg = run.physical_roll_deg
 
 
 def apply_pipeline_cli(config: Config, args: Any) -> None:
@@ -363,6 +479,7 @@ def apply_pipeline_cli(config: Config, args: Any) -> None:
         elif getattr(args, "input_dir", None) and getattr(args, "name", None):
             apply_front_named_input(config, str(args.input_dir), str(args.name))
     elif pipeline == "sideview":
+        apply_sideview_profile(config)
         if getattr(args, "input_dir", None) and getattr(args, "name", None):
             apply_sideview_named_input(
                 config, str(args.input_dir), str(args.name)

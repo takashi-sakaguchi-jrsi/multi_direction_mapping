@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -76,21 +78,47 @@ def run_id_from_physical_roll(physical_roll_deg: float) -> str:
     raise ValueError(f"未対応の physical_roll_deg: {physical_roll_deg}")
 
 
+def canonical_run_id(physical_roll_deg: float) -> str:
+    """カメラカー roll[deg] を 3 桁 run_id（000…359）にする。45° には量子化しない。"""
+    wrapped = float(physical_roll_deg) % 360.0
+    if wrapped < 0.0:
+        wrapped += 360.0
+    return f"{int(round(wrapped)) % 360:03d}"
+
+
+def physical_roll_from_run_id(run_id: str) -> float:
+    """U/R/L/A/B/C または 3 桁 run_id からカメラカー roll[deg] を返す。"""
+    key = str(run_id or "").strip().upper().lstrip("_")
+    if key == "A":
+        key = "U"
+    elif key == "B":
+        key = "R"
+    elif key == "C":
+        key = "L"
+    if key in SUFFIX_TO_PHYSICAL_ROLL_DEG:
+        return SUFFIX_TO_PHYSICAL_ROLL_DEG[key]
+    if key.isdigit():
+        return float(int(key) % 360)
+    raise ValueError(f"未知の run_id: {run_id}")
+
+
 def physical_roll_from_suffix(suffix: str) -> float:
-    """ファイル名識別子 _U/_R/_L からカメラカー roll[deg] を返す"""
-    key = suffix.strip().upper().lstrip("_")
-    if key not in SUFFIX_TO_PHYSICAL_ROLL_DEG:
-        raise ValueError(f"未知の方向 suffix: {suffix}")
-    return SUFFIX_TO_PHYSICAL_ROLL_DEG[key]
+    """ファイル名識別子 _U/_R/_L または _000… からカメラカー roll[deg] を返す"""
+    return physical_roll_from_run_id(suffix)
 
 
 def infer_suffix_from_path(video_path: str) -> Optional[str]:
-    """パス末尾の _U/_R/_L、またはファイル名そのものが U/R/L のとき検出する。無ければ None"""
+    """パス末尾の _000/_U/_R/_L、またはファイル名そのものが U/R/L/3桁 のとき検出する。"""
     name = video_path.replace("\\", "/").split("/")[-1]
     stem = name.rsplit(".", 1)[0]
     upper = stem.upper()
     if upper in ("U", "R", "L"):
         return upper
+    if upper.isdigit() and len(upper) <= 3:
+        return f"{int(upper):03d}"
+    matched = re.search(r"_(\d{3})$", stem)
+    if matched:
+        return f"{int(matched.group(1)):03d}"
     for suffix in ("U", "R", "L"):
         if stem.endswith(f"_{suffix}"):
             return suffix
@@ -103,23 +131,24 @@ def capture_to_program_orientation_deg(
 ) -> Tuple[float, float, float]:
     """カメラカー初期方位 → プログラム姿勢 (roll, yaw, pitch) [deg]
 
-    カメラカーの roll は回転軸の向き、pitch はその軸周りの回転で、
-    プログラムの yaw/pitch/roll とは定義が異なる。回転順は問わず、
-    プログラム角へは次の対応で変換する。
+    壁面正対（physical_pitch=90°）を仮定する。光軸はカメラカー roll θ の壁
+    ``(sin θ, cos θ, 0)`` を向き、現行 U と同じくカメラ +Y（画像下）は −Z。
+    0° は ``(-90, 90, 90)``。0°/180° は pitch 特異点のため、内部 roll の
+    符号で Euler 分岐する（θ≥0 は roll=-90,yaw=90、θ<0 は roll=90,yaw=-90）。
 
-        (90, 0)    → yaw=90,  pitch=90,  roll=-90  → (roll,yaw,pitch)=(-90, 90, 90)
-        (90, 120)  → yaw=90,  pitch=-30, roll=-90  → (-90, 90, -30)
-        (90, -120) → yaw=-90, pitch=-30, roll=90   → (90, -90, -30)
+        (90, 0)    → (roll,yaw,pitch)=(-90, 90, 90)
+        (90, 120)  → (-90, 90, -30)
+        (90, -120) → (90, -90, -30)
     """
     pitch_c = float(physical_pitch_deg)
-    roll_c = physical_roll_to_internal_deg(physical_roll_deg)
-    key = (round(pitch_c, 6), round(roll_c, 6))
-    if key not in _CAPTURE_TO_PROGRAM_RPY_DEG:
+    if abs(pitch_c - 90.0) > 1e-3:
         raise ValueError(
-            f"未対応のカメラカー初期方位: pitch={physical_pitch_deg}, "
-            f"roll={physical_roll_deg}（内部 roll={roll_c}）"
+            f"未対応のカメラカー pitch: {physical_pitch_deg}（壁面正対 90° のみ）"
         )
-    return _CAPTURE_TO_PROGRAM_RPY_DEG[key]
+    th = physical_roll_to_internal_deg(physical_roll_deg)
+    if th >= 0.0:
+        return (-90.0, 90.0, 90.0 - th)
+    return (90.0, -90.0, 90.0 + th)
 
 
 def pose_R_c2w(roll_rad: float, yaw_rad: float, pitch_rad: float) -> np.ndarray:
@@ -202,6 +231,109 @@ SECTOR_CAMERA_CAR_DEG = {
 }
 
 
+@dataclass(frozen=True)
+class DirectionLayout:
+    """n 方向の担当帯・カット・隣接接合。3 方向 U/R/L 定数とは別物。"""
+
+    n_directions: int
+    fov_deg: float
+    optical_axis_spacing_deg: float
+    rolls_deg: Tuple[float, ...]
+    run_ids: Tuple[str, ...]
+    assigned_width_deg: float
+    cut_camera_car_deg: Tuple[float, ...]
+    sectors: Dict[str, Tuple[float, float]]
+    seam_pairs: Tuple[Tuple[str, str], ...]
+    overlap_center_deg: Dict[Tuple[str, str], float]
+    boundary_partners: Dict[str, Tuple[str, str]]
+
+
+def build_direction_layout(
+    n_directions: int = 8,
+    optical_axis_spacing_deg: float = 45.0,
+    fov_deg: float = 60.0,
+) -> DirectionLayout:
+    """光軸間隔と台数から担当帯・カット線・隣接 SEAM を作る。"""
+    n = int(n_directions)
+    if n < 1:
+        raise ValueError(f"n_directions は 1 以上: {n_directions}")
+    spacing = float(optical_axis_spacing_deg)
+    if spacing <= 0.0:
+        raise ValueError(f"optical_axis_spacing_deg は正: {optical_axis_spacing_deg}")
+    fov = float(fov_deg)
+    assigned = 360.0 / float(n)
+    rolls = tuple((i * spacing) % 360.0 for i in range(n))
+    run_ids = tuple(canonical_run_id(r) for r in rolls)
+    half = assigned / 2.0
+    cuts = tuple((rolls[i] + half) % 360.0 for i in range(n))
+    sectors = {
+        run_ids[i]: (rolls[i] - half, rolls[i] + half) for i in range(n)
+    }
+    pairs: List[Tuple[str, str]] = []
+    overlap_center: Dict[Tuple[str, str], float] = {}
+    partners: Dict[str, Tuple[str, str]] = {}
+    for i in range(n):
+        a = run_ids[i]
+        nxt = run_ids[(i + 1) % n]
+        prv = run_ids[(i - 1) % n]
+        pairs.append((a, nxt))
+        overlap_center[(a, nxt)] = float(cuts[i])
+        partners[a] = (prv, nxt)
+    return DirectionLayout(
+        n_directions=n,
+        fov_deg=fov,
+        optical_axis_spacing_deg=spacing,
+        rolls_deg=rolls,
+        run_ids=run_ids,
+        assigned_width_deg=assigned,
+        cut_camera_car_deg=cuts,
+        sectors=sectors,
+        seam_pairs=tuple(pairs),
+        overlap_center_deg=overlap_center,
+        boundary_partners=partners,
+    )
+
+
+def _legacy_run_id_key(run_id: str) -> str:
+    key = str(run_id or "").strip().upper()
+    if key == "A":
+        return "U"
+    if key == "B":
+        return "R"
+    if key == "C":
+        return "L"
+    return key
+
+
+def sector_camera_car_bounds(
+    run_id: str,
+    layout: Optional[DirectionLayout] = None,
+) -> Tuple[float, float]:
+    """run の担当帯 (lo, hi) [カメラカー deg]。U/R/L は 3 方向定数、3 桁は layout。"""
+    key = _legacy_run_id_key(run_id)
+    if layout is not None:
+        if key in layout.sectors:
+            return layout.sectors[key]
+        try:
+            cid = canonical_run_id(physical_roll_from_run_id(key))
+        except ValueError:
+            cid = ""
+        if cid and cid in layout.sectors:
+            return layout.sectors[cid]
+    if key in SECTOR_CAMERA_CAR_DEG:
+        return SECTOR_CAMERA_CAR_DEG[key]
+    try:
+        roll = physical_roll_from_run_id(key)
+    except ValueError as exc:
+        raise ValueError(f"未知の run_id: {run_id}") from exc
+    default = build_direction_layout(8, 45.0, 60.0)
+    cid = canonical_run_id(roll)
+    if cid in default.sectors:
+        return default.sectors[cid]
+    half = default.assigned_width_deg / 2.0
+    return (roll - half, roll + half)
+
+
 def camera_car_deg_to_eta(car_deg) -> np.ndarray:
     """カメラカー周方向角[deg] → プログラム η[rad]。U=0° が η=π。"""
     deg = np.asarray(car_deg, dtype=float)
@@ -233,6 +365,19 @@ def expected_edge_etas(
     return center, lo, hi
 
 
+def optical_axis_near_pipe_vertical(
+    run_id: str,
+    threshold_deg: float = 20.0,
+) -> bool:
+    """光軸が ±Y 近傍（カメラカー 0° または 180°）か。"""
+    try:
+        roll = physical_roll_from_run_id(run_id)
+    except ValueError:
+        return _legacy_run_id_key(run_id) == "U"
+    internal = abs(physical_roll_to_internal_deg(roll))
+    return internal <= float(threshold_deg) or abs(internal - 180.0) <= float(threshold_deg)
+
+
 def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
     """Mode A で推定する角度 (estimate_yaw, estimate_pitch)。
 
@@ -241,42 +386,30 @@ def mode_a_estimate_yaw_pitch(run_id: str) -> Tuple[bool, bool]:
        （yaw を同時に入れると pitch に相殺が漏れ積算する）。
        2段階 yaw（`mode_a_yaw_second_stage`）は実験用で既定オフ。
        画像 x→pitch、画像 y→z。pitch は 90° 求心。前後のうなずきは dz に載せる。
-    R/L: 画像x=pitch, 画像y=z。roll=r0, yaw=y0, x=y=0 固定。pitch は p0 求心。
+    R/L および 8 方向: 画像x=pitch, 画像y=z。roll=r0, yaw=y0, x=y=0 固定。
     """
-    key = str(run_id or "").strip().upper()
-    if key == "A":
-        key = "U"
-    if key == "B":
-        key = "R"
-    if key == "C":
-        key = "L"
+    key = _legacy_run_id_key(run_id)
     if key in ("U", "R", "L"):
         return False, True
-    return True, False
+    try:
+        physical_roll_from_run_id(key)
+    except ValueError:
+        return True, False
+    return False, True
 
 
 def mode_a_use_frame_xy_residual(run_id: str) -> bool:
-    """Mode A の U はフレーム座標 (dx, dy) 残差。R/L は円筒 3D 残差。"""
-    key = str(run_id or "").strip().upper()
-    if key == "A":
-        key = "U"
-    if key == "C":
-        key = "L"
-    return key == "U"
+    """Mode A の ±Y 光軸（0°/180°）はフレーム座標残差。その他は円筒 3D 残差。"""
+    return optical_axis_near_pipe_vertical(run_id)
 
 
-def theta_in_camera_car_sector(eta, run_id: str) -> np.ndarray:
-    """η が run の 120° 担当帯（重なり中央で分割）に入るか。"""
-    key = run_id.strip().upper()
-    if key in ("A",):
-        key = "U"
-    if key in ("B",):
-        key = "R"
-    if key in ("C",):
-        key = "L"
-    if key not in SECTOR_CAMERA_CAR_DEG:
-        raise ValueError(f"未知の run_id: {run_id}")
-    lo, hi = SECTOR_CAMERA_CAR_DEG[key]
+def theta_in_camera_car_sector(
+    eta,
+    run_id: str,
+    layout: Optional[DirectionLayout] = None,
+) -> np.ndarray:
+    """η が run の担当帯（重なり中央で分割）に入るか。"""
+    lo, hi = sector_camera_car_bounds(run_id, layout=layout)
     car = eta_to_camera_car_deg(eta)
     lo = lo % 360.0
     hi = hi % 360.0

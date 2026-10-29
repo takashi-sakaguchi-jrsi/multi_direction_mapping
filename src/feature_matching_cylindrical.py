@@ -347,8 +347,8 @@ class CylindricalFeatureMatcher:
         1. 円筒座標変換(前処理含む)
         2. 全画像でORB特徴点検出
         3. マッチング
+        3.5. 静止状態フレームスキップ判定（Task 4.2.9）
         3.5. 物理 (ΔZ, Δθ) フィルタ（静止スキップはしない）
-        4. 空間分散フィルタ(円筒座標グリッド)
         5. フレーム座標に逆変換
         
         Args:
@@ -365,8 +365,8 @@ class CylindricalFeatureMatcher:
             prev_points: 前フレームのマッチ点座標 (N, 2)、失敗時はNone
             curr_points: 現フレームのマッチ点座標 (N, 2)、失敗時はNone
             status: str - 処理結果ステータス
+                - "SUCCESS": 成功
                 - "SUCCESS": 成功（mean|ΔZ|≈0 でも推定へ進める）
-                - "FAILED": 特徴点抽出またはマッチング失敗
         """
         try:
             self.logger.info("=== 円筒座標系特徴点マッチング開始(新方式) ===")
@@ -463,7 +463,6 @@ class CylindricalFeatureMatcher:
                     self.logger.warning("物理フィルタ後の点数が不足")
                     return None, None, "FAILED"
             else:
-
                 self.logger.debug("Phase 4: 空間分散フィルタ")
                 prev_points_cyl, curr_points_cyl = self._apply_spatial_filter(
                     prev_points_cyl, curr_points_cyl
@@ -1675,11 +1674,11 @@ def clip_front_physical_estimate(
         elif n < n_att and att_deg > untrusted + eps:
             drop_att = True
             drop_reason = "low_n_large_attitude"
-    if drop_att:
-        dyaw = 0.0
-        dpitch = 0.0
-        out["attitude_suppressed"] = True
-        out["attitude_suppress_reason"] = drop_reason
+        if drop_att:
+            dyaw = 0.0
+            dpitch = 0.0
+            out["attitude_suppressed"] = True
+            out["attitude_suppress_reason"] = drop_reason
     else:
         out["attitude_suppressed"] = False
     out["dz"] = dz

@@ -4,6 +4,7 @@
 
 主な機能:
     - 暗部領域の可視化（消失点検出）
+    - フレーム座標の特徴点ベクトル描画
     - グリッド・軌跡描画
     - フレームウィンドウ表示
     - コンソール詳細出力
@@ -65,6 +66,7 @@ class DebugConfig:
     Attributes:
         enabled: デバッグモードのON/OFF（全機能の親スイッチ）
         show_dark_region: 暗部領域表示（消失点検出の可視化）
+        show_feature_points: フレーム座標の特徴点ベクトル表示
         show_grid: 円周グリッド表示（管路断面の可視化）
         show_front_indicator: 正面方向インジケータ表示
         show_colormap: カラーマッププレビュー表示（未実装）
@@ -89,6 +91,7 @@ class DebugConfig:
     
     # 機能別ON/OFF
     show_dark_region: bool = False
+    show_feature_points: bool = True
     show_grid: bool = False
     show_front_indicator: bool = False
     show_colormap: bool = False
@@ -242,6 +245,81 @@ class DebugVisualizer:
             -1
         )
         
+        return frame_copy
+
+    def draw_feature_vectors(
+        self,
+        frame: np.ndarray,
+        prev_points: np.ndarray,
+        curr_points: np.ndarray,
+        dZ_mm: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """フレーム座標のマッチベクトルを描く。prev → curr。
+
+        dZ_mm があるときは壁面相対 |ΔZ| で色分けする。
+        緑: <1mm、黄: 1–8mm、赤: ≥8mm。
+        """
+        if not self.config.enabled or not bool(
+            getattr(self.config, "show_feature_points", True)
+        ):
+            return frame
+        if prev_points is None or curr_points is None:
+            return frame
+        prev_points = np.asarray(prev_points, dtype=float)
+        curr_points = np.asarray(curr_points, dtype=float)
+        if prev_points.ndim != 2 or curr_points.ndim != 2:
+            return frame
+        n = min(len(prev_points), len(curr_points))
+        if n == 0:
+            return frame
+        prev_points = prev_points[:n]
+        curr_points = curr_points[:n]
+        dz = None
+        if dZ_mm is not None:
+            dz = np.asarray(dZ_mm, dtype=float).reshape(-1)
+            if dz.size != n:
+                dz = None
+        frame_copy = frame.copy()
+        h, w = frame_copy.shape[:2]
+        for i in range(n):
+            p0 = prev_points[i]
+            p1 = curr_points[i]
+            if not (np.isfinite(p0).all() and np.isfinite(p1).all()):
+                continue
+            x0, y0 = int(round(p0[0])), int(round(p0[1]))
+            x1, y1 = int(round(p1[0])), int(round(p1[1]))
+            if not (0 <= x0 < w and 0 <= y0 < h and 0 <= x1 < w and 0 <= y1 < h):
+                continue
+            if dz is None:
+                mag = float(np.hypot(x1 - x0, y1 - y0))
+                if mag < 2:
+                    color = (0, 220, 0)
+                elif mag < 12:
+                    color = (0, 220, 220)
+                else:
+                    color = (0, 0, 220)
+            else:
+                adz = abs(float(dz[i]))
+                if adz < 1.0:
+                    color = (0, 220, 0)
+                elif adz < 8.0:
+                    color = (0, 220, 220)
+                else:
+                    color = (0, 0, 220)
+            cv2.arrowedLine(
+                frame_copy, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA, tipLength=0.25
+            )
+            cv2.circle(frame_copy, (x1, y1), 2, color, -1)
+        label = f"matches: {n}"
+        cv2.putText(
+            frame_copy,
+            label,
+            (10, h - 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            self.config.text_scale,
+            self.config.text_color,
+            self.config.text_thickness,
+        )
         return frame_copy
     
     def draw_grid(
