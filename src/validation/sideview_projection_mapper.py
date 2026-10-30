@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+from src.coordinate_transform import PinholeCamera
 from src.validation.geometry import pose_R_c2w, world_to_eta
 from src.validation.records import FrameProjectionSummary
+
+logger = logging.getLogger(__name__)
 
 
 class SideviewProjectionMapper:
@@ -23,11 +27,29 @@ class SideviewProjectionMapper:
         self.config = config
         self.transformer = transformer
         self.pipe_radius = float(transformer.pipe_radius)
-        self.allow_signed_z = config.two_direction.projection.allow_signed_relative_z
-        self.sample_stride = max(1, int(config.two_direction.projection.sample_stride))
+        proj = config.two_direction.projection
+        self.allow_signed_z = proj.allow_signed_relative_z
+        self.sample_stride = max(1, int(proj.sample_stride))
+        self.v_forward_half_ratio = float(
+            getattr(proj, "v_forward_half_ratio", 0.6)
+        )
+        self.use_full_image_width = bool(
+            getattr(proj, "use_full_image_width", True)
+        )
+        self._pinhole = isinstance(transformer.camera, PinholeCamera)
         cap = config.two_direction.capture
         self.outer_ratio = cap.usable_outer_radius_ratio
         self.roi_rect = cap.roi_rect
+        v_half = float(
+            getattr(config.two_direction.feature_matching_sideview, "v_half_ratio", 0.4)
+        )
+        if self.v_forward_half_ratio + 1e-9 < v_half:
+            logger.warning(
+                "projection.v_forward_half_ratio (%.3f) が "
+                "feature_matching_sideview.v_half_ratio (%.3f) より小さい",
+                self.v_forward_half_ratio,
+                v_half,
+            )
 
     def default_roi_rect(self, width: int, height: int) -> List[int]:
         if self.roi_rect is not None:
@@ -37,7 +59,16 @@ class SideviewProjectionMapper:
         return [margin_x, margin_y, width - margin_x, height - margin_y]
 
     def max_radius_px(self, width: int, height: int) -> float:
+        if self._pinhole:
+            return float("inf")
         return min(width, height) / 2.0 * self.outer_ratio
+
+    def forward_z_span_mm(self, frame_shape: Tuple[int, int]) -> float:
+        """進行方向の展開帯幅[mm]。ΔZ = R · (ratio·(H/2) / f) = R tan β。"""
+        h = int(frame_shape[0])
+        f = max(float(self.transformer.camera.f), 1e-9)
+        dv = float(self.v_forward_half_ratio) * (h / 2.0)
+        return float(self.pipe_radius) * (dv / f)
 
     def generate_eta_z_grid(
         self,
@@ -67,9 +98,16 @@ class SideviewProjectionMapper:
         max_dz: float,
         alpha: float,
     ) -> Tuple[float, float]:
-        """カメラ z を相対 0 とし、帯は [0, max_dz * alpha] mm。"""
-        del frame_shape, orientation
+        """カメラ z を相対 0 とし、ピンホールでは縦割合の +Z 帯。
+
+        max_dz / alpha は推定クリップ用で、描画幅には使わない。
+        魚眼の旧経路だけ max_dz×α を残す。
+        """
+        del orientation
         z_cam = float(np.asarray(camera_position, dtype=float).reshape(-1)[2])
+        if self._pinhole:
+            span = max(self.forward_z_span_mm(frame_shape), 1e-6)
+            return z_cam, z_cam + span
         span = max(0.0, float(max_dz) * float(alpha))
         if span <= 0.0:
             span = max(float(max_dz), 1e-6)
@@ -106,7 +144,10 @@ class SideviewProjectionMapper:
         pixels_ideal = self.transformer.world_to_pixel(
             world, cam_pos, roll, yaw, pitch, apply_distortion=False
         )
-        pixels = self.transformer.distort_ideal_pixels(pixels_ideal)
+        if self._pinhole:
+            pixels = pixels_ideal
+        else:
+            pixels = self.transformer.distort_ideal_pixels(pixels_ideal)
         map_x = pixels[:, 0].astype(np.float32)
         map_y = pixels[:, 1].astype(np.float32)
         map_x_2d = np.nan_to_num(
@@ -134,7 +175,10 @@ class SideviewProjectionMapper:
         R = pose_R_c2w(roll, yaw, pitch)
         pts_cam = (world - cam_pos.reshape(1, 3)) @ R.T
         in_front = pts_cam[:, 2] > 1e-6
-        in_disk = r_sq <= max_r ** 2
+        if np.isfinite(max_r):
+            in_disk = r_sq <= max_r ** 2
+        else:
+            in_disk = np.ones(r_sq.shape, dtype=bool)
         in_img = (
             (map_x >= 0.0) & (map_x <= fw - 1.0)
             & (map_y >= 0.0) & (map_y <= fh - 1.0)
@@ -145,9 +189,12 @@ class SideviewProjectionMapper:
             & in_img
             & np.isfinite(map_x)
             & np.isfinite(map_y)
-            & self.transformer.kannala_rising_branch_mask(pixels_ideal)
         )
+        if not self._pinhole:
+            valid = valid & self.transformer.kannala_rising_branch_mask(pixels_ideal)
         if not self.allow_signed_z:
+            valid = valid & (world[:, 2] >= cam_pos[2])
+        elif self._pinhole:
             valid = valid & (world[:, 2] >= cam_pos[2])
         return colors, valid.reshape(height, width)
 
@@ -165,7 +212,7 @@ class SideviewProjectionMapper:
         run_id: str = "",
         frame_num: int = 0,
     ) -> Dict[str, np.ndarray]:
-        """1フレーム分の帯を逆投影する。z はカメラ位置から max_dz*alpha mm。"""
+        """1フレーム分の帯を逆投影する。ピンホールは縦割合の +Z、魚眼は max_dz*alpha。"""
         z_min, z_max = self.calculate_dynamic_z_range(
             frame.shape[:2], camera_position, orientation, max_dz, alpha
         )

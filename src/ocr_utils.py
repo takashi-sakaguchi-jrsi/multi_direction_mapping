@@ -1060,7 +1060,8 @@ def compute_average_speed(
 def estimate_high_precision_z_positions(
     ocr_distances: np.ndarray,
     success_flags: np.ndarray,
-    average_speed: float
+    average_speed: float,
+    extrapolate_last_plateau: bool = True,
 ) -> np.ndarray:
     """平均速度ベースの高精度Z位置推定（差分等分割法）
 
@@ -1069,10 +1070,15 @@ def estimate_high_precision_z_positions(
     n 等分して割り振る。表示が 10mm のまま 10 フレーム続いたあと 40mm
     に進む場合、Δ=30mm を 30/10 mm 間隔で載せる。
 
+    次のカウントアップが無い最後の区間は、直前のカウントアップ間隔の速度
+    (OCR(F_1)−OCR(F_0))/(F_1−F_0) で最終フレームまで進んだと仮定する。
+    カウントアップが1回しか無いときは表示値のまま。
+
     Args:
         ocr_distances: OCR読み取り距離配列 (N,) [mm]
         success_flags: 読み取り成功フラグ (N,)
-        average_speed: 平均速度 [mm/frame]（このメソッドでは使用しない）
+        average_speed: 平均速度 [mm/frame]（互換のため残す。最後の区間には使わない）
+        extrapolate_last_plateau: True なら最後のプラトーを直前間隔の速度で外挿する
 
     Returns:
         z_positions: 高精度Z位置配列 (N,) [mm]
@@ -1080,17 +1086,12 @@ def estimate_high_precision_z_positions(
     処理ロジック:
         同一値 X が n 個連続し、次の成功値が Y なら
         k 番目（0-indexed）を X + k * (Y−X) / n とする。
-        次の成功値が無い最後の区間は差分 0（表示値のまま）。
 
         例: 10mm が 10 フレーム続いたあと 40mm
             k=0 → 10.0, k=1 → 13.0, …, k=9 → 37.0, 次区間先頭 → 40.0
 
         例: 10mm 刻み [3000, 3010, 3010, 3020, 3020, 3030]
             → [3000.0, 3010.0, 3015.0, 3020.0, 3025.0, 3030.0]
-
-    Note:
-        - OCR失敗フレームは前後の値から線形補間
-        - 平均速度パラメータは互換性のために残すが使用しない
     """
     n_frames = len(ocr_distances)
 
@@ -1112,6 +1113,9 @@ def estimate_high_precision_z_positions(
     # OCR成功フレームのみを処理（連続する同一値を等分割）
     i = 0
     interpolated_count = 0
+    prev_countup_idx = None
+    prev_countup_ocr = None
+    last_extrap_from = None
 
     while i < n_frames:
         if not success_flags[i]:
@@ -1134,27 +1138,50 @@ def estimate_high_precision_z_positions(
             not success_flags[nxt] or ocr_distances[nxt] == current_ocr_value
         ):
             nxt += 1
-        if nxt < n_frames and success_flags[nxt]:
+        has_next = nxt < n_frames and bool(success_flags[nxt])
+        if has_next:
             delta = float(ocr_distances[nxt]) - float(current_ocr_value)
+            step = delta / n_consecutive if n_consecutive else 0.0
+            for k in range(n_consecutive):
+                z_estimated[i + k] = current_ocr_value + k * step
+        elif (
+            extrapolate_last_plateau
+            and prev_countup_idx is not None
+            and i > prev_countup_idx
+        ):
+            speed = (
+                float(current_ocr_value) - float(prev_countup_ocr)
+            ) / float(i - prev_countup_idx)
+            for k in range(i, n_frames):
+                z_estimated[k] = float(current_ocr_value) + speed * (k - i)
+            last_extrap_from = i
+            interpolated_count += n_frames - i
+            logger.info(
+                f"Last plateau extrapolate: OCR={current_ocr_value:.1f}mm "
+                f"F0={prev_countup_idx} F1={i} F_end={n_frames - 1} "
+                f"speed={speed:.4f}mm/frame "
+                f"z_end={z_estimated[n_frames - 1]:.2f}mm"
+            )
+            break
         else:
-            delta = 0.0
-        step = delta / n_consecutive if n_consecutive else 0.0
-        for k in range(n_consecutive):
-            z_estimated[i + k] = current_ocr_value + k * step
+            for k in range(n_consecutive):
+                z_estimated[i + k] = current_ocr_value
 
-        if n_consecutive > 1:
+        if n_consecutive > 1 and has_next:
             interpolated_count += n_consecutive
             logger.debug(
                 f"OCR value {current_ocr_value:.1f}mm: {n_consecutive} consecutive frames "
                 f"divided equally from {z_estimated[i]:.2f}mm to {z_estimated[j-1]:.2f}mm"
             )
-        else:
-            z_estimated[i] = current_ocr_value
 
+        prev_countup_idx = i
+        prev_countup_ocr = current_ocr_value
         i = j
 
     # OCR失敗フレームを線形補間
     for i in range(n_frames):
+        if last_extrap_from is not None and i >= last_extrap_from:
+            continue
         if not success_flags[i]:
             # 前後の成功フレームを探す
             prev_success = success_indices[success_indices < i]

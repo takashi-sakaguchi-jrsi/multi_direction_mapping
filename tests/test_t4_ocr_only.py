@@ -239,3 +239,25 @@ def test_high_precision_last_plateau_holds_display_value():
     success = np.ones(3, dtype=bool)
     z = estimate_high_precision_z_positions(ocr, success, 1.0)
     np.testing.assert_allclose(z, [10.0, 10.0, 10.0])
+
+
+def test_high_precision_last_plateau_uses_previous_countup_speed():
+    ocr = np.array([10.0] * 5 + [40.0] * 5, dtype=float)
+    success = np.ones(ocr.size, dtype=bool)
+    z = estimate_high_precision_z_positions(ocr, success, 99.0)
+    speed = (40.0 - 10.0) / 5.0
+    expected = np.concatenate([
+        10.0 + np.arange(5) * speed,
+        40.0 + np.arange(5) * speed,
+    ])
+    np.testing.assert_allclose(z, expected)
+    assert z[-1] == pytest.approx(40.0 + speed * 4)
+
+
+def test_high_precision_last_plateau_continues_through_trailing_failures():
+    ocr = np.array([10.0, 10.0, 40.0, 40.0, np.nan])
+    success = np.array([True, True, True, True, False])
+    z = estimate_high_precision_z_positions(ocr, success, 1.0)
+    speed = (40.0 - 10.0) / 2.0
+    np.testing.assert_allclose(z, [10.0, 25.0, 40.0, 55.0, 70.0])
+    assert z[-1] == pytest.approx(40.0 + speed * 2)

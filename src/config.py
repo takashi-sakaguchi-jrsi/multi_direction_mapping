@@ -1191,7 +1191,7 @@ class BestViewConfig:
 
 @dataclass
 class FeatureMatchingSideviewConfig:
-    """壁面正対: レンズ中央の低歪矩形で抽出。空間格子間引きはしない。"""
+    """壁面正対: 主点まわりの縦帯＋全幅で抽出。空間格子間引きはしない。"""
     use_radius_filter: bool = False
     max_pixel_displacement_sideview: float = 250.0
     spatial_grid_rows: int = 8
@@ -1199,8 +1199,10 @@ class FeatureMatchingSideviewConfig:
     ratio_test_threshold: float = 0.75
     min_match_count: int = 10
     max_features: int = 2000
+    v_half_ratio: float = 0.4
+    """マッチ縦。|v−cy| ≤ ratio·(H/2)。横は全幅。"""
     center_rect_half_ratio: float = 0.4
-    """レンズ半径 min(w,h)/2 に対する中央矩形の半辺。0.4 なら一辺は短辺の 0.4 倍。"""
+    """互換。v_half_ratio が JSON に無いときだけ使う旧正方形半辺。"""
     reject_reverse_travel: bool = True
     reverse_flow_tolerance_px: float = 1.0
     """フレーム y 増加（下向き）を逆走として落とすときの許容[px]。"""
@@ -1214,9 +1216,14 @@ class FeatureMatchingSideviewConfig:
 class ProjectionConfig:
     """側方パッチ投影。蓄積は逆投影＋双線形補間。sample_stride は順投影テスト用。"""
     allow_signed_relative_z: bool = True
+    """順投影テスト用。展開（sample_strip）は進行方向 +Z のみ。"""
     save_projection_cache: bool = False
     distance_metric: str = "coordinate"
     sample_stride: int = 2
+    v_forward_half_ratio: float = 0.6
+    """展開縦。cy から +Z へ ratio·(H/2)。帯幅は R tan β で、max_dz とは独立。"""
+    use_full_image_width: bool = True
+    """横はフレーム全幅。ピンホールでは円形 outer mask を使わない。"""
 
 
 @dataclass
@@ -1230,7 +1237,11 @@ SIDEVIEW_OCR_ROI_RATIO = [0.0556, 0.1000, 0.0438, 0.1063]
 
 
 def default_sideview_camera_overlay() -> Dict[str, Any]:
-    return {"ocr_roi_ratio": list(SIDEVIEW_OCR_ROI_RATIO)}
+    return {
+        "ocr_roi_ratio": list(SIDEVIEW_OCR_ROI_RATIO),
+        "fov_degrees": 60.0,
+        "camera_model": "pinhole",
+    }
 
 
 @dataclass
@@ -1456,9 +1467,14 @@ def build_two_direction_config(data: Optional[Dict[str, Any]]) -> TwoDirectionCo
         PitchTrendWarpConfig, data.get("pitch_trend_warp")
     )
     cfg.best_view = _dataclass_from_dict(BestViewConfig, data.get("best_view"))
+    fm_raw = data.get("feature_matching_sideview") or {}
     cfg.feature_matching_sideview = _dataclass_from_dict(
-        FeatureMatchingSideviewConfig, data.get("feature_matching_sideview")
+        FeatureMatchingSideviewConfig, fm_raw
     )
+    if "v_half_ratio" not in fm_raw and "center_rect_half_ratio" in fm_raw:
+        cfg.feature_matching_sideview.v_half_ratio = float(
+            fm_raw["center_rect_half_ratio"]
+        )
     cfg.projection = _dataclass_from_dict(ProjectionConfig, data.get("projection"))
     cfg.legacy_vp = _dataclass_from_dict(LegacyVpConfig, data.get("legacy_vp"))
     return cfg
@@ -2509,6 +2525,16 @@ class ConfigValidator:
         if cfg.capture.usable_outer_radius_ratio <= 0:
             raise ConfigValidationError(
                 "capture.usable_outer_radius_ratio は正である必要があります"
+            )
+        v_half = float(cfg.feature_matching_sideview.v_half_ratio)
+        if v_half <= 0.0:
+            raise ConfigValidationError(
+                "feature_matching_sideview.v_half_ratio は正である必要があります"
+            )
+        v_fwd = float(cfg.projection.v_forward_half_ratio)
+        if v_fwd <= 0.0:
+            raise ConfigValidationError(
+                "projection.v_forward_half_ratio は正である必要があります"
             )
         if str(cfg.z_source).lower() not in ("ocr", "known"):
             raise ConfigValidationError(

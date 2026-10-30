@@ -1,4 +1,4 @@
-"""T5: レンズ中央矩形での抽出と逆走ベクトル除外"""
+"""T5: 縦帯＋全幅での抽出と逆走ベクトル除外"""
 
 import numpy as np
 
@@ -15,16 +15,19 @@ def test_roi_mask_excludes_outside_points():
     assert mask[90, 110] == 0
 
 
-def test_default_mask_is_center_rect_not_full_frame():
+def test_default_mask_is_vertical_band_full_width():
     cfg = Config.from_defaults()
     matcher = SideviewFeatureMatcher(cfg)
     mask = matcher.build_roi_mask((1080, 1920), None, None, center=(960.0, 540.0))
     assert mask[540, 960] == 255
+    assert mask[540, 0] == 255
+    assert mask[540, 1919] == 255
     assert mask[0, 0] == 0
     assert mask[1079, 1919] == 0
-    rect = matcher.center_rect((1080, 1920), (960.0, 540.0))
+    rect = matcher.match_roi_rect((1080, 1920), (960.0, 540.0))
     half = 0.4 * (1080 / 2.0)
-    assert abs((rect[2] - rect[0]) / 2.0 - half) < 2.0
+    assert rect[0] == 0
+    assert rect[2] == 1920
     assert abs((rect[3] - rect[1]) / 2.0 - half) < 2.0
 
 

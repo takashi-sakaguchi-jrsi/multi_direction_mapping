@@ -1,6 +1,6 @@
 """壁面正対用の特徴点マッチング
 
-レンズ中央の低歪矩形で抽出し、Lowe 比などの品質フィルタ、
+主点まわりの縦帯＋全幅で抽出し、Lowe 比などの品質フィルタ、
 逆走除外、ベクトル長と方向角の IQR 外れ値除外を行う。
 8×8 空間間引きはしない。
 """
@@ -14,17 +14,23 @@ import numpy as np
 
 
 class SideviewFeatureMatcher:
-    """レンズ中央矩形 + 品質フィルタ + 逆走除外"""
+    """縦帯＋全幅 + 品質フィルタ + 逆走除外"""
 
     def __init__(self, config):
         side = config.two_direction.feature_matching_sideview
         fm = config.estimation.feature_matching
+        proj = config.two_direction.projection
         self.max_features = side.max_features
         self.ratio_test_threshold = side.ratio_test_threshold
         self.max_displacement = side.max_pixel_displacement_sideview
         self.min_match_count = side.min_match_count
-        self.center_rect_half_ratio = float(
-            getattr(side, "center_rect_half_ratio", 0.4)
+        self.v_half_ratio = float(
+            getattr(side, "v_half_ratio", None)
+            or getattr(side, "center_rect_half_ratio", 0.4)
+        )
+        self.center_rect_half_ratio = self.v_half_ratio
+        self.use_full_image_width = bool(
+            getattr(proj, "use_full_image_width", True)
         )
         self.reject_reverse_travel = bool(
             getattr(side, "reject_reverse_travel", True)
@@ -48,26 +54,38 @@ class SideviewFeatureMatcher:
             fastThreshold=fm.fast_threshold,
         )
 
-    def center_rect(
+    def match_roi_rect(
         self,
         shape: Tuple[int, int],
         center: Optional[Tuple[float, float]] = None,
     ) -> List[int]:
-        """レンズ中心まわりの正方形。一辺は min(w,h) * half_ratio。"""
+        """主点まわりの縦帯。横は全幅。|v−cy| ≤ v_half_ratio·(H/2)。"""
         h, w = int(shape[0]), int(shape[1])
         if center is None:
             cx, cy = w / 2.0, h / 2.0
         else:
             cx, cy = float(center[0]), float(center[1])
-        half = max(4.0, self.center_rect_half_ratio * (min(w, h) / 2.0))
-        x0 = int(np.floor(cx - half))
-        y0 = int(np.floor(cy - half))
-        x1 = int(np.ceil(cx + half))
-        y1 = int(np.ceil(cy + half))
+        half_v = max(4.0, self.v_half_ratio * (h / 2.0))
+        y0 = int(np.floor(cy - half_v))
+        y1 = int(np.ceil(cy + half_v))
+        if self.use_full_image_width:
+            x0, x1 = 0, w
+        else:
+            half_u = max(4.0, self.v_half_ratio * (min(w, h) / 2.0))
+            x0 = int(np.floor(cx - half_u))
+            x1 = int(np.ceil(cx + half_u))
         return [
             max(0, x0), max(0, y0),
             min(w, x1), min(h, y1),
         ]
+
+    def center_rect(
+        self,
+        shape: Tuple[int, int],
+        center: Optional[Tuple[float, float]] = None,
+    ) -> List[int]:
+        """互換名。縦帯＋全幅の match_roi_rect を返す。"""
+        return self.match_roi_rect(shape, center)
 
     def build_roi_mask(
         self,
@@ -80,7 +98,7 @@ class SideviewFeatureMatcher:
         h, w = shape[:2]
         mask = np.zeros((h, w), dtype=np.uint8)
         if roi_rect is None:
-            roi_rect = self.center_rect(shape, center)
+            roi_rect = self.match_roi_rect(shape, center)
         x0, y0, x1, y1 = [int(v) for v in roi_rect]
         x0 = max(0, min(w, x0))
         x1 = max(0, min(w, x1))
@@ -160,7 +178,7 @@ class SideviewFeatureMatcher:
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         h, w = prev_frame.shape[:2]
         if roi_rect is None:
-            roi_rect = self.center_rect((h, w), center)
+            roi_rect = self.match_roi_rect((h, w), center)
         x0, y0, x1, y1 = [int(v) for v in roi_rect]
         x0 = max(0, min(w, x0))
         x1 = max(0, min(w, x1))
