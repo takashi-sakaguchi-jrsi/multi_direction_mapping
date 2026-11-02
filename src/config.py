@@ -1382,6 +1382,26 @@ class TwoDirectionConfig:
     hard_bounds: HardBoundsConfig = field(default_factory=HardBoundsConfig)
     mode_a_yaw_second_stage: bool = False
     """Mode A: dz+pitch のあと yaw 1変数を最小二乗する。全長では pitch が悪化するため既定オフ。"""
+    physical_attitude_source: str = "match"
+    """展開に積む角度。工程2比較用に個別スイッチ。
+
+    match: Mode A の推定 Δpitch/Δyaw を積む（工程2）
+    dz_only: 推定はするが Δpitch/Δyaw は捨て、dz のみ積む。消失点は使わない
+    """
+    ocr_dz_anomaly_ratio: float = 0.0
+    """推定 |dz| が OCR 窓平均のこの倍率未満なら Z方向矛盾（FAILED）。
+
+    0 以下で無効（工程2）。正面と同型だが側視キーは two_direction 側。
+    """
+    ocr_dz_anomaly_min_ocr_mm: float = 1.0
+    """OCR 窓平均がこれ未満のときは異常判定しない。"""
+    ocr_dz_anomaly_window: int = 50
+    """OCR 窓平均のフレーム数。"""
+    fail_advance_median_dz: bool = False
+    """FAILED 時に prev を進め、履歴中央値 dz（maxlen=10）で z を進めて塗らない。
+
+    false は工程2どおり pose/prev を凍結する。
+    """
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     seam_warp: SeamWarpConfig = field(default_factory=SeamWarpConfig)
     pitch_trend_warp: PitchTrendWarpConfig = field(default_factory=PitchTrendWarpConfig)
@@ -2539,6 +2559,25 @@ class ConfigValidator:
         if str(cfg.z_source).lower() not in ("ocr", "known"):
             raise ConfigValidationError(
                 f"two_direction.z_source は ocr/known のみ: {cfg.z_source}"
+            )
+        att = str(getattr(cfg, "physical_attitude_source", "match") or "match").strip().lower()
+        if att not in ("match", "dz_only"):
+            raise ConfigValidationError(
+                "two_direction.physical_attitude_source は match/dz_only のみ: "
+                f"{cfg.physical_attitude_source}"
+            )
+        cfg.physical_attitude_source = att
+        if float(getattr(cfg, "ocr_dz_anomaly_ratio", 0.0) or 0.0) < 0.0:
+            raise ConfigValidationError(
+                "two_direction.ocr_dz_anomaly_ratio は 0 以上である必要があります"
+            )
+        if float(getattr(cfg, "ocr_dz_anomaly_min_ocr_mm", 1.0) or 0.0) <= 0.0:
+            raise ConfigValidationError(
+                "two_direction.ocr_dz_anomaly_min_ocr_mm は正である必要があります"
+            )
+        if int(getattr(cfg, "ocr_dz_anomaly_window", 50) or 0) < 1:
+            raise ConfigValidationError(
+                "two_direction.ocr_dz_anomaly_window は 1 以上である必要があります"
             )
         if cfg.max_frames is not None and int(cfg.max_frames) <= 0:
             raise ConfigValidationError(

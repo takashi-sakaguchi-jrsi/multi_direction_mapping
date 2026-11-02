@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -21,6 +22,60 @@ from src.validation.records import FrameAnalysisRecord
 from src.validation.sideview_feature_matcher import SideviewFeatureMatcher
 
 logger = logging.getLogger(__name__)
+
+SIDEVIEW_ATTITUDE_SOURCES = ("match", "dz_only")
+_DZ_HISTORY_MAXLEN = 10
+
+
+def normalize_sideview_attitude_source(value, default: str = "match") -> str:
+    """側視の積む角度。match / dz_only。discard（消失点）は使わない。"""
+    if value is None or str(value).strip() == "":
+        return default
+    key = str(value).strip().lower()
+    if key not in SIDEVIEW_ATTITUDE_SOURCES:
+        allowed = ", ".join(SIDEVIEW_ATTITUDE_SOURCES)
+        raise ValueError(
+            f"two_direction.physical_attitude_source は {allowed} のみ: {value!r}"
+        )
+    return key
+
+
+def is_abnormally_small_dz(
+    dz: Optional[float],
+    ocr_avg_dz: Optional[float],
+    *,
+    ratio: float,
+    min_ocr_mm: float,
+) -> bool:
+    """推定 dz が OCR 窓平均に対して異常に小さいか。ratio≤0 なら判定しない。"""
+    if dz is None or ocr_avg_dz is None:
+        return False
+    r = float(ratio)
+    min_ocr = float(min_ocr_mm)
+    if r <= 0.0 or min_ocr <= 0.0:
+        return False
+    ocr = float(ocr_avg_dz)
+    if not np.isfinite(ocr) or ocr < min_ocr:
+        return False
+    est = float(dz)
+    if not np.isfinite(est):
+        return False
+    return abs(est) < r * ocr
+
+
+def ocr_local_avg_dz_mm(z_mm, window: int = 50) -> Optional[np.ndarray]:
+    """OCR 距離列から局所平均 dz[mm/frame]。負の dz は 0。"""
+    z = np.asarray(z_mm, dtype=float).reshape(-1)
+    if z.size < 2:
+        return None
+    if not np.any(np.isfinite(z)):
+        return None
+    dz = np.diff(z)
+    dz = np.where(np.isfinite(dz), np.maximum(dz, 0.0), 0.0)
+    w = max(1, min(int(window), int(dz.size)))
+    kernel = np.ones(w, dtype=float) / float(w)
+    avg = np.convolve(dz, kernel, mode="same")
+    return np.concatenate([avg, [avg[-1]]])
 
 
 def resolve_frame_window(td, n_total: Optional[int] = None) -> Tuple[int, Optional[int]]:
@@ -217,6 +272,20 @@ class FrameAnalyzer:
         ], dtype=float)
 
         mapper_roi = self.roi_rect
+        attitude_src = normalize_sideview_attitude_source(
+            getattr(td, "physical_attitude_source", "match")
+        )
+        ocr_ratio = float(getattr(td, "ocr_dz_anomaly_ratio", 0.0) or 0.0)
+        ocr_min = float(getattr(td, "ocr_dz_anomaly_min_ocr_mm", 1.0) or 1.0)
+        ocr_window = int(getattr(td, "ocr_dz_anomaly_window", 50) or 50)
+        fail_advance = bool(getattr(td, "fail_advance_median_dz", False))
+        ocr_avg = None
+        if ocr_ratio > 0.0:
+            series = z_positions if z_positions is not None else ocr_dist
+            ocr_avg = ocr_local_avg_dz_mm(series, window=ocr_window)
+        dz_history: deque = deque(maxlen=_DZ_HISTORY_MAXLEN)
+        n_fail_feature = 0
+        n_fail_z = 0
         prev = None
         center = (0.0, 0.0)
         camera_params: Dict = {}
@@ -256,7 +325,29 @@ class FrameAnalyzer:
                     camera_params, mapper_roi, constraints,
                 )
             )
+            residual_stats = dict(residual_stats or {})
+            fail_kind = None
+            if status == "OK" and ocr_avg is not None and local_i < len(ocr_avg):
+                if is_abnormally_small_dz(
+                    float(motion_raw[2]),
+                    float(ocr_avg[local_i]),
+                    ratio=ocr_ratio,
+                    min_ocr_mm=ocr_min,
+                ):
+                    status = "FAILED"
+                    fail_kind = "z_inconsistency"
+                    residual_stats["fail_kind"] = fail_kind
+                    logger.warning(
+                        f"{run_id} frame {orig}: 推定dzがOCR窓平均に対して異常に小さい "
+                        f"dz={float(motion_raw[2]):.3f}mm "
+                        f"OCR窓平均={float(ocr_avg[local_i]):.2f}mm/frame "
+                        f"閾値={ocr_ratio:.2f}× → Z方向矛盾"
+                    )
             if status == "OK":
+                if attitude_src == "dz_only":
+                    motion_final = np.asarray(motion_final, dtype=float).copy()
+                    motion_final[4] = 0.0
+                    motion_final[5] = 0.0
                 position = position + np.array([
                     motion_final[0], motion_final[1], motion_final[2]
                 ])
@@ -275,7 +366,30 @@ class FrameAnalyzer:
                         orientation[1] = reference["yaw_ref_rad"]
                     if not est_pitch:
                         orientation[2] = reference["pitch_ref_rad"]
+                if attitude_src == "dz_only":
+                    orientation[1] = reference["yaw_ref_rad"]
+                    orientation[2] = reference["pitch_ref_rad"]
+                dz_ok = float(motion_final[2])
+                if np.isfinite(dz_ok):
+                    dz_history.append(dz_ok)
                 prev = curr
+            else:
+                if fail_kind is None:
+                    fail_kind = "feature"
+                    residual_stats["fail_kind"] = fail_kind
+                if fail_kind == "z_inconsistency":
+                    n_fail_z += 1
+                else:
+                    n_fail_feature += 1
+                if fail_advance:
+                    prev = curr
+                    if dz_history:
+                        fallback_dz = float(np.median(list(dz_history)))
+                        position = np.asarray(position, dtype=float).copy()
+                        position[2] += fallback_dz
+                        motion_final = np.zeros(6, dtype=float)
+                        motion_final[2] = fallback_dz
+                        residual_stats["fallback_dz_mm"] = fallback_dz
             records.append(self._make_record(
                 run_id, local_i, orig, orig / fps, position.copy(), orientation.copy(), reference,
                 ocr_dist, success, z_positions, motion_raw, motion_final,
@@ -312,6 +426,11 @@ class FrameAnalyzer:
             "start_frame": start,
             "end_frame": start + len(records),
             "fps": fps,
+            "physical_attitude_source": attitude_src,
+            "ocr_dz_anomaly_ratio": ocr_ratio,
+            "fail_advance_median_dz": fail_advance,
+            "fail_feature_count": n_fail_feature,
+            "fail_z_inconsistency_count": n_fail_z,
         }
         return records, extra
 

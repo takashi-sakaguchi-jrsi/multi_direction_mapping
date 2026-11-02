@@ -346,6 +346,22 @@ def apply_sideview_profile(config: Config) -> None:
         config.camera.lens_calibration_file,
         list(config.camera.ocr_roi_ratio),
     )
+    att = str(getattr(td, "physical_attitude_source", "match") or "match").strip().lower()
+    logger.info("側視 physical_attitude_source=%s", att)
+    ratio = float(getattr(td, "ocr_dz_anomaly_ratio", 0.0) or 0.0)
+    if ratio > 0.0:
+        logger.info(
+            "側視 OCR比異常判定: |dz| < %.2f×OCR窓平均 かつ "
+            "OCR窓平均≥%.1fmm/frame なら Z方向矛盾",
+            ratio,
+            float(getattr(td, "ocr_dz_anomaly_min_ocr_mm", 1.0)),
+        )
+    else:
+        logger.info("側視 OCR比異常判定: オフ（工程2）")
+    if bool(getattr(td, "fail_advance_median_dz", False)):
+        logger.info("側視 FAILED: prev 更新 + 履歴中央値 dz（塗らない）")
+    else:
+        logger.info("側視 FAILED: pose/prev 凍結（工程2）")
 
 
 def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:

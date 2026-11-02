@@ -45,6 +45,11 @@
     "known_z_metadata_path": "data/input/videos/phi250_baseline_calib_metadata.json",
     "match_source_pixels_per_mm": true,
     "mode_a_yaw_second_stage": false,
+    "physical_attitude_source": "match",
+    "ocr_dz_anomaly_ratio": 0.0,
+    "ocr_dz_anomaly_min_ocr_mm": 1.0,
+    "ocr_dz_anomaly_window": 50,
+    "fail_advance_median_dz": false,
     "capture": {
       "usable_outer_radius_ratio": 0.8,
       "derived_usable_half_fov_deg": 71.97,

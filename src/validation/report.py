@@ -135,6 +135,11 @@ def summarize_records(records: List[Any]) -> Dict[str, Any]:
         "n_frames": len(records),
         "match_count_mean": float(np.mean([r.match_count for r in records])),
         "status_counts": _count([r.status for r in records]),
+        "fail_kind_counts": _count([
+            str((r.residual_stats or {}).get("fail_kind"))
+            for r in records
+            if (r.residual_stats or {}).get("fail_kind")
+        ]),
         "position_std_mm": pos.std(axis=0).tolist(),
         "position_max_abs_mm": np.max(np.abs(pos), axis=0).tolist(),
         "orientation_std_deg": ori_deg.std(axis=0).tolist(),
