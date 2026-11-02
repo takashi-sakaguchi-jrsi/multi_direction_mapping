@@ -46,13 +46,43 @@ from src.validation.ocr_simulation import (
 from src.validation.pose_jitter import (
     PoseJitterConfig,
     build_motion_series,
+    independent_run_seed,
+    independent_z_step_mm,
     motion_metadata_fields,
+)
+
+_CAMERA_META_KEYS = (
+    "colormap",
+    "camera_model",
+    "fov_deg",
+    "n_directions",
+    "optical_axis_spacing_deg",
+    "f_px",
+    "fx",
+    "fy",
+    "cx",
+    "cy",
+    "distortion_k",
+    "width",
+    "height",
+    "radius_mm",
+    "pipe_diameter_mm",
+    "colormap_width_px",
+    "colormap_height_px",
+    "source_pixels_per_mm",
+    "physical_pitch_deg",
+    "fps",
+    "distance_overlay",
+    "phase1",
+    "lens_calibration_file",
 )
 from src.validation.geometry import (
     SUFFIX_TO_PHYSICAL_ROLL_DEG,
+    build_direction_layout,
     build_run_reference,
+    canonical_run_id,
+    physical_roll_from_run_id,
     physical_roll_to_internal_deg,
-    run_id_from_physical_roll,
 )
 
 
@@ -60,13 +90,28 @@ logger = logging.getLogger(__name__)
 
 
 def parse_runs(text: str) -> List[str]:
-    runs = [p.strip().upper() for p in text.split(",") if p.strip()]
+    runs = [p.strip().upper().lstrip("_") for p in text.split(",") if p.strip()]
     if not runs:
         raise ValueError("runs が空です")
+    out: List[str] = []
     for run in runs:
-        if run not in SUFFIX_TO_PHYSICAL_ROLL_DEG:
-            raise ValueError(f"未知の run: {run}（U/R/L）")
-    return runs
+        roll = physical_roll_from_run_id(run)
+        if run in SUFFIX_TO_PHYSICAL_ROLL_DEG:
+            out.append(run)
+        else:
+            out.append(canonical_run_id(roll))
+    return out
+
+
+def default_pinhole_run_ids(
+    n_directions: int = 8,
+    optical_axis_spacing_deg: float = 45.0,
+    fov_deg: float = 60.0,
+) -> List[str]:
+    layout = build_direction_layout(
+        n_directions, optical_axis_spacing_deg, fov_deg
+    )
+    return list(layout.run_ids)
 
 
 def generate_two_direction_videos(
@@ -90,7 +135,18 @@ def generate_two_direction_videos(
     jitter: bool = False,
     jitter_seed: int = 0,
     calibration_path: Optional[str] = None,
+    camera_model: str = "fisheye",
+    n_directions: Optional[int] = None,
+    optical_axis_spacing_deg: float = 45.0,
 ) -> Dict:
+    model = str(camera_model or "fisheye").lower()
+    if model not in ("fisheye", "pinhole"):
+        raise ValueError(f"未知の camera_model: {camera_model}")
+    if model == "pinhole" and calibration_path:
+        raise ValueError(
+            "ピンホール経路ではレンズ校正 JSON は使えません。"
+            " --calibration を外してください。"
+        )
     calib = None
     dist_coeffs = None
     f_px = None
@@ -122,69 +178,66 @@ def generate_two_direction_videos(
         cx=cx,
         cy=cy,
         dist_coeffs=dist_coeffs,
+        camera_model=model,
     )
     if n_frames < N_FRAMES_HINT_MIN or n_frames > N_FRAMES_HINT_MAX:
         logger.warning(
             f"目視確認には {N_FRAMES_HINT_MIN}～{N_FRAMES_HINT_MAX} フレーム程度を推奨"
             f"（指定: {n_frames}）"
         )
-    jitter_cfg = PoseJitterConfig(seed=int(jitter_seed))
+    z_max_mm = float(renderer.z_extent_mm) - float(z_margin_mm)
     program_rpy_by_run = {}
-    if jitter:
-        series = build_motion_series(
-            n_frames=n_frames,
-            z_start_mm=z_start_mm,
-            z_step_mm=z_step_mm,
-            z_max_mm=float(renderer.z_extent_mm) - float(z_margin_mm),
-            config=jitter_cfg,
-        )
-        zs = series["z_mm"]
-        ocr_fields = motion_metadata_fields(series, z_step_mm=float(z_step_mm), config=jitter_cfg)
-        logger.info(
-            f"振動走行 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, "
-            f"dz_mean={ocr_fields['dz_mean_mm']:.3f} mm"
-        )
-    else:
-        series = None
-        zs = z_values_for_segment(
+    shared_zs = None
+    shared_ocr_fields = None
+    if not jitter:
+        shared_zs = z_values_for_segment(
             renderer,
             z_start_mm=z_start_mm,
             n_frames=n_frames,
             z_step_mm=z_step_mm,
             z_margin_mm=z_margin_mm,
         )
-        ocr_fields = ocr_metadata_fields(zs, z_step_mm=float(z_step_mm), ocr_step_mm=OCR_STEP_MM)
-    if len(zs) < n_frames:
-        logger.warning(
-            f"展開図終端のため {n_frames} フレームから {len(zs)} に短縮 "
-            f"(z_start={zs[0]:.1f} mm, z_end={zs[-1]:.1f} mm, extent={renderer.z_extent_mm:.1f} mm)"
+        shared_ocr_fields = ocr_metadata_fields(
+            shared_zs, z_step_mm=float(z_step_mm), ocr_step_mm=OCR_STEP_MM
         )
-    if not jitter:
+        if len(shared_zs) < n_frames:
+            logger.warning(
+                f"展開図終端のため {n_frames} フレームから {len(shared_zs)} に短縮 "
+                f"(z_start={shared_zs[0]:.1f} mm, z_end={shared_zs[-1]:.1f} mm, "
+                f"extent={renderer.z_extent_mm:.1f} mm)"
+            )
         logger.info(
-            f"生成区間 z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, step={z_step_mm} mm"
+            f"生成区間 z={shared_zs[0]:.1f}～{shared_zs[-1]:.1f} mm, "
+            f"{len(shared_zs)} frames, step={z_step_mm} mm"
         )
     logger.info(
         f"フレームは逐次エンコードします（RAM に全枚保持しない）: "
-        f"{len(zs)} frames × {len(runs)} runs, {width}x{height}"
+        f"最大 {n_frames} frames × {len(runs)} runs, {width}x{height}"
+        + ("（方向ごとに独立走行）" if jitter else "")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     videos_dir = output_dir
     result: Dict = {
         "colormap": str(colormap),
         "camera_model": (
-            "fisheye_calibrated" if calib is not None else "fisheye_equidistant"
+            "pinhole" if model == "pinhole"
+            else ("fisheye_calibrated" if calib is not None else "fisheye_equidistant")
         ),
-        "lens_calibration_file": str(calibration_path) if calib is not None else None,
         "fov_deg": float(fov_deg),
+        "n_directions": int(n_directions) if n_directions is not None else len(list(runs)),
+        "optical_axis_spacing_deg": float(optical_axis_spacing_deg),
         "f_px": float(renderer.f),
         "fx": float(renderer.f),
         "fy": float(fy) if fy else float(renderer.f),
         "cx": float(renderer.cx),
         "cy": float(renderer.cy),
         "distortion_k": (
-            [float(v) for v in renderer.dist_coeffs]
-            if renderer.dist_coeffs is not None
-            else [0.0, 0.0, 0.0, 0.0]
+            [0.0, 0.0, 0.0, 0.0] if model == "pinhole"
+            else (
+                [float(v) for v in renderer.dist_coeffs]
+                if renderer.dist_coeffs is not None
+                else [0.0, 0.0, 0.0, 0.0]
+            )
         ),
         "width": int(width),
         "height": int(height),
@@ -196,14 +249,18 @@ def generate_two_direction_videos(
             pixels_per_mm_from_equirect(renderer.eq_h, radius_mm)
         ),
         "physical_pitch_deg": float(pitch_deg),
-        "z_start_mm": float(zs[0]),
-        "z_end_mm": float(zs[-1]),
-        **ocr_fields,
         "fps": float(fps),
         "distance_overlay": False,
         "phase1": False,
+        "motion_jitter": bool(jitter),
+        "motion_jitter_independent_runs": bool(jitter),
+        "jitter_seed": int(jitter_seed) if jitter else None,
         "runs": {},
     }
+    if model != "pinhole":
+        result["lens_calibration_file"] = (
+            str(calibration_path) if calib is not None else None
+        )
     rec_canvas = None
     rec_filled = None
     rec_dmin = None
@@ -212,11 +269,34 @@ def generate_two_direction_videos(
         rec_filled = np.zeros((renderer.eq_h, renderer.eq_w), dtype=bool)
         rec_dmin = np.full((renderer.eq_h, renderer.eq_w), np.inf, dtype=np.float32)
     n_runs = len(runs)
-    progress_every = 50 if len(zs) >= 100 else max(1, len(zs))
+    z_lo_all = None
+    z_hi_all = None
     for run_i, run in enumerate(runs):
-        roll = SUFFIX_TO_PHYSICAL_ROLL_DEG[run]
+        roll = physical_roll_from_run_id(run)
+        run_key = canonical_run_id(roll) if model == "pinhole" else run
         rpy_list = None
+        series = None
+        run_seed = None
         if jitter:
+            run_seed = independent_run_seed(int(jitter_seed), run_i)
+            z_step_run = independent_z_step_mm(float(z_step_mm), run_seed)
+            jitter_cfg = PoseJitterConfig(seed=run_seed)
+            series = build_motion_series(
+                n_frames=n_frames,
+                z_start_mm=z_start_mm,
+                z_step_mm=z_step_run,
+                z_max_mm=z_max_mm,
+                config=jitter_cfg,
+            )
+            zs = series["z_mm"]
+            ocr_fields = motion_metadata_fields(
+                series, z_step_mm=float(z_step_run), config=jitter_cfg
+            )
+            logger.info(
+                f"{run_key}: 独立振動走行 seed={run_seed} "
+                f"z={zs[0]:.1f}～{zs[-1]:.1f} mm, {len(zs)} frames, "
+                f"dz_mean={ocr_fields['dz_mean_mm']:.3f} mm"
+            )
             ref = build_run_reference(roll, physical_pitch_deg=pitch_deg)
             yaw_off = series["yaw_offset_deg"]
             pitch_off = series["pitch_offset_deg"]
@@ -228,16 +308,30 @@ def generate_two_direction_videos(
                 )
                 for i in range(len(zs))
             ]
-            program_rpy_by_run[run] = rpy_list
-        video_path = videos_dir / f"{name}_{run}.mp4"
+            program_rpy_by_run[run_key] = rpy_list
+        else:
+            zs = shared_zs
+            ocr_fields = dict(shared_ocr_fields)
+        if z_lo_all is None:
+            z_lo_all = float(zs[0])
+            z_hi_all = float(zs[-1])
+        else:
+            z_lo_all = min(z_lo_all, float(zs[0]))
+            z_hi_all = max(z_hi_all, float(zs[-1]))
+        if run_i == 0:
+            result["z_start_mm"] = float(zs[0])
+            result["z_end_mm"] = float(zs[-1])
+            result.update(ocr_fields)
+        video_path = videos_dir / f"{name}_{run_key}.mp4"
         writer = open_mp4_writer(
             video_path, (renderer.output_width, renderer.output_height), fps
         )
         frame_dir = None
         if save_png:
-            frame_dir = videos_dir / f"{name}_{run}_frames"
+            frame_dir = videos_dir / f"{name}_{run_key}_frames"
             frame_dir.mkdir(parents=True, exist_ok=True)
         n_written = 0
+        progress_every = 50 if len(zs) >= 100 else max(1, len(zs))
         try:
             for i, (frame, z) in enumerate(
                 renderer.iter_rendered_frames(
@@ -249,7 +343,7 @@ def generate_two_direction_videos(
                     cv2.imwrite(str(frame_dir / f"{i:06d}.png"), frame)
                 if reconstruct:
                     ori = (
-                        program_rpy_by_run[run][i]
+                        program_rpy_by_run[run_key][i]
                         if jitter
                         else (float(roll), float(pitch_deg))
                     )
@@ -269,26 +363,56 @@ def generate_two_direction_videos(
                     )
         finally:
             writer.release()
-        result["runs"][run] = {
-            "run_id": run_id_from_physical_roll(roll),
+        run_entry = {
+            "run_id": run_key,
             "physical_roll_deg": float(roll),
             "physical_roll_internal_deg": float(physical_roll_to_internal_deg(roll)),
             "video_path": str(video_path),
             "n_frames": n_written,
+            "z_start_mm": float(zs[0]),
+            "z_end_mm": float(zs[-1]),
+            **ocr_fields,
         }
-        logger.info(f"{run}: {video_path} ({n_written} frames, roll={roll})")
+        if jitter:
+            run_entry["motion_jitter_seed"] = int(run_seed)
+        run_meta = {
+            key: result[key]
+            for key in _CAMERA_META_KEYS
+            if key in result
+        }
+        run_meta.update(ocr_fields)
+        run_meta["run_id"] = run_key
+        run_meta["physical_roll_deg"] = float(roll)
+        run_meta["z_start_mm"] = float(zs[0])
+        run_meta["z_end_mm"] = float(zs[-1])
+        run_meta["motion_jitter"] = bool(jitter)
+        run_meta["n_frames"] = n_written
+        if jitter:
+            run_meta["motion_jitter_seed"] = int(run_seed)
+        run_meta_path = videos_dir / f"{name}_{run_key}_metadata.json"
+        run_meta_path.write_text(
+            json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        run_entry["metadata_path"] = str(run_meta_path)
+        result["runs"][run_key] = run_entry
+        logger.info(f"{run_key}: {video_path} ({n_written} frames, roll={roll})")
+    if z_lo_all is not None:
+        result["z_start_mm"] = float(z_lo_all)
+        result["z_end_mm"] = float(z_hi_all)
 
     if reconstruct:
         rec_dir = output_dir / "reconstruct_skip_phase1"
         rec_dir.mkdir(parents=True, exist_ok=True)
         rec_canvas[~rec_filled] = 0
         canvas, filled = rec_canvas, rec_filled
-        preview = crop_colormap_z_window(canvas, renderer, float(zs[0]), float(zs[-1]))
+        crop_lo = float(z_lo_all if z_lo_all is not None else zs[0])
+        crop_hi = float(z_hi_all if z_hi_all is not None else zs[-1])
+        preview = crop_colormap_z_window(canvas, renderer, crop_lo, crop_hi)
         source_preview = crop_colormap_z_window(
-            renderer.equirect_img, renderer, float(zs[0]), float(zs[-1])
+            renderer.equirect_img, renderer, crop_lo, crop_hi
         )
         mask_preview = crop_colormap_z_window(
-            (filled.astype(np.uint8) * 255), renderer, float(zs[0]), float(zs[-1])
+            (filled.astype(np.uint8) * 255), renderer, crop_lo, crop_hi
         )
         rec_path = rec_dir / f"{name}_reconstruct.png"
         src_path = rec_dir / f"{name}_source.png"
@@ -333,16 +457,29 @@ def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
         help="mp4 の出力先",
     )
     p.add_argument("--name", type=str, default="phi250_fisheye_side")
-    p.add_argument("--runs", type=str, default="U,R")
+    p.add_argument(
+        "--runs",
+        type=str,
+        default=None,
+        help="U,R,L または 000,045,...。未指定時は魚眼 U,R、ピンホールは 8 方向",
+    )
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--height", type=int, default=None)
     p.add_argument("--radius-mm", type=float, default=DEFAULT_RADIUS_MM)
-    p.add_argument("--fov", type=float, default=DEFAULT_FOV_DEG)
+    p.add_argument("--fov", type=float, default=None)
+    p.add_argument(
+        "--camera-model",
+        type=str,
+        default="fisheye",
+        choices=["fisheye", "pinhole"],
+        help="生成レンズ。pinhole は 60°・8 方向が既定",
+    )
+    p.add_argument("--n-directions", type=int, default=None)
     p.add_argument(
         "--calibration",
         type=Path,
         default=None,
-        help="レンズ校正 JSON（fx/cx/cy と Kannala-Brandt 歪み。解析と同じファイル）",
+        help="レンズ校正 JSON（魚眼のみ。ピンホール経路では拒否）",
     )
     p.add_argument("--pitch", type=float, default=DEFAULT_PITCH_DEG)
     p.add_argument(
@@ -377,7 +514,7 @@ def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
     p.add_argument(
         "--jitter",
         action="store_true",
-        help="dz/dpitch/dyaw に十数フレーム＋2〜3フレームの合成振動を入れる",
+        help="dz/dpitch/dyaw の合成振動を方向ごとに独立して入れる（速度も非同期）",
     )
     p.add_argument("--jitter-seed", type=int, default=0)
     p.add_argument(
@@ -395,7 +532,21 @@ def main(argv: Sequence[str] = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     try:
         colormap = resolve_colormap_path(args.colormap)
-        runs = parse_runs(args.runs)
+        camera_model = str(args.camera_model or "fisheye").lower()
+        n_directions = args.n_directions
+        if n_directions is None and camera_model == "pinhole":
+            n_directions = 8
+        fov_deg = args.fov
+        if fov_deg is None:
+            fov_deg = 60.0 if camera_model == "pinhole" else DEFAULT_FOV_DEG
+        if args.runs:
+            runs = parse_runs(args.runs)
+        elif camera_model == "pinhole":
+            runs = default_pinhole_run_ids(
+                int(n_directions or 8), 45.0, float(fov_deg)
+            )
+        else:
+            runs = parse_runs("U,R")
         calib_path = str(args.calibration) if args.calibration else None
         width = args.width
         height = args.height
@@ -416,7 +567,7 @@ def main(argv: Sequence[str] = None) -> int:
             width=width,
             height=height,
             radius_mm=args.radius_mm,
-            fov_deg=args.fov,
+            fov_deg=fov_deg,
             pitch_deg=args.pitch,
             n_frames=args.frames,
             fps=args.fps,
@@ -430,17 +581,27 @@ def main(argv: Sequence[str] = None) -> int:
             jitter=bool(args.jitter),
             jitter_seed=int(args.jitter_seed),
             calibration_path=calib_path,
+            camera_model=camera_model,
+            n_directions=n_directions,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         logger.error(str(exc))
         return 1
     print(f"metadata: {result.get('metadata_path')}")
     print(
-        f"z={result.get('z_start_mm'):.1f}～{result.get('z_end_mm'):.1f} mm, "
-        f"frames={len(result.get('z_values_mm', []))}"
+        f"z={result.get('z_start_mm'):.1f}～{result.get('z_end_mm'):.1f} mm "
+        f"(全 run の範囲)"
     )
     for run, info in result.get("runs", {}).items():
-        print(f"{run}: {info['video_path']}")
+        zs = info.get("z_values_mm") or []
+        n = int(info.get("n_frames") or len(zs))
+        if zs:
+            print(
+                f"{run}: {info['video_path']} "
+                f"z={zs[0]:.1f}～{zs[-1]:.1f} mm n={n}"
+            )
+        else:
+            print(f"{run}: {info['video_path']}")
     return 0
 
 

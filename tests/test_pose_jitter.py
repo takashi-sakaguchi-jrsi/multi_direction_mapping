@@ -1,5 +1,8 @@
 """生成動画の dz/dpitch/dyaw 合成振動と OCR の累積 z 整合"""
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -13,6 +16,8 @@ from src.validation.ocr_simulation import simulate_ocr_distance_mm
 from src.validation.pose_jitter import (
     PoseJitterConfig,
     build_motion_series,
+    independent_run_seed,
+    independent_z_step_mm,
     motion_metadata_fields,
 )
 
@@ -63,6 +68,15 @@ def test_program_pose_matches_demo_optical_axis():
         np.testing.assert_allclose(axis_p, axis_d, atol=1e-6)
 
 
+def test_independent_run_seeds_and_speeds_differ():
+    assert independent_run_seed(0, 0) != independent_run_seed(0, 1)
+    step0 = independent_z_step_mm(4.5, independent_run_seed(4, 0))
+    step1 = independent_z_step_mm(4.5, independent_run_seed(4, 1))
+    assert step0 != step1
+    assert 4.5 * 0.88 - 1e-9 <= step0 <= 4.5 * 1.12 + 1e-9
+    assert 4.5 * 0.88 - 1e-9 <= step1 <= 4.5 * 1.12 + 1e-9
+
+
 def test_generate_jitter_writes_motion_and_ocr(tmp_path):
     import cv2
 
@@ -91,6 +105,7 @@ def test_generate_jitter_writes_motion_and_ocr(tmp_path):
         jitter_seed=4,
     )
     assert result["motion_jitter"] is True
+    assert result["motion_jitter_independent_runs"] is True
     n = len(result["z_values_mm"])
     assert n == 12
     assert len(result["ocr_z_mm"]) == n
@@ -103,3 +118,19 @@ def test_generate_jitter_writes_motion_and_ocr(tmp_path):
     dz = np.asarray(result["dz_mm"])
     np.testing.assert_allclose(z, z[0] + np.cumsum(dz))
     assert abs(z[-1] - (8.0 + 4.5 * 11)) > 0.05
+    z_u = np.asarray(result["runs"]["U"]["z_values_mm"])
+    z_r = np.asarray(result["runs"]["R"]["z_values_mm"])
+    assert z_u.shape == z_r.shape
+    assert not np.allclose(z_u, z_r)
+    assert result["runs"]["U"]["motion_jitter_seed"] != result["runs"]["R"]["motion_jitter_seed"]
+    assert result["runs"]["U"]["z_step_mm"] != result["runs"]["R"]["z_step_mm"]
+    yaw_u = np.asarray(result["runs"]["U"]["yaw_offset_deg"])
+    yaw_r = np.asarray(result["runs"]["R"]["yaw_offset_deg"])
+    assert not np.allclose(yaw_u, yaw_r)
+    u_meta = Path(result["runs"]["U"]["metadata_path"])
+    r_meta = Path(result["runs"]["R"]["metadata_path"])
+    assert u_meta.is_file()
+    assert r_meta.is_file()
+    assert u_meta.name == "jitter_side_U_metadata.json"
+    u_payload = json.loads(u_meta.read_text(encoding="utf-8"))
+    np.testing.assert_allclose(u_payload["z_values_mm"], z_u)

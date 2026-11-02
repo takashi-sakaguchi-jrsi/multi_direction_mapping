@@ -78,6 +78,14 @@ def run_id_from_physical_roll(physical_roll_deg: float) -> str:
     raise ValueError(f"未対応の physical_roll_deg: {physical_roll_deg}")
 
 
+def _run_id_or_canonical(physical_roll_deg: float) -> str:
+    """U/R/L なら従来 ID、それ以外は 3 桁 run_id。"""
+    try:
+        return run_id_from_physical_roll(physical_roll_deg)
+    except ValueError:
+        return canonical_run_id(physical_roll_deg)
+
+
 def canonical_run_id(physical_roll_deg: float) -> str:
     """カメラカー roll[deg] を 3 桁 run_id（000…359）にする。45° には量子化しない。"""
     wrapped = float(physical_roll_deg) % 360.0
@@ -184,7 +192,7 @@ def build_run_reference(
         "roll_ref_rad": float(np.radians(roll_p)),
         "yaw_ref_rad": float(np.radians(yaw_p)),
         "pitch_ref_rad": float(np.radians(pitch_p)),
-        "run_id": run_id_from_physical_roll(physical_roll_deg),
+        "run_id": _run_id_or_canonical(physical_roll_deg),
     }
 
 

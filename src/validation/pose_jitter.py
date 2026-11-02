@@ -31,6 +31,22 @@ class PoseJitterConfig:
     seed: int = 0
 
 
+def independent_run_seed(base_seed: int, run_index: int) -> int:
+    """方向（走行）ごとに独立な乱数種。8 往復の非同期テスト用。"""
+    return int(base_seed) + 1009 * (int(run_index) + 1)
+
+
+def independent_z_step_mm(
+    nominal_mm: float,
+    seed: int,
+    scale_lo: float = 0.88,
+    scale_hi: float = 1.12,
+) -> float:
+    """公称速度を走行ごとに少しずらす（速度非同期）。"""
+    rng = np.random.default_rng(int(seed) + 17)
+    return float(nominal_mm) * float(rng.uniform(float(scale_lo), float(scale_hi)))
+
+
 def _two_tone(
     n: int,
     t: np.ndarray,

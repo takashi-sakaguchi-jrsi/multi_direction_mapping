@@ -16,8 +16,10 @@ from src.validation.known_z import (
     apply_generation_metadata_to_config,
     infer_known_z_metadata_path,
     is_generation_camera_metadata,
+    known_z_mm_from_metadata,
     load_known_z_mm,
     resolve_known_z_mm,
+    resolve_known_z_mm_for_run,
 )
 from tests.synthetic_pipe import make_sequence
 
@@ -92,6 +94,41 @@ def test_analyzer_records_known_z_as_ocr(transformer, config):
     np.testing.assert_allclose(extra["ocr_dist"], known)
     assert recs[0].z_ocr == pytest.approx(100.0)
     assert recs[-1].z_ocr == pytest.approx(124.0)
+
+
+def test_infer_prefers_per_run_metadata(tmp_path):
+    video = tmp_path / "demo_side_U.mp4"
+    video.write_bytes(b"")
+    shared = tmp_path / "demo_side_metadata.json"
+    shared.write_text(json.dumps({"z_values_mm": [1.0, 2.0]}), encoding="utf-8")
+    per_run = tmp_path / "demo_side_U_metadata.json"
+    per_run.write_text(json.dumps({"z_values_mm": [9.0, 8.0, 7.0]}), encoding="utf-8")
+    inferred = infer_known_z_metadata_path(str(video))
+    assert inferred == per_run
+    np.testing.assert_allclose(load_known_z_mm(inferred), [9.0, 8.0, 7.0])
+
+
+def test_known_z_from_run_entry(tmp_path, config):
+    meta = {
+        "ocr_z_mm": [0.0, 10.0, 20.0],
+        "runs": {
+            "U": {"ocr_z_mm": [0.0, 4.0, 9.0]},
+            "R": {"ocr_z_mm": [0.0, 6.0, 11.0, 17.0]},
+        },
+    }
+    path = tmp_path / "shared_metadata.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    np.testing.assert_allclose(known_z_mm_from_metadata(meta), [0.0, 10.0, 20.0])
+    np.testing.assert_allclose(known_z_mm_from_metadata(meta, run_id="U"), [0.0, 4.0, 9.0])
+    np.testing.assert_allclose(known_z_mm_from_metadata(meta, run_id="R"), [0.0, 6.0, 11.0, 17.0])
+    config.z_source = "known"
+    config.known_z_metadata_path = str(path)
+    np.testing.assert_allclose(
+        resolve_known_z_mm_for_run(config, run_id="U"), [0.0, 4.0, 9.0]
+    )
+    np.testing.assert_allclose(
+        resolve_known_z_mm_for_run(config, run_id="R"), [0.0, 6.0, 11.0, 17.0]
+    )
 
 
 def test_metadata_loader_and_infer(tmp_path):
@@ -333,3 +370,40 @@ def test_apply_generation_metadata_keeps_calib(config):
     assert transformer.camera.f == pytest.approx(343.9361312858878)
     assert transformer.camera.cx == pytest.approx(980.2892954686431)
     assert transformer.camera.cy == pytest.approx(552.6559656218703)
+
+
+def test_apply_generation_metadata_pinhole_does_not_restore_calib(config):
+    from src.product_runtime import apply_sideview_profile
+
+    apply_sideview_profile(config)
+    config.camera.lens_calibration_file = (
+        "data/calibration/fisheye_recalibrated_20260217.json"
+    )
+    config.camera._lens_calibration = object()
+    apply_generation_metadata_to_config(
+        config,
+        {
+            "camera_model": "pinhole",
+            "fov_deg": 60.0,
+            "n_directions": 8,
+            "f_px": 935.307,
+            "fy": 935.307,
+            "cx": 960.0,
+            "cy": 540.0,
+            "width": 1920,
+            "height": 1080,
+            "pipe_diameter_mm": 250.0,
+            "lens_calibration_file": (
+                "data/calibration/fisheye_recalibrated_20260217.json"
+            ),
+        },
+    )
+    assert config.camera.camera_model == "pinhole"
+    assert config.camera.lens_calibration_file is None
+    assert config.camera._lens_calibration is None
+    assert config.camera.fov_degrees == pytest.approx(60.0)
+    assert config.camera.fx == pytest.approx(935.307)
+    assert config.camera.cx == pytest.approx(960.0)
+    transformer = build_transformer(config)
+    assert transformer.calibration is None
+    assert str(type(transformer.camera).__name__) == "PinholeCamera"

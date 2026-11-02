@@ -38,9 +38,11 @@ from src.product_runtime import (
 from src.validation.known_z import (
     apply_generation_metadata_to_config,
     assert_known_z_covers_window,
+    effective_known_z_metadata_path,
     effective_z_source,
+    infer_known_z_metadata_path,
     load_generation_metadata,
-    resolve_known_z_mm,
+    resolve_known_z_mm_for_run,
     source_pixels_per_mm_from_metadata,
 )
 from src.camera_utils import compute_pinhole_focal_length
@@ -195,22 +197,28 @@ def run_two_direction_validation(
             f"{tag}={run_cfg.run_id or tag}" for tag, run_cfg in jobs
         )
     )
-    if known_z_mm is None and effective_z_source(config) == "known":
-        known_z_mm = resolve_known_z_mm(config)
-        if td.known_z_metadata_path:
-            meta = load_generation_metadata(td.known_z_metadata_path)
+    injected_known_z = known_z_mm
+    z_source_known = injected_known_z is not None or effective_z_source(config) == "known"
+    if injected_known_z is None and effective_z_source(config) == "known":
+        cam_meta_path = effective_known_z_metadata_path(config)
+        if cam_meta_path is None:
+            for _tag, run_cfg in jobs:
+                if run_cfg.video_path:
+                    inferred = infer_known_z_metadata_path(run_cfg.video_path)
+                    if inferred is not None:
+                        cam_meta_path = str(inferred)
+                        break
+        if cam_meta_path:
+            meta = load_generation_metadata(cam_meta_path)
             apply_generation_metadata_to_config(config, meta)
             if td.match_source_pixels_per_mm:
                 ppm = source_pixels_per_mm_from_metadata(meta)
                 config.colormap.pixels_per_mm = ppm
                 logger.info(f"生成カラーマップ pix/mm を元展開図に合わせる: {ppm:.6f}")
-        logger.info(
-            f"第1段階: 既知zをOCR代用 ({len(known_z_mm)} 点, "
-            f"metadata={td.known_z_metadata_path})"
-        )
+            logger.info(f"第1段階: 既知zをOCR代用 (run 別, metadata={cam_meta_path})")
     win_start, win_end = resolve_frame_window(td)
-    if known_z_mm is not None:
-        assert_known_z_covers_window(known_z_mm, win_start, win_end)
+    if injected_known_z is not None:
+        assert_known_z_covers_window(injected_known_z, win_start, win_end)
     transformer = build_transformer(config)
     estimator = CameraEstimator(config.estimation, transformer)
     mapper = SideviewProjectionMapper(config, transformer)
@@ -234,7 +242,7 @@ def run_two_direction_validation(
     output_dir.mkdir(parents=True, exist_ok=True)
     results: Dict[str, Any] = {
         "derived_usable_half_fov_deg": derived_fov,
-        "z_source": "known" if known_z_mm is not None else "ocr",
+        "z_source": "known" if z_source_known else "ocr",
         "pixels_per_mm": float(config.colormap.pixels_per_mm),
         "n_runs": len(jobs),
         "run_tags": [tag for tag, _ in jobs],
@@ -289,10 +297,21 @@ def run_two_direction_validation(
                 except Exception:
                     pass
 
+            run_known_z = injected_known_z
+            if run_known_z is None and z_source_known:
+                run_known_z = resolve_known_z_mm_for_run(
+                    config,
+                    video_path=run_cfg.video_path,
+                    run_id=run_cfg.run_id,
+                )
+                assert_known_z_covers_window(run_known_z, win_start, win_end)
+                logger.info(
+                    f"{rid_hint}: 既知z {len(run_known_z)} 点"
+                )
             rec, extra = analyzer.analyze_run(
                 run_cfg,
                 frames=frames_by_tag.get(tag),
-                known_z_mm=known_z_mm,
+                known_z_mm=run_known_z,
                 progress_callback=_run_progress,
             )
             analyzed.append({"tag": tag, "run_cfg": run_cfg, "rec": rec, "extra": extra})
@@ -521,7 +540,7 @@ def run_two_direction_validation(
         if cmap:
             results["colormap_path"] = str(cmap)
     if getattr(config, "save_ocr_metadata", False):
-        z_save = known_z_mm
+        z_save = injected_known_z
         if z_save is None and analyzed:
             rec0 = analyzed[0].get("rec")
             rows = rec0 if isinstance(rec0, (list, tuple)) else []

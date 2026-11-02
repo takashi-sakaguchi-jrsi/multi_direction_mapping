@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
-from src.camera_utils import compute_fisheye_focal_length
+from src.camera_utils import compute_fisheye_focal_length, compute_pinhole_focal_length
 from src.coordinate_transform import FisheyeCamera
 from src.validation.geometry import pose_R_c2w
 
@@ -87,6 +87,7 @@ class FisheyeSideviewRenderer:
         cx: Optional[float] = None,
         cy: Optional[float] = None,
         dist_coeffs: Optional[Sequence[float]] = None,
+        camera_model: str = "fisheye",
     ):
         if isinstance(colormap, np.ndarray):
             img = colormap
@@ -113,8 +114,17 @@ class FisheyeSideviewRenderer:
         self.horiz_mm_per_px = (2.0 * np.pi * self.radius) / self.eq_h
         self.z_extent_mm = self.eq_w * self.horiz_mm_per_px
         self.fov_deg = float(fov_deg)
+        self.camera_model = str(camera_model or "fisheye").lower()
+        if self.camera_model not in ("fisheye", "pinhole"):
+            raise ValueError(f"未知の camera_model: {camera_model}")
         if f_px is not None and float(f_px) > 0.0:
             self.f = float(f_px)
+        elif self.camera_model == "pinhole":
+            self.f = float(
+                compute_pinhole_focal_length(
+                    self.fov_deg, (self.output_height, self.output_width)
+                )
+            )
         else:
             self.f = float(
                 compute_fisheye_focal_length(
@@ -124,7 +134,7 @@ class FisheyeSideviewRenderer:
         self.cx = float(cx) if cx is not None else self.output_width / 2.0
         self.cy = float(cy) if cy is not None else self.output_height / 2.0
         self.dist_coeffs: Optional[np.ndarray] = None
-        if dist_coeffs is not None:
+        if self.camera_model != "pinhole" and dist_coeffs is not None:
             dist = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1)
             if dist.size >= 4 and not np.allclose(dist[:4], 0.0):
                 self.dist_coeffs = dist[:4].copy()
@@ -141,28 +151,32 @@ class FisheyeSideviewRenderer:
         r_px = np.hypot(cam_x, cam_y)
         rho = np.maximum(r_px, 1e-12)
         theta_max = np.radians(self.fov_deg) / 2.0
-        if self.dist_coeffs is not None:
-            camera = FisheyeCamera(
-                f=self.f,
-                cx=self.cx,
-                cy=self.cy,
-                image_width=self.output_width,
-                image_height=self.output_height,
-            )
-            gamma = camera.invert_kannala_theta(
-                r_px / self.f, self.dist_coeffs, theta_max
-            )
+        if self.camera_model == "pinhole":
+            # 矩形センサ全面。半画角の円で切ると 16:9 の左右が黒円になる。
+            gamma = np.arctan(r_px / max(self.f, 1e-12))
         else:
-            gamma = r_px / self.f
-        # FOV は 180°前後。π を超える入射角は裏側へ周回するので捨てる。
-        gamma = np.where(
-            np.isfinite(gamma)
-            & (gamma >= -1e-9)
-            & (gamma <= theta_max + 1e-6)
-            & (gamma < np.pi),
-            np.clip(gamma, 0.0, theta_max),
-            np.nan,
-        )
+            if self.dist_coeffs is not None:
+                camera = FisheyeCamera(
+                    f=self.f,
+                    cx=self.cx,
+                    cy=self.cy,
+                    image_width=self.output_width,
+                    image_height=self.output_height,
+                )
+                gamma = camera.invert_kannala_theta(
+                    r_px / self.f, self.dist_coeffs, theta_max
+                )
+            else:
+                gamma = r_px / self.f
+            # 魚眼は円形フレーム。π を超える入射角は裏側へ周回するので捨てる。
+            gamma = np.where(
+                np.isfinite(gamma)
+                & (gamma >= -1e-9)
+                & (gamma <= theta_max + 1e-6)
+                & (gamma < np.pi),
+                np.clip(gamma, 0.0, theta_max),
+                np.nan,
+            )
         vx = np.sin(gamma) * (cam_x / rho)
         vy = np.sin(gamma) * (cam_y / rho)
         vz = np.cos(gamma)
@@ -219,7 +233,10 @@ class FisheyeSideviewRenderer:
         b = 2.0 * (x0 * dx + y0 * dy)
         c = x0 * x0 + y0 * y0 - self.radius * self.radius
         disc = b * b - 4.0 * a * c
-        in_fov = self._r_px <= (self.r_max + 1e-6)
+        if self.camera_model == "pinhole":
+            in_fov = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(dz)
+        else:
+            in_fov = self._r_px <= (self.r_max + 1e-6)
         ok = (
             (disc >= 0.0)
             & (a > 1e-12)

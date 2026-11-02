@@ -9,23 +9,58 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 
 from src.validation.fisheye_sideview_renderer import pixels_per_mm_from_equirect
+from src.validation.geometry import canonical_run_id, physical_roll_from_run_id
 from src.validation.ocr_simulation import ocr_z_from_metadata
+
+_DIRECTION_STEM_SUFFIXES = ("_U", "_R", "_L")
 
 
 def infer_known_z_metadata_path(video_path: str) -> Optional[Path]:
-    """`<name>_U.mp4` から `<name>_metadata.json` を探す"""
+    """動画に対応する metadata を探す。方向別ファイルを共有ファイルより優先する。"""
     path = Path(video_path)
     stem = path.stem
-    candidates = []
-    for suffix in ("_U", "_R", "_L"):
+    candidates = [
+        path.with_name(stem + "_metadata.json"),
+        path.with_name(path.name + "_metadata.json"),
+    ]
+    for suffix in _DIRECTION_STEM_SUFFIXES:
         if stem.endswith(suffix):
             candidates.append(path.with_name(stem[: -len(suffix)] + "_metadata.json"))
             break
-    candidates.append(path.with_name(stem + "_metadata.json"))
-    candidates.append(path.with_name(path.name + "_metadata.json"))
+    else:
+        if len(stem) >= 4 and stem[-4] == "_" and stem[-3:].isdigit():
+            candidates.append(path.with_name(stem[:-4] + "_metadata.json"))
     for cand in candidates:
         if cand.is_file():
             return cand
+    return None
+
+
+def _run_entry_from_metadata(meta: Dict[str, Any], run_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    runs = meta.get("runs")
+    if not isinstance(runs, dict) or not run_id:
+        return None
+    key = str(run_id).strip()
+    if key in runs and isinstance(runs[key], dict):
+        return runs[key]
+    upper = key.upper().lstrip("_")
+    if upper in runs and isinstance(runs[upper], dict):
+        return runs[upper]
+    try:
+        roll = physical_roll_from_run_id(upper)
+        canon = canonical_run_id(roll)
+        if canon in runs and isinstance(runs[canon], dict):
+            return runs[canon]
+        for rid, entry in runs.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                if canonical_run_id(physical_roll_from_run_id(str(rid))) == canon:
+                    return entry
+            except ValueError:
+                continue
+    except ValueError:
+        return None
     return None
 
 
@@ -71,8 +106,22 @@ def load_generation_metadata(metadata_path: Union[str, Path]) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def known_z_mm_from_metadata(meta: Dict[str, Any]) -> np.ndarray:
-    """OCR 代用値。ocr_z_mm / z_ocr_mm があればそれを使い、なければ真値 z。"""
+def known_z_mm_from_metadata(
+    meta: Dict[str, Any],
+    run_id: Optional[str] = None,
+) -> np.ndarray:
+    """OCR 代用値。ocr_z_mm / z_ocr_mm があればそれを使い、なければ真値 z。
+
+    run_id があり metadata.runs[run] に距離列があるときは、その走行の列を使う。
+    """
+    run_meta = _run_entry_from_metadata(meta, run_id)
+    if run_meta is not None:
+        try:
+            z = ocr_z_from_metadata(run_meta, fallback_true_z=True)
+            if z.size > 0:
+                return z
+        except ValueError:
+            pass
     z = ocr_z_from_metadata(meta, fallback_true_z=True)
     if z.size == 0:
         raise ValueError("OCR/z 列が空です")
@@ -88,8 +137,13 @@ def true_z_mm_from_metadata(meta: Dict[str, Any]) -> np.ndarray:
     return z
 
 
-def load_known_z_mm(metadata_path: Union[str, Path]) -> np.ndarray:
-    return known_z_mm_from_metadata(load_generation_metadata(metadata_path))
+def load_known_z_mm(
+    metadata_path: Union[str, Path],
+    run_id: Optional[str] = None,
+) -> np.ndarray:
+    return known_z_mm_from_metadata(
+        load_generation_metadata(metadata_path), run_id=run_id
+    )
 
 
 def is_generation_camera_metadata(meta: Dict[str, Any]) -> bool:
@@ -110,11 +164,37 @@ def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
 
     無歪み等距離で作った仮想動画は本番校正を外す。
     校正レンズで生成した動画は metadata の lens_calibration_file を残す。
+    ピンホール側視（config または metadata が pinhole）では校正パスを戻さない。
     OCR 保存 JSON（距離列のみ）ではカメラ設定を触らない。
     """
     if not is_generation_camera_metadata(meta):
         return
-    if str(getattr(config.camera, "camera_model", "") or "").lower() == "pinhole":
+    meta_model = str(meta.get("camera_model") or "").lower()
+    cfg_model = str(getattr(config.camera, "camera_model", "") or "").lower()
+    is_pinhole = meta_model == "pinhole" or cfg_model == "pinhole"
+    if is_pinhole:
+        config.camera.camera_model = "pinhole"
+        config.camera.lens_calibration_file = None
+        config.camera._lens_calibration = None
+        if meta_model == "pinhole":
+            if "f_px" in meta and meta["f_px"]:
+                fx = float(meta["f_px"])
+                config.camera.fx = fx
+                config.camera.fy = float(meta["fy"]) if meta.get("fy") else fx
+            if "cx" in meta and meta["cx"] is not None:
+                config.camera.cx = float(meta["cx"])
+            if "cy" in meta and meta["cy"] is not None:
+                config.camera.cy = float(meta["cy"])
+            if "fov_deg" in meta and meta["fov_deg"]:
+                config.camera.fov_degrees = float(meta["fov_deg"])
+            if "width" in meta and meta["width"]:
+                w = int(meta["width"])
+                config.camera.image_width = w
+                config.two_direction.capture.image_width_px = w
+            if "height" in meta and meta["height"]:
+                h = int(meta["height"])
+                config.camera.image_height = h
+                config.two_direction.capture.image_height_px = h
         if "pipe_diameter_mm" in meta and meta["pipe_diameter_mm"]:
             config.pipe.diameter_mm = float(meta["pipe_diameter_mm"])
         elif "radius_mm" in meta and meta["radius_mm"]:
@@ -204,7 +284,11 @@ def assert_known_z_covers_window(
 
 
 def resolve_known_z_mm(config) -> Optional[np.ndarray]:
-    """z_source=known のとき metadata から既知 z を読む。ocr なら None。"""
+    """z_source=known のとき metadata から既知 z を読む。ocr なら None。
+
+    1 本の系列が欲しい経路（正面、旧テスト）向け。側視の方向別 z は
+    ``resolve_known_z_mm_for_run`` を使う。
+    """
     if effective_z_source(config) != "known":
         return None
     path = effective_known_z_metadata_path(config)
@@ -225,8 +309,29 @@ def resolve_known_z_mm(config) -> Optional[np.ndarray]:
             if inferred is not None:
                 td.known_z_metadata_path = str(inferred)
                 config.known_z_metadata_path = str(inferred)
-                return load_known_z_mm(inferred)
+                return load_known_z_mm(inferred, run_id=run.run_id)
     raise FileNotFoundError(
         "z_source=known ですが known_z_metadata_path も "
         "動画横の *_metadata.json も見つかりません"
+    )
+
+
+def resolve_known_z_mm_for_run(
+    config,
+    video_path: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> np.ndarray:
+    """z_source=known のとき、指定 Run の既知 z を返す。"""
+    if effective_z_source(config) != "known":
+        raise ValueError("z_source=known ではありません")
+    explicit = effective_known_z_metadata_path(config)
+    if explicit:
+        return load_known_z_mm(explicit, run_id=run_id)
+    if video_path:
+        inferred = infer_known_z_metadata_path(video_path)
+        if inferred is not None:
+            return load_known_z_mm(inferred, run_id=run_id)
+    raise FileNotFoundError(
+        f"z_source=known ですが run={run_id or '-'} の metadata が見つかりません"
+        + (f": {video_path}" if video_path else "")
     )
