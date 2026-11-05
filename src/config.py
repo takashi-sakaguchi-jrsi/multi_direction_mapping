@@ -1402,6 +1402,16 @@ class TwoDirectionConfig:
 
     false は工程2どおり pose/prev を凍結する。
     """
+    strip_overlap_match: bool = False
+    """展開後の既描画と現帯で ORB を取り、重なり誤差を測る。"""
+    strip_overlap_correct: bool = False
+    """測定した leftover で絶対 (z, pitch) を直し、取り直してから書く。"""
+    strip_overlap_allow_bin_worse: bool = False
+    """True なら z+pitch でも η ビン悪化を通す。z のみは常にビン悪化を許容する。"""
+    residual_theta_bins: int = 6
+    """帯重なり leftover の η ビン数。60° 塗布帯をこの数で割る。正面 front.residual_theta_bins とは別。"""
+    residual_min_bin_points: int = 2
+    """η ビンを有効とみなす最小点数。側視はねじれが小さいので正面より低くてよい。"""
     registration: RegistrationConfig = field(default_factory=RegistrationConfig)
     seam_warp: SeamWarpConfig = field(default_factory=SeamWarpConfig)
     pitch_trend_warp: PitchTrendWarpConfig = field(default_factory=PitchTrendWarpConfig)
@@ -2578,6 +2588,20 @@ class ConfigValidator:
         if int(getattr(cfg, "ocr_dz_anomaly_window", 50) or 0) < 1:
             raise ConfigValidationError(
                 "two_direction.ocr_dz_anomaly_window は 1 以上である必要があります"
+            )
+        if bool(getattr(cfg, "strip_overlap_correct", False)) and not bool(
+            getattr(cfg, "strip_overlap_match", False)
+        ):
+            raise ConfigValidationError(
+                "two_direction.strip_overlap_correct は strip_overlap_match が true のときだけ有効です"
+            )
+        if int(getattr(cfg, "residual_theta_bins", 6) or 0) < 2:
+            raise ConfigValidationError(
+                "two_direction.residual_theta_bins は 2 以上である必要があります"
+            )
+        if int(getattr(cfg, "residual_min_bin_points", 2) or 0) < 1:
+            raise ConfigValidationError(
+                "two_direction.residual_min_bin_points は 1 以上である必要があります"
             )
         if cfg.max_frames is not None and int(cfg.max_frames) <= 0:
             raise ConfigValidationError(

@@ -48,6 +48,11 @@ def test_config_defaults_keep_step2_motion():
     assert td.physical_attitude_source == "match"
     assert td.ocr_dz_anomaly_ratio == pytest.approx(0.0)
     assert td.fail_advance_median_dz is False
+    assert td.strip_overlap_match is False
+    assert td.strip_overlap_correct is False
+    assert td.strip_overlap_allow_bin_worse is False
+    assert td.residual_theta_bins == 6
+    assert td.residual_min_bin_points == 2
 
 
 def test_config_rejects_discard_attitude_source():

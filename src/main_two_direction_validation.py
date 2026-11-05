@@ -67,6 +67,7 @@ from src.validation.report import (
 from src.validation.seam_join import join_at_overlap_centers
 from src.validation.seam_warp import normalize_run_id, warp_strips_to_seams
 from src.validation.sideview_projection_mapper import SideviewProjectionMapper
+from src.validation.sideview_strip_overlap import inherit_running_pose, maybe_correct_strip
 from src.validation.strip_correction import (
     apply_pitch_trend_warp,
     correct_strip,
@@ -770,9 +771,22 @@ def _accumulate_run(
     max_dz = float(config.estimation.motion.max_dz)
     alpha = float(config.colormap.alpha)
     n = len(records)
+    z_run = None
+    pitch_run = None
+    z_ana_prev = None
+    pitch_ana_prev = None
     for i, (rec, frame) in enumerate(zip_records_with_frames(records, extra)):
         if rec.status not in ("OK", "INIT"):
             continue
+        z_ana = float(np.asarray(rec.position, dtype=float)[2])
+        pitch_ana = float(np.asarray(rec.orientation, dtype=float)[2])
+        z_init, pitch_init = inherit_running_pose(
+            z_ana, pitch_ana, z_ana_prev, pitch_ana_prev, z_run, pitch_run
+        )
+        rec.position = np.asarray(rec.position, dtype=float).copy()
+        rec.orientation = np.asarray(rec.orientation, dtype=float).copy()
+        rec.position[2] = z_init
+        rec.orientation[2] = pitch_init
         strip = mapper.sample_strip(
             frame,
             rec.position,
@@ -786,6 +800,13 @@ def _accumulate_run(
             run_id=run_id,
             frame_num=rec.frame_num,
         )
+        strip = maybe_correct_strip(
+            mapper, acc, strip, rec, frame, run_id, config, max_dz, alpha, ppm
+        )
+        z_run = float(rec.position[2])
+        pitch_run = float(rec.orientation[2])
+        z_ana_prev = z_ana
+        pitch_ana_prev = pitch_ana
         acc.add_strip(
             strip["colors_2d"], strip["mask_2d"], float(strip["z_min_strip"]),
             run_id, rec.frame_num,

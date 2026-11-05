@@ -362,6 +362,15 @@ def apply_sideview_profile(config: Config) -> None:
         logger.info("側視 FAILED: prev 更新 + 履歴中央値 dz（塗らない）")
     else:
         logger.info("側視 FAILED: pose/prev 凍結（工程2）")
+    logger.info(
+        "側視 strip_overlap: match=%s correct=%s allow_bin_worse=%s "
+        "residual_theta_bins=%s residual_min_bin_points=%s",
+        bool(getattr(td, "strip_overlap_match", False)),
+        bool(getattr(td, "strip_overlap_correct", False)),
+        bool(getattr(td, "strip_overlap_allow_bin_worse", False)),
+        int(getattr(td, "residual_theta_bins", 6)),
+        int(getattr(td, "residual_min_bin_points", 2)),
+    )
 
 
 def validate_pipeline_cli_args(pipeline: str, args: Any) -> None:

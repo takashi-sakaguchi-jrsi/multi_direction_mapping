@@ -50,6 +50,11 @@
     "ocr_dz_anomaly_min_ocr_mm": 1.0,
     "ocr_dz_anomaly_window": 50,
     "fail_advance_median_dz": false,
+    "strip_overlap_match": false,
+    "strip_overlap_correct": false,
+    "strip_overlap_allow_bin_worse": false,
+    "residual_theta_bins": 6,
+    "residual_min_bin_points": 2,
     "capture": {
       "usable_outer_radius_ratio": 0.8,
       "derived_usable_half_fov_deg": 71.97,
