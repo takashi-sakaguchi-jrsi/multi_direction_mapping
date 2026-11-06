@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from src.config import SeamWarpConfig
+from src.validation.geometry import build_direction_layout
 from src.validation.seam_warp import (
     SeamMismatch,
     _seam_row,
@@ -36,6 +37,49 @@ def test_sector_blend_weight_u_edges_and_center():
     np.testing.assert_allclose(w_hi, 1.0, atol=1e-6)
     # 帯の直前は 0（360° 回り込みしない）
     assert float(sector_blend_weight(50.0, "R")) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sector_blend_weight_eight_dir_is_45deg():
+    layout = build_direction_layout(8, 45.0, 60.0)
+    w_lo = float(sector_blend_weight(-22.5, "000", layout=layout))
+    w_mid = float(sector_blend_weight(0.0, "000", layout=layout))
+    w_hi = float(sector_blend_weight(22.5, "000", layout=layout))
+    np.testing.assert_allclose([w_lo, w_mid, w_hi], [0.0, 0.5, 1.0], atol=1e-6)
+    w180 = float(sector_blend_weight(180.0, "180", layout=layout))
+    np.testing.assert_allclose(w180, 0.5, atol=1e-6)
+
+
+def test_eight_dir_missing_partner_is_zero():
+    layout = build_direction_layout(8, 45.0, 60.0)
+    z = np.array([0.0, 40.0, 80.0])
+    mm = SeamMismatch(
+        ("000", "045"), z, np.full(3, 4.0), np.zeros(3), 8, 8, "ok"
+    )
+    ulo_z, _, uhi_z, _ = boundary_displacement("000", z, [mm], layout=layout)
+    np.testing.assert_allclose(ulo_z, 0.0)
+    np.testing.assert_allclose(uhi_z, -2.0)
+
+
+def test_eight_dir_adjacent_pairs_only():
+    h, w = 90, 60
+    filled = np.ones((h, w), dtype=bool)
+    strips = []
+    for i, rid in enumerate(("000", "045", "090")):
+        strips.append({
+            "rgb": _pattern(h, w, seed=i + 4),
+            "filled": filled,
+            "z_min": 0.0,
+            "z_max": float(w),
+            "run_id": rid,
+        })
+    layout = build_direction_layout(8, 45.0, 60.0)
+    cfg = SeamWarpConfig(enabled=True, min_matches=4)
+    result = warp_strips_to_seams(strips, pixels_per_mm=1.0, config=cfg, layout=layout)
+    pairs = {m.pair for m in result.mismatches}
+    assert ("000", "045") in pairs
+    assert ("045", "090") in pairs
+    assert ("000", "090") not in pairs
+    assert ("315", "000") not in pairs
 
 
 def test_three_way_half_mismatch_interpolates_on_u():
@@ -184,6 +228,29 @@ def test_remap_keeps_theta_wrap_filled():
     out = _remap_run(
         {"rgb": rgb, "filled": filled, "z_min": 0.0, "z_max": float(w), "run_id": "L"},
         "L", [mm], ppm=1.0, theta_min=0.0, theta_max=2.0 * np.pi, cfg=None,
+    )
+    assert float(np.mean(out["filled"][0])) > 0.9
+    assert float(np.mean(out["filled"][-1])) > 0.9
+    assert int(out["rgb"][0].max()) > 0
+    assert int(out["rgb"][-1].max()) > 0
+
+
+def test_remap_180_keeps_eta0_wrap_filled():
+    """180° Run の担当帯は η=0 を含む。周期パッドで黒帯にしない。"""
+    from src.validation.seam_warp import SeamMismatch, _remap_run, seam_geom_from_layout
+
+    layout = build_direction_layout(8, 45.0, 60.0)
+    geom = seam_geom_from_layout(layout)
+    h, w = 48, 40
+    rgb = np.full((h, w, 3), 180, dtype=np.uint8)
+    filled = np.ones((h, w), dtype=bool)
+    mth = np.full(2, np.radians(20.0))
+    mm = SeamMismatch(
+        ("180", "225"), np.array([0.0, float(w)]), np.zeros(2), mth, 12, 12, "ok"
+    )
+    out = _remap_run(
+        {"rgb": rgb, "filled": filled, "z_min": 0.0, "z_max": float(w), "run_id": "180"},
+        "180", [mm], ppm=1.0, theta_min=0.0, theta_max=2.0 * np.pi, cfg=None, geom=geom,
     )
     assert float(np.mean(out["filled"][0])) > 0.9
     assert float(np.mean(out["filled"][-1])) > 0.9

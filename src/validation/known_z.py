@@ -237,25 +237,35 @@ def apply_generation_metadata_to_config(config, meta: Dict[str, Any]) -> None:
         config.pipe.diameter_mm = float(meta["radius_mm"]) * 2.0
 
 
+def _norm_z_source(value) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in ("ocr", "known") else ""
+
+
+def _nonempty_path(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def effective_z_source(config) -> str:
-    top = str(getattr(config, "z_source", "") or "").lower()
-    td = str(getattr(config.two_direction, "z_source", "") or "").lower()
-    if top in ("ocr", "known"):
-        if top == "known" or td != "known":
-            return top
-    if td in ("ocr", "known"):
-        return td
-    return "ocr"
+    """側視は two_direction.z_source、正面はトップレベル z_source。"""
+    pipeline = str(getattr(config, "pipeline", "sideview") or "sideview").lower()
+    top = _norm_z_source(getattr(config, "z_source", ""))
+    td = _norm_z_source(getattr(config.two_direction, "z_source", ""))
+    if pipeline == "sideview":
+        return td or top or "ocr"
+    return top or td or "ocr"
 
 
 def effective_known_z_metadata_path(config) -> Optional[str]:
-    top = getattr(config, "known_z_metadata_path", None)
-    if top:
-        return str(top)
-    td = getattr(config.two_direction, "known_z_metadata_path", None)
-    if td:
-        return str(td)
-    return None
+    pipeline = str(getattr(config, "pipeline", "sideview") or "sideview").lower()
+    top = _nonempty_path(getattr(config, "known_z_metadata_path", None))
+    td = _nonempty_path(getattr(config.two_direction, "known_z_metadata_path", None))
+    if pipeline == "sideview":
+        return td or top
+    return top or td
 
 
 def assert_known_z_covers_window(

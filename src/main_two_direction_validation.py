@@ -56,6 +56,7 @@ from src.validation.frame_analyzer import FrameAnalyzer, resolve_frame_window, z
 from src.validation.geometry import (
     build_run_reference,
     derive_usable_half_fov_deg,
+    direction_layout_from_config,
     infer_suffix_from_path,
     physical_roll_from_suffix,
 )
@@ -200,6 +201,13 @@ def run_two_direction_validation(
     )
     injected_known_z = known_z_mm
     z_source_known = injected_known_z is not None or effective_z_source(config) == "known"
+    logger.info(
+        "z_source=%s (two_direction=%s, top=%s, known_z_injected=%s)",
+        "known" if z_source_known else "ocr",
+        getattr(td, "z_source", None),
+        getattr(config, "z_source", None),
+        injected_known_z is not None,
+    )
     if injected_known_z is None and effective_z_source(config) == "known":
         cam_meta_path = effective_known_z_metadata_path(config)
         if cam_meta_path is None:
@@ -410,6 +418,7 @@ def run_two_direction_validation(
                 progress_rep.update_step(seam_step, 10.0, details={"phase": "seam_warp"})
             except Exception:
                 pass
+        layout = _join_layout(td, analyzed)
         seam = warp_strips_to_seams(
             [
                 {
@@ -423,11 +432,15 @@ def run_two_direction_validation(
             theta_min=theta_min,
             theta_max=theta_max,
             config=seam_cfg,
+            layout=layout,
         )
         logger.info(seam.message)
         joined = join_at_overlap_centers(
             seam.strips,
             pixels_per_mm=ppm,
+            theta_min=theta_min,
+            theta_max=theta_max,
+            layout=layout,
         )
 
         motion_csv: Dict[str, str] = {}
@@ -692,6 +705,14 @@ def _save_rgb_png(
             _save_photoviewer_png(pv, arr)
     except Exception as exc:
         logger.warning(f"画像保存失敗: {path}: {exc}")
+
+
+def _join_layout(td, analyzed):
+    """U/R/L の 3 方向は従来 120° 定数。3 桁 run は n 方向 layout。"""
+    ids = {_run_id(item["rec"], item["tag"]) for item in analyzed}
+    if ids and ids <= {"U", "R", "L", "A", "B", "C"}:
+        return None
+    return direction_layout_from_config(td)
 
 
 def _run_id(records, fallback: str) -> str:

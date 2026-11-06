@@ -21,7 +21,7 @@ from src.product_runtime import (
     save_ocr_metadata_file,
     validate_pipeline_cli_args,
 )
-from src.validation.known_z import assert_known_z_covers_window
+from src.validation.known_z import assert_known_z_covers_window, effective_z_source
 
 
 def _args(**kwargs):
@@ -88,6 +88,24 @@ def test_sideview_named_input_clears_missing_l(tmp_path: Path):
     assert config.two_direction.run_A.run_id == "000"
     assert config.two_direction.run_C.video_path == ""
     assert [r.run_id for r in config.two_direction.runs] == ["000"]
+
+
+def test_cli_sideview_ignores_json_front_ocr_z_source():
+    """JSON が pipeline=front / z_source=OCR でも --pipeline sideview なら known。"""
+    cfg = Config.from_dict({
+        "pipeline": "front",
+        "z_source": "OCR",
+        "known_z_metadata_path": "",
+        "two_direction": {
+            "z_source": "known",
+            "known_z_metadata_path": None,
+        },
+    })
+    assert cfg.pipeline == "front"
+    apply_product_cli(cfg, _args(pipeline="sideview"))
+    assert effective_pipeline(cfg) == "sideview"
+    assert cfg.two_direction.z_source == "known"
+    assert effective_z_source(cfg) == "known"
 
 
 def test_front_input_sets_video_path(tmp_path: Path):

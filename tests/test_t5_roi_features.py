@@ -2,8 +2,12 @@
 
 import numpy as np
 
-from src.config import Config
+from src.config import Config, FeatureMatchingSideviewConfig
 from src.validation.sideview_feature_matcher import SideviewFeatureMatcher
+
+
+def test_default_v_half_ratio_is_half_height_0_8():
+    assert FeatureMatchingSideviewConfig().v_half_ratio == 0.8
 
 
 def test_roi_mask_excludes_outside_points():
@@ -17,6 +21,7 @@ def test_roi_mask_excludes_outside_points():
 
 def test_default_mask_is_vertical_band_full_width():
     cfg = Config.from_defaults()
+    cfg.two_direction.feature_matching_sideview.v_half_ratio = 0.8
     matcher = SideviewFeatureMatcher(cfg)
     mask = matcher.build_roi_mask((1080, 1920), None, None, center=(960.0, 540.0))
     assert mask[540, 960] == 255
@@ -25,7 +30,7 @@ def test_default_mask_is_vertical_band_full_width():
     assert mask[0, 0] == 0
     assert mask[1079, 1919] == 0
     rect = matcher.match_roi_rect((1080, 1920), (960.0, 540.0))
-    half = 0.4 * (1080 / 2.0)
+    half = 0.8 * (1080 / 2.0)
     assert rect[0] == 0
     assert rect[2] == 1920
     assert abs((rect[3] - rect[1]) / 2.0 - half) < 2.0

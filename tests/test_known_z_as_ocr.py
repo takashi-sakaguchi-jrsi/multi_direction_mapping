@@ -10,10 +10,12 @@ import pytest
 from src.camera_estimation import CameraEstimator, compute_distance_constraints_only
 from src.config import Config, load_config
 from src.main_two_direction_validation import build_transformer, run_two_direction_validation
+from src.product_runtime import apply_sideview_profile
 from src.validation.frame_analyzer import FrameAnalyzer
 from src.validation.geometry import build_run_reference
 from src.validation.known_z import (
     apply_generation_metadata_to_config,
+    effective_z_source,
     infer_known_z_metadata_path,
     is_generation_camera_metadata,
     known_z_mm_from_metadata,
@@ -121,7 +123,9 @@ def test_known_z_from_run_entry(tmp_path, config):
     np.testing.assert_allclose(known_z_mm_from_metadata(meta), [0.0, 10.0, 20.0])
     np.testing.assert_allclose(known_z_mm_from_metadata(meta, run_id="U"), [0.0, 4.0, 9.0])
     np.testing.assert_allclose(known_z_mm_from_metadata(meta, run_id="R"), [0.0, 6.0, 11.0, 17.0])
+    config.pipeline = "sideview"
     config.z_source = "known"
+    config.two_direction.z_source = "known"
     config.known_z_metadata_path = str(path)
     np.testing.assert_allclose(
         resolve_known_z_mm_for_run(config, run_id="U"), [0.0, 4.0, 9.0]
@@ -145,6 +149,29 @@ def test_metadata_loader_and_infer(tmp_path):
     np.testing.assert_allclose(z, [2.0, 4.0, 6.0])
 
 
+def test_from_json_keeps_nested_known_when_top_level_is_ocr(tmp_path):
+    """正面用トップレベル z_source=OCR があっても側視 known は残す。"""
+    path = tmp_path / "mixed.json"
+    path.write_text(
+        json.dumps({
+            "pipeline": "sideview",
+            "z_source": "OCR",
+            "known_z_metadata_path": "",
+            "two_direction": {
+                "z_source": "known",
+                "known_z_metadata_path": None,
+            },
+        }),
+        encoding="utf-8",
+    )
+    cfg = Config.from_json(str(path))
+    assert cfg.two_direction.z_source == "known"
+    assert effective_z_source(cfg) == "known"
+    apply_sideview_profile(cfg)
+    assert cfg.z_source == "known"
+    assert effective_z_source(cfg) == "known"
+
+
 def test_resolve_known_z_from_config_path(tmp_path, config):
     meta = tmp_path / "z.json"
     meta.write_text(json.dumps({"z_values_mm": [1.0, 2.0]}), encoding="utf-8")
@@ -160,6 +187,7 @@ def test_resolve_known_z_from_product_ocr_save(tmp_path, config):
         json.dumps({"z_ocr_mm": [0.0, 1.428, 2.857], "n": 3}),
         encoding="utf-8",
     )
+    config.pipeline = "front"
     config.z_source = "known"
     config.known_z_metadata_path = str(meta)
     config.two_direction.z_source = "ocr"
@@ -178,6 +206,7 @@ def test_save_ocr_metadata_roundtrip_as_known(tmp_path, config):
     path = save_ocr_metadata_file(tmp_path / "ocr_metadata.json", np.array([0.0, 10.0, 20.0]))
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["z_ocr_mm"] == payload["ocr_z_mm"]
+    config.pipeline = "front"
     config.z_source = "known"
     config.known_z_metadata_path = str(path)
     np.testing.assert_allclose(resolve_known_z_mm(config), [0.0, 10.0, 20.0])

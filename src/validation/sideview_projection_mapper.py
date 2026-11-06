@@ -41,7 +41,7 @@ class SideviewProjectionMapper:
         self.outer_ratio = cap.usable_outer_radius_ratio
         self.roi_rect = cap.roi_rect
         v_half = float(
-            getattr(config.two_direction.feature_matching_sideview, "v_half_ratio", 0.4)
+            getattr(config.two_direction.feature_matching_sideview, "v_half_ratio", 0.8)
         )
         if self.v_forward_half_ratio + 1e-9 < v_half:
             logger.warning(

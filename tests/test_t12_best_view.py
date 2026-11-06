@@ -61,3 +61,25 @@ def test_add_strip_grows_past_right_edge(config):
     written = acc.buf.color[:, :w]
     assert np.any(np.all(written == np.array([0, 0, 255]), axis=2))
     assert np.all(acc.buf.filled[:, :w])
+
+
+def test_theta_wrap_lands_on_canvas(config):
+    acc = BestViewAccumulator(config, z_min=0.0, z_max=20.0, theta_bins=32)
+    n = acc.buf.theta_bins
+
+    def proj(theta, color):
+        return {
+            "z": np.array([4.0]),
+            "theta": np.array([theta]),
+            "d_wall": np.array([100.0]),
+            "colors": np.array([color], dtype=np.uint8),
+            "u": np.array([1.0]),
+            "v": np.array([2.0]),
+            "gamma": np.array([0.1]),
+            "valid": np.array([True]),
+            "frame_num": 1,
+        }
+
+    acc.add_projection(proj(-0.05, [0, 255, 0]), "180")
+    acc.add_projection(proj(2.0 * np.pi + 0.05, [255, 0, 0]), "180")
+    assert np.any(acc.buf.filled[0] | acc.buf.filled[n - 1])

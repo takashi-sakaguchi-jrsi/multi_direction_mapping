@@ -258,6 +258,7 @@ def overlay_camera_config(
 
 def apply_front_profile(config: Config) -> None:
     """正面経路の衝突項目を FrontConfig で上書きする。側視の既定値は触らない。"""
+    config.pipeline = "front"
     front = getattr(config, "front", None)
     if front is None:
         return
@@ -330,6 +331,7 @@ def apply_front_profile(config: Config) -> None:
 
 def apply_sideview_profile(config: Config) -> None:
     """側視経路の camera / OCR 増分を two_direction から載せる。正面の値は触らない。"""
+    config.pipeline = "sideview"
     td = getattr(config, "two_direction", None)
     if td is None:
         return
@@ -346,6 +348,10 @@ def apply_sideview_profile(config: Config) -> None:
         config.camera.lens_calibration_file,
         list(config.camera.ocr_roi_ratio),
     )
+    td_z = str(getattr(td, "z_source", "") or "").strip().lower()
+    if td_z in ("ocr", "known"):
+        config.z_source = td_z
+    logger.info("側視 z_source=%s", config.z_source)
     att = str(getattr(td, "physical_attitude_source", "match") or "match").strip().lower()
     logger.info("側視 physical_attitude_source=%s", att)
     ratio = float(getattr(td, "ocr_dz_anomaly_ratio", 0.0) or 0.0)
@@ -358,8 +364,14 @@ def apply_sideview_profile(config: Config) -> None:
         )
     else:
         logger.info("側視 OCR比異常判定: オフ（工程2）")
+    n_streak = int(getattr(td, "fail_advance_after_n_feature_fails", 0) or 0)
     if bool(getattr(td, "fail_advance_median_dz", False)):
         logger.info("側視 FAILED: prev 更新 + 履歴中央値 dz（塗らない）")
+    elif n_streak > 0:
+        logger.info(
+            "側視 FAILED: 特徴点失敗が %s 回連続するまで凍結、以降は prev 更新 + 履歴中央値 dz",
+            n_streak,
+        )
     else:
         logger.info("側視 FAILED: pose/prev 凍結（工程2）")
     logger.info(

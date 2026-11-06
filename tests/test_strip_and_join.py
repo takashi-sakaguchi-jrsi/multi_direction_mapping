@@ -3,6 +3,8 @@
 import numpy as np
 
 from src.validation.geometry import (
+    assigned_sector_contains_eta0,
+    build_direction_layout,
     camera_car_deg_to_eta,
     eta_to_camera_car_deg,
     expected_edge_etas,
@@ -125,6 +127,59 @@ def test_join_three_runs_covers_full_circle():
     for seam in (60.0, -60.0, 180.0):
         row_s = int(np.argmin(np.abs((car - seam + 180) % 360 - 180)))
         assert 0.08 * h < row_s < 0.92 * h
+
+
+def test_join_eight_runs_meet_at_22_5_and_cover_circle():
+    layout = build_direction_layout(8, 45.0, 60.0)
+    h, w = 80, 24
+    ppm = 1.0
+    filled = np.ones((h, w), dtype=bool)
+    strips = []
+    colors = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (128, 64, 0), (64, 128, 255),
+    ]
+    for rid, col in zip(layout.run_ids, colors):
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        rgb[:] = col
+        strips.append({
+            "rgb": rgb, "filled": filled, "z_min": 0.0, "z_max": 24.0, "run_id": rid,
+        })
+    out = join_at_overlap_centers(strips, pixels_per_mm=ppm, z_pad_mm=0.0, layout=layout)
+    car = unwrap_row_camera_car_deg(h)
+    src = out["source_run"][:, 8]
+    filled_col = out["filled"][:, 8]
+    assert float(np.mean(filled_col)) > 0.95
+    for roll, rid in zip(layout.rolls_deg, layout.run_ids):
+        row = int(np.argmin(np.abs((car - roll + 180) % 360 - 180)))
+        code = list(layout.run_ids).index(rid)
+        assert src[row] == code
+    cut = 22.5
+    row_cut = int(np.argmin(np.abs((car - cut + 180) % 360 - 180)))
+    assert src[row_cut] in (0, 1)
+    assert assigned_sector_contains_eta0("180", layout=layout)
+    assert not assigned_sector_contains_eta0("000", layout=layout)
+    row_180 = int(np.argmin(np.abs((car - 180.0 + 180) % 360 - 180)))
+    assert src[row_180] == list(layout.run_ids).index("180")
+    assert 0.2 * h < row_180 < 0.8 * h
+
+
+def test_join_eight_dir_missing_run_leaves_gap():
+    layout = build_direction_layout(8, 45.0, 60.0)
+    h, w = 64, 16
+    filled = np.ones((h, w), dtype=bool)
+    strips = []
+    for rid in ("000", "045"):
+        rgb = np.full((h, w, 3), 200, dtype=np.uint8)
+        strips.append({
+            "rgb": rgb, "filled": filled, "z_min": 0.0, "z_max": 16.0, "run_id": rid,
+        })
+    out = join_at_overlap_centers(strips, pixels_per_mm=1.0, z_pad_mm=0.0, layout=layout)
+    car = unwrap_row_camera_car_deg(h)
+    row_090 = int(np.argmin(np.abs((car - 90.0 + 180) % 360 - 180)))
+    assert not bool(out["filled"][row_090, 4])
+    row_000 = int(np.argmin(np.abs((car - 0.0 + 180) % 360 - 180)))
+    assert bool(out["filled"][row_000, 4])
 
 
 def test_join_fills_one_pixel_wrap_gap_at_180():

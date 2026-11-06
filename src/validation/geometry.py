@@ -411,6 +411,15 @@ def mode_a_use_frame_xy_residual(run_id: str) -> bool:
     return optical_axis_near_pipe_vertical(run_id)
 
 
+def direction_layout_from_config(td) -> DirectionLayout:
+    """two_direction 設定から担当帯 layout を作る。"""
+    return build_direction_layout(
+        int(getattr(td, "n_directions", 8) or 8),
+        float(getattr(td, "optical_axis_spacing_deg", 45.0) or 45.0),
+        float(getattr(td, "fov_deg", 60.0) or 60.0),
+    )
+
+
 def theta_in_camera_car_sector(
     eta,
     run_id: str,
@@ -424,3 +433,13 @@ def theta_in_camera_car_sector(
     if lo < hi:
         return (car >= lo) & (car < hi)
     return (car >= lo) | (car < hi)
+
+
+def assigned_sector_contains_eta0(
+    run_id: str,
+    layout: Optional[DirectionLayout] = None,
+) -> bool:
+    """担当帯がプログラム η=0（カメラカー 180°）を含むか。周期パッド対象。"""
+    eta0 = np.array([0.0])
+    mask = theta_in_camera_car_sector(eta0, run_id, layout=layout)
+    return bool(np.asarray(mask).reshape(-1)[0])

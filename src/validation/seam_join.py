@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from src.validation.geometry import eta_to_camera_car_deg, theta_in_camera_car_sector
+from src.validation.geometry import (
+    DirectionLayout,
+    eta_to_camera_car_deg,
+    theta_in_camera_car_sector,
+)
 
 DEFAULT_UNWRAP_CUT_CAMERA_CAR_DEG = 0.0
 """最終展開図の周期切断。カメラカー 0° = 真上。接合面（60/−60/180）ではない。"""
@@ -111,11 +115,13 @@ def join_at_overlap_centers(
     theta_max: float = 2.0 * np.pi,
     z_pad_mm: float = 10.0,
     cut_camera_car_deg: float = DEFAULT_UNWRAP_CUT_CAMERA_CAR_DEG,
+    layout: Optional[DirectionLayout] = None,
 ) -> Dict[str, np.ndarray]:
-    """各 strip を担当 120° 帯だけ残して貼る。
+    """各 strip を担当帯（360/n）だけ残して貼る。
 
-    接合面はカメラカー 60° / −60° / 180°。最終画像の上下端（周期切断）は
-    真上 θ=0（``cut_camera_car_deg``）で、接合面ではない。
+    3 方向の接合面はカメラカー 60° / −60° / 180°。8 方向は 22.5°+45k。
+    最終画像の上下端（周期切断）は真上 θ=0（``cut_camera_car_deg``）で、
+    接合面ではない。η=0 を含む担当帯は行がキャンバス端で割れる。
 
     strip は ``rgb, filled, z_min, z_max, run_id`` を持つ。
     """
@@ -140,7 +146,7 @@ def join_at_overlap_centers(
         mask = strip["filled"]
         h, w = rgb.shape[:2]
         z0 = float(strip["z_min"])
-        sector = theta_in_camera_car_sector(eta[:h], run_id)
+        sector = theta_in_camera_car_sector(eta[:h], run_id, layout=layout)
         if h != theta_bins:
             # 行数が違う場合は η をリサンプルせず、先頭 h 行だけ使う
             pass

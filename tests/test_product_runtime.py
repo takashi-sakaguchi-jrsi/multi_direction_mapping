@@ -129,6 +129,12 @@ def test_write_three_direction_excel(tmp_path):
     path = tmp_path / "report.xlsx"
     out = write_three_direction_excel(path, {"U": [rec]})
     assert Path(out).is_file()
+    eight = {
+        rid: [rec]
+        for rid in ("000", "045", "090", "135", "180", "225", "270", "315")
+    }
+    out8 = write_three_direction_excel(tmp_path / "report8.xlsx", eight)
+    assert Path(out8).is_file()
 
 
 def test_derive_progress_weights_rounds_to_100():

@@ -1199,10 +1199,10 @@ class FeatureMatchingSideviewConfig:
     ratio_test_threshold: float = 0.75
     min_match_count: int = 10
     max_features: int = 2000
-    v_half_ratio: float = 0.4
-    """マッチ縦。|v−cy| ≤ ratio·(H/2)。横は全幅。"""
-    center_rect_half_ratio: float = 0.4
-    """互換。v_half_ratio が JSON に無いときだけ使う旧正方形半辺。"""
+    v_half_ratio: float = 0.8
+    """マッチ縦。|v−cy| ≤ ratio·(H/2)。横は全幅。既定 0.8（高さ全体を 1.0 とした 0.4 に相当）。"""
+    center_rect_half_ratio: float = 0.8
+    """互換。v_half_ratio が JSON に無いときだけ使う。同じ半高比。"""
     reject_reverse_travel: bool = True
     reverse_flow_tolerance_px: float = 1.0
     """フレーム y 増加（下向き）を逆走として落とすときの許容[px]。"""
@@ -1401,6 +1401,11 @@ class TwoDirectionConfig:
     """FAILED 時に prev を進め、履歴中央値 dz（maxlen=10）で z を進めて塗らない。
 
     false は工程2どおり pose/prev を凍結する。
+    """
+    fail_advance_after_n_feature_fails: int = 0
+    """fail_advance_median_dz=false のとき、特徴点失敗がこの回数連続したら前進へ切替。
+
+    0 は切替なし（凍結のまま）。true のときはこの値を見ない。
     """
     strip_overlap_match: bool = False
     """展開後の既描画と現帯で ORB を取り、重なり誤差を測る。"""
@@ -1792,16 +1797,21 @@ class Config:
         front_cfg = _dataclass_from_dict(FrontConfig, config_dict.get("front"))
 
         pipeline = str(config_dict.get("pipeline", "sideview")).lower()
+        nested_has_z = "z_source" in two_direction_raw
         if "z_source" in config_dict:
             z_source = str(config_dict.get("z_source") or "ocr")
-            two_direction_cfg.z_source = z_source
         else:
             z_source = two_direction_cfg.z_source
+        # 正面のトップレベル z_source で側視 two_direction.z_source を潰さない
+        if not nested_has_z:
+            two_direction_cfg.z_source = z_source
+        nested_has_meta = "known_z_metadata_path" in two_direction_raw
         if "known_z_metadata_path" in config_dict:
             known_meta = config_dict.get("known_z_metadata_path")
-            two_direction_cfg.known_z_metadata_path = known_meta
         else:
             known_meta = two_direction_cfg.known_z_metadata_path
+        if not nested_has_meta:
+            two_direction_cfg.known_z_metadata_path = known_meta
         save_ocr_metadata = bool(config_dict.get("save_ocr_metadata", False))
 
         config = cls(
@@ -2588,6 +2598,10 @@ class ConfigValidator:
         if int(getattr(cfg, "ocr_dz_anomaly_window", 50) or 0) < 1:
             raise ConfigValidationError(
                 "two_direction.ocr_dz_anomaly_window は 1 以上である必要があります"
+            )
+        if int(getattr(cfg, "fail_advance_after_n_feature_fails", 0) or 0) < 0:
+            raise ConfigValidationError(
+                "two_direction.fail_advance_after_n_feature_fails は 0 以上である必要があります"
             )
         if bool(getattr(cfg, "strip_overlap_correct", False)) and not bool(
             getattr(cfg, "strip_overlap_match", False)

@@ -121,11 +121,10 @@ class BestViewAccumulator:
     def _index(self, z: np.ndarray, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         iz = np.round((z - self.buf.z_min) * self.buf.pixels_per_mm).astype(int)
         span = self.theta_max - self.theta_min
-        it = np.round((theta - self.theta_min) / span * (self.buf.theta_bins - 1)).astype(int)
-        valid = (
-            (iz >= 0) & (iz < self.buf.color.shape[1])
-            & (it >= 0) & (it < self.buf.color.shape[0])
-        )
+        n_th = max(int(self.buf.theta_bins), 1)
+        it = np.round((theta - self.theta_min) / max(span, 1e-12) * (n_th - 1)).astype(int)
+        it = np.mod(it, n_th)
+        valid = (iz >= 0) & (iz < self.buf.color.shape[1])
         return it, iz, valid
 
     def add_strip(

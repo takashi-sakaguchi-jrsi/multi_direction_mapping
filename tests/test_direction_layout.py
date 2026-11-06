@@ -14,6 +14,7 @@ from src.product_runtime import (
     resolve_named_run_videos,
 )
 from src.validation.geometry import (
+    assigned_sector_contains_eta0,
     build_direction_layout,
     build_run_reference,
     canonical_run_id,
@@ -122,6 +123,10 @@ def test_theta_sector_000_wraps_across_zero():
     assert not bool(theta_in_camera_car_sector(eta_out, "000")[0])
     # 3 方向 U は 120° 帯のまま
     assert bool(theta_in_camera_car_sector(eta_out, "U")[0])
+    layout = build_direction_layout(8, 45.0, 60.0)
+    assert assigned_sector_contains_eta0("180", layout=layout)
+    assert not assigned_sector_contains_eta0("000", layout=layout)
+    assert assigned_sector_contains_eta0("L")
 
 
 def test_infer_suffix_three_digit_and_u_alias():

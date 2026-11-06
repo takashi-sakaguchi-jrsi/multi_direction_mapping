@@ -279,6 +279,9 @@ class FrameAnalyzer:
         ocr_min = float(getattr(td, "ocr_dz_anomaly_min_ocr_mm", 1.0) or 1.0)
         ocr_window = int(getattr(td, "ocr_dz_anomaly_window", 50) or 50)
         fail_advance = bool(getattr(td, "fail_advance_median_dz", False))
+        fail_advance_after = int(
+            getattr(td, "fail_advance_after_n_feature_fails", 0) or 0
+        )
         ocr_avg = None
         if ocr_ratio > 0.0:
             series = z_positions if z_positions is not None else ocr_dist
@@ -286,6 +289,7 @@ class FrameAnalyzer:
         dz_history: deque = deque(maxlen=_DZ_HISTORY_MAXLEN)
         n_fail_feature = 0
         n_fail_z = 0
+        n_consec_feature = 0
         prev = None
         center = (0.0, 0.0)
         camera_params: Dict = {}
@@ -344,6 +348,7 @@ class FrameAnalyzer:
                         f"閾値={ocr_ratio:.2f}× → Z方向矛盾"
                     )
             if status == "OK":
+                n_consec_feature = 0
                 if attitude_src == "dz_only":
                     motion_final = np.asarray(motion_final, dtype=float).copy()
                     motion_final[4] = 0.0
@@ -379,10 +384,19 @@ class FrameAnalyzer:
                     residual_stats["fail_kind"] = fail_kind
                 if fail_kind == "z_inconsistency":
                     n_fail_z += 1
+                    n_consec_feature = 0
                 else:
                     n_fail_feature += 1
-                if fail_advance:
+                    n_consec_feature += 1
+                use_advance = fail_advance or (
+                    fail_kind == "feature"
+                    and fail_advance_after > 0
+                    and n_consec_feature >= fail_advance_after
+                )
+                if use_advance:
                     prev = curr
+                    residual_stats["fail_advance_applied"] = True
+                    residual_stats["fail_feature_streak"] = n_consec_feature
                     if dz_history:
                         fallback_dz = float(np.median(list(dz_history)))
                         position = np.asarray(position, dtype=float).copy()
@@ -429,6 +443,7 @@ class FrameAnalyzer:
             "physical_attitude_source": attitude_src,
             "ocr_dz_anomaly_ratio": ocr_ratio,
             "fail_advance_median_dz": fail_advance,
+            "fail_advance_after_n_feature_fails": fail_advance_after,
             "fail_feature_count": n_fail_feature,
             "fail_z_inconsistency_count": n_fail_z,
         }

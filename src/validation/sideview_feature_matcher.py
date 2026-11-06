@@ -26,7 +26,7 @@ class SideviewFeatureMatcher:
         self.min_match_count = side.min_match_count
         self.v_half_ratio = float(
             getattr(side, "v_half_ratio", None)
-            or getattr(side, "center_rect_half_ratio", 0.4)
+            or getattr(side, "center_rect_half_ratio", 0.8)
         )
         self.center_rect_half_ratio = self.v_half_ratio
         self.use_full_image_width = bool(

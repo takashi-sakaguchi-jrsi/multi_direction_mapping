@@ -113,6 +113,7 @@ def test_match_attitude_still_accumulates_pitch(transformer, config):
 
 def test_fail_freeze_is_default(transformer, config):
     config.two_direction.fail_advance_median_dz = False
+    config.two_direction.fail_advance_after_n_feature_fails = 0
     config.estimation.use_offset_moving_average = False
     analyzer = FrameAnalyzer(
         config, CameraEstimator(config.estimation, transformer), mode="A"
@@ -145,6 +146,59 @@ def test_fail_advance_median_dz_updates_prev_and_z(transformer, config):
     assert recs[-1].position[2] == pytest.approx(z0 + 4.0 + 6.0 + 5.0)
     assert recs[-1].motion_final[2] == pytest.approx(5.0)
     assert recs[-1].residual_stats.get("fail_kind") == "feature"
+
+
+def test_fail_advance_after_n_feature_fails_switches_from_freeze(transformer, config):
+    config.two_direction.fail_advance_median_dz = False
+    config.two_direction.fail_advance_after_n_feature_fails = 3
+    config.estimation.use_offset_moving_average = False
+    analyzer = FrameAnalyzer(
+        config, CameraEstimator(config.estimation, transformer), mode="A"
+    )
+    _patch_motion(analyzer, [
+        ("OK", 4.0, 0.0), ("OK", 6.0, 0.0),
+        ("FAILED", 0.0, 0.0), ("FAILED", 0.0, 0.0), ("FAILED", 0.0, 0.0),
+    ])
+    recs, extra = analyzer.analyze_run(
+        config.two_direction.run_A, frames=_blank_frames(6), fps=10.0,
+        known_z_mm=np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0]),
+    )
+    z0 = recs[0].position[2]
+    z_after_ok = z0 + 4.0 + 6.0
+    assert recs[3].status == "FAILED"
+    assert recs[3].position[2] == pytest.approx(z_after_ok)
+    assert recs[3].residual_stats.get("fail_advance_applied") is None
+    assert recs[4].position[2] == pytest.approx(z_after_ok)
+    assert recs[5].position[2] == pytest.approx(z_after_ok + 5.0)
+    assert recs[5].residual_stats.get("fail_advance_applied") is True
+    assert recs[5].residual_stats.get("fail_feature_streak") == 3
+    assert recs[5].motion_final[2] == pytest.approx(5.0)
+    assert extra["fail_advance_median_dz"] is False
+    assert extra["fail_advance_after_n_feature_fails"] == 3
+
+
+def test_fail_streak_resets_on_ok(transformer, config):
+    config.two_direction.fail_advance_median_dz = False
+    config.two_direction.fail_advance_after_n_feature_fails = 3
+    config.estimation.use_offset_moving_average = False
+    analyzer = FrameAnalyzer(
+        config, CameraEstimator(config.estimation, transformer), mode="A"
+    )
+    _patch_motion(analyzer, [
+        ("OK", 4.0, 0.0),
+        ("FAILED", 0.0, 0.0), ("FAILED", 0.0, 0.0), ("FAILED", 0.0, 0.0),
+        ("OK", 4.0, 0.0),
+        ("FAILED", 0.0, 0.0),
+    ])
+    recs, _extra = analyzer.analyze_run(
+        config.two_direction.run_A, frames=_blank_frames(7), fps=10.0,
+        known_z_mm=np.array([0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+    )
+    z_before_last = recs[-2].position[2]
+    assert recs[-2].status == "OK"
+    assert recs[-1].status == "FAILED"
+    assert recs[-1].position[2] == pytest.approx(z_before_last)
+    assert recs[-1].residual_stats.get("fail_advance_applied") is None
 
 
 def test_ocr_dz_anomaly_is_independent_switch(transformer, config):

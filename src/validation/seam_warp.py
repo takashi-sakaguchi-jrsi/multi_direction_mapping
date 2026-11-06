@@ -1,9 +1,9 @@
 """接合面の 2 次元残差を半分ずつ戻す補正。
 
 OCR 距離補正のあと、各接合線で (Δz, Δθ) を測り、端は固定しない。
-カメラ i, j に u_i = −m/2, u_j = +m/2 を与え、120° 帯の内部は
+カメラ i, j に u_i = −m/2, u_j = +m/2 を与え、担当帯（360/n）の内部は
 θ 方向に線形補間する。相手の無い接合は u=0（OCR のまま）。
-3 方向では U が R 側と L 側の両方を境界条件に取る。
+3 方向では U が R 側と L 側の両方を境界条件に取る。8 方向は隣接のみ。
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import numpy as np
 from src.validation.geometry import (
     OVERLAP_CENTER_CAMERA_CAR_DEG,
     SECTOR_CAMERA_CAR_DEG,
+    DirectionLayout,
+    build_direction_layout,
     camera_car_deg_to_eta,
     eta_to_camera_car_deg,
 )
@@ -47,20 +49,97 @@ def normalize_run_id(run_id: str) -> str:
     return key
 
 
-def pair_key(a: str, b: str) -> Optional[Tuple[str, str]]:
+@dataclass(frozen=True)
+class SeamGeom:
+    """接合に使う担当帯・隣接ペア。3 方向定数または n 方向 layout。"""
+
+    pairs: Tuple[Tuple[str, str], ...]
+    partners: Dict[str, Tuple[str, str]]
+    overlap_center_deg: Dict[Tuple[str, str], float]
+    assigned_width_deg: float
+    sectors: Dict[str, Tuple[float, float]]
+
+
+LEGACY_SEAM_GEOM = SeamGeom(
+    pairs=SEAM_PAIRS,
+    partners=RUN_BOUNDARY_PARTNERS,
+    overlap_center_deg=dict(OVERLAP_CENTER_CAMERA_CAR_DEG),
+    assigned_width_deg=120.0,
+    sectors=dict(SECTOR_CAMERA_CAR_DEG),
+)
+
+
+def seam_geom_from_layout(layout: DirectionLayout) -> SeamGeom:
+    return SeamGeom(
+        pairs=layout.seam_pairs,
+        partners=layout.boundary_partners,
+        overlap_center_deg=dict(layout.overlap_center_deg),
+        assigned_width_deg=float(layout.assigned_width_deg),
+        sectors=dict(layout.sectors),
+    )
+
+
+def resolve_seam_geom(
+    strips: Optional[Sequence[dict]] = None,
+    layout: Optional[DirectionLayout] = None,
+) -> SeamGeom:
+    if layout is not None:
+        return seam_geom_from_layout(layout)
+    ids = {
+        normalize_run_id(str(s.get("run_id", "")))
+        for s in (strips or [])
+    }
+    ids.discard("")
+    if ids and ids <= {"U", "R", "L", "A", "B", "C"}:
+        return LEGACY_SEAM_GEOM
+    if ids and all(i.isdigit() for i in ids):
+        if ids <= {"000", "120", "240"} and (ids & {"120", "240"}):
+            return seam_geom_from_layout(build_direction_layout(3, 120.0, 120.0))
+        return seam_geom_from_layout(build_direction_layout(8, 45.0, 60.0))
+    return LEGACY_SEAM_GEOM
+
+
+def pair_key(
+    a: str,
+    b: str,
+    geom: Optional[SeamGeom] = None,
+) -> Optional[Tuple[str, str]]:
     ua, ub = normalize_run_id(a), normalize_run_id(b)
-    for key in SEAM_PAIRS:
+    pairs = (geom.pairs if geom is not None else SEAM_PAIRS)
+    for key in pairs:
         if set(key) == {ua, ub}:
             return key
     return None
 
 
-def sector_blend_weight(car_deg, run_id: str) -> np.ndarray:
-    """担当帯 lo→hi で 0→1。帯の外は 0 または 1 にクリップ。"""
+def sector_blend_weight(
+    car_deg, run_id: str, layout: Optional[DirectionLayout] = None
+) -> np.ndarray:
+    """担当帯 lo→hi で 0→1。帯の外は 0 または 1 にクリップ。幅は 360/n。"""
     key = normalize_run_id(run_id)
-    lo, _hi = SECTOR_CAMERA_CAR_DEG[key]
+    geom = seam_geom_from_layout(layout) if layout is not None else LEGACY_SEAM_GEOM
+    if key not in geom.sectors and layout is None and key in SECTOR_CAMERA_CAR_DEG:
+        lo, _hi = SECTOR_CAMERA_CAR_DEG[key]
+        width = 120.0
+    else:
+        if key not in geom.sectors:
+            raise KeyError(f"未知の run_id: {run_id}")
+        lo, _hi = geom.sectors[key]
+        width = float(geom.assigned_width_deg)
     delta = (np.asarray(car_deg, dtype=float) - lo + 180.0) % 360.0 - 180.0
-    return np.clip(delta / 120.0, 0.0, 1.0)
+    return np.clip(delta / max(width, 1e-9), 0.0, 1.0)
+
+
+def _blend_weight_geom(car_deg, run_id: str, geom: Optional[SeamGeom]) -> np.ndarray:
+    key = normalize_run_id(run_id)
+    if geom is None:
+        geom = LEGACY_SEAM_GEOM
+    if key not in geom.sectors:
+        raise KeyError(f"未知の run_id: {run_id}")
+    lo, _hi = geom.sectors[key]
+    width = float(geom.assigned_width_deg)
+    delta = (np.asarray(car_deg, dtype=float) - lo + 180.0) % 360.0 - 180.0
+    return np.clip(delta / max(width, 1e-9), 0.0, 1.0)
 
 
 @dataclass
@@ -105,6 +184,7 @@ def warp_strips_to_seams(
     theta_min: float = 0.0,
     theta_max: float = 2.0 * np.pi,
     config=None,
+    layout: Optional[DirectionLayout] = None,
 ) -> SeamWarpResult:
     """OCR 後の部分図リストを接合面基準で変形する。"""
     if not strips:
@@ -121,16 +201,17 @@ def warp_strips_to_seams(
     for s in prepared:
         s["run_id"] = normalize_run_id(s["run_id"])
     present = {s["run_id"] for s in prepared}
+    geom = resolve_seam_geom(prepared, layout=layout)
     ppm = max(float(pixels_per_mm), 1e-9)
     commons = _paste_common(prepared, ppm)
     mismatches: List[SeamMismatch] = []
-    for a_id, b_id in SEAM_PAIRS:
+    for a_id, b_id in geom.pairs:
         if a_id not in present or b_id not in present:
             continue
         sa = commons[a_id]
         sb = commons[b_id]
         mm = _match_seam_pair(
-            sa, sb, a_id, b_id, ppm, theta_min, theta_max, cfg
+            sa, sb, a_id, b_id, ppm, theta_min, theta_max, cfg, geom
         )
         mismatches.append(mm)
 
@@ -146,7 +227,9 @@ def warp_strips_to_seams(
     warped: List[dict] = []
     for run_id, strip in by_id.items():
         warped.append(
-            _remap_run(strip, run_id, mismatches, ppm, theta_min, theta_max, cfg)
+            _remap_run(
+                strip, run_id, mismatches, ppm, theta_min, theta_max, cfg, geom
+            )
         )
     # 元の順を保つ
     order = [normalize_run_id(s["run_id"]) for s in strips]
@@ -246,10 +329,12 @@ def _match_seam_pair(
     theta_min: float,
     theta_max: float,
     cfg,
+    geom: Optional[SeamGeom] = None,
 ) -> SeamMismatch:
-    pair = pair_key(a_id, b_id)
+    pair = pair_key(a_id, b_id, geom)
     assert pair is not None
-    car = OVERLAP_CENTER_CAMERA_CAR_DEG[pair]
+    centers = geom.overlap_center_deg if geom is not None else OVERLAP_CENTER_CAMERA_CAR_DEG
+    car = centers[pair]
     gray_a = sa["rgb"]
     gray_b = sb["rgb"]
     h, w = gray_a.shape[:2]
@@ -586,13 +671,17 @@ def boundary_displacement(
     run_id: str,
     z_mm: np.ndarray,
     mismatches: Sequence[SeamMismatch],
+    layout: Optional[DirectionLayout] = None,
+    geom: Optional[SeamGeom] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """run の lo/hi 接合での u=(δz[mm], δθ[rad])。相手無しは 0。"""
     key = normalize_run_id(run_id)
-    lo_p, hi_p = RUN_BOUNDARY_PARTNERS[key]
+    if geom is None:
+        geom = seam_geom_from_layout(layout) if layout is not None else LEGACY_SEAM_GEOM
+    lo_p, hi_p = geom.partners[key]
     z_mm = np.asarray(z_mm, dtype=float)
-    u_lo_z, u_lo_th = _u_against(key, lo_p, z_mm, mismatches)
-    u_hi_z, u_hi_th = _u_against(key, hi_p, z_mm, mismatches)
+    u_lo_z, u_lo_th = _u_against(key, lo_p, z_mm, mismatches, geom)
+    u_hi_z, u_hi_th = _u_against(key, hi_p, z_mm, mismatches, geom)
     return u_lo_z, u_lo_th, u_hi_z, u_hi_th
 
 
@@ -601,8 +690,9 @@ def _u_against(
     partner: str,
     z_mm: np.ndarray,
     mismatches: Sequence[SeamMismatch],
+    geom: Optional[SeamGeom] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    pk = pair_key(run_id, partner)
+    pk = pair_key(run_id, partner, geom)
     if pk is None:
         return np.zeros_like(z_mm), np.zeros_like(z_mm)
     found = None
@@ -627,6 +717,7 @@ def _remap_run(
     theta_min: float,
     theta_max: float,
     cfg,
+    geom: Optional[SeamGeom] = None,
 ) -> dict:
     rgb = strip["rgb"]
     filled = strip["filled"]
@@ -635,11 +726,15 @@ def _remap_run(
     xs = np.arange(w, dtype=float)
     ys = np.arange(h, dtype=float)
     z_cols = z_min + xs / ppm
-    u_lo_z, u_lo_th, u_hi_z, u_hi_th = boundary_displacement(run_id, z_cols, mismatches)
+    u_lo_z, u_lo_th, u_hi_z, u_hi_th = boundary_displacement(
+        run_id, z_cols, mismatches, geom=geom
+    )
     span = float(theta_max - theta_min)
     eta = theta_min + ys / max(h, 1) * span
     car = eta_to_camera_car_deg(eta)
-    wt = np.asarray(sector_blend_weight(car, run_id), dtype=float).reshape(-1, 1)
+    wt = np.asarray(
+        _blend_weight_geom(car, run_id, geom), dtype=float
+    ).reshape(-1, 1)
     th_scale = h / max(span, 1e-12)
     if rgb.ndim == 3:
         rgb_o = np.zeros((h, w, rgb.shape[2]), dtype=rgb.dtype)
